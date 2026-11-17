@@ -21,7 +21,10 @@ DEFAULTS = {
     "extra_obs": True,         # extra observations: effects/runtime telemetry, ghost speed, line offset ...
     "steer_mode": "progressive",   # "progressive" (fine near centre, coarse at the edges) or "uniform" (10% steps)
     "cut_behind_s": 5.0,
-    "ghost_window_s": 2.0,     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
+    "ghost_window_s": 2.0,
+    "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
+    "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
+    "horizon_s": 20.0,         # how far ahead (seconds) the AI weighs rewards     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
     "decay_steps": 4000000,    # learning rate + exploration halve every N env steps (0 = off)
     "line_refresh_s": 0.2,
     "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
@@ -38,6 +41,8 @@ WEIGHTS = {
     "w_time": (0.02, "Time penalty", "cost per 50 ms step; this is what makes going fast pay"),
     "w_guide": (0.05, "Pull toward the target line", "per step, by distance from the PB/best line; only while behind its pace"),
     "ghost_weight": (10.0, "Ghost", "reward per second gained on the fastest run so far (0 = off)"),
+    "w_vcp": (1.0, "Virtual checkpoint bonus", "flat reward per virtual checkpoint (every few s of the PB pace)"),
+    "w_vsplit": (2.0, "Virtual checkpoint split", "per second ahead (+) or behind (-) the PB/ghost at each virtual checkpoint"),
     "w_checkpoint": (3.0, "Checkpoint bonus", "flat reward per checkpoint"),
     "w_finish": (50.0, "Finish bonus", "flat reward for finishing"),
     "w_finish_time": (10.0, "Finish speed bonus", "reward per second faster than the champion at the finish (negative if slower)"),

@@ -219,7 +219,10 @@ class TMEnv(gym.Env):
     """One car on one map. Action = (steer level, throttle mode)."""
 
     LOOK = (10, 25, 50, 90, 140)      # route lookahead in metres
-    N_BASE = N_BASE0 + len(EXTRA_NAMES)   # non-lidar features
+    PREVIEW = (15, 30, 45, 60, 80, 100, 130, 160, 200, 250)    # track memory: where the line goes, far ahead
+    N_HIST = 5                            # short memory: the last 5 decisions' slide / rotation / speed
+    N_MEM = 2 * len(PREVIEW) + 3 * N_HIST
+    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM   # non-lidar features
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
@@ -227,6 +230,9 @@ class TMEnv(gym.Env):
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
         self.cut_behind = float(cfg["cut_behind_s"])
         self.ghost_window = float(cfg["ghost_window_s"])
+        self.vcp_every = float(cfg["vcp_every_s"])
+        self.vcp_s, self.vcp_t, self.vcp_i = np.zeros(0), np.zeros(0), 0
+        self.tf = cfg["ticks_per_step"] / 5.0          # per-step costs are scaled so they mean the same per second
         self.run_dir, self.role, self.shorten = (Path(run_dir) if run_dir else None), role, shorten
         self.dense, self._line_m, self.prof, self._prof_m, self.champ_ms = None, None, None, None, None
         self.phi, self._prev_lv, self.since_hit, self.air = 0.0, None, 20, 0
@@ -435,6 +441,7 @@ class TMEnv(gym.Env):
             gs = np.gradient(ps) / np.maximum(np.gradient(pt / 100.0), 1e-3)       # ghost speed along the line, m/s
             gs = np.convolve(np.pad(gs, 4, mode="edge"), np.ones(9) / 9, mode="valid")
             self.prof, self.gspd, self._prof_m = (ps, pt), np.clip(gs, 0.0, 200.0), m
+            self._make_vcps()
 
     def _load_champ(self):
         """The champion's pace on the current line: laps are cut when far behind it (not the fastest ghost)."""
@@ -452,6 +459,17 @@ class TMEnv(gym.Env):
             self.cprof, self._cprof_key = (pr[:, 0], pr[:, 1]), key
         except (OSError, ValueError, IndexError):
             pass
+
+    def _make_vcps(self):
+        """Virtual checkpoints every few seconds of the ghost's (your PB's) pace: where it was at 4 s, 8 s, ..."""
+        self.vcp_s, self.vcp_t = np.zeros(0), np.zeros(0)
+        if self.prof is None or self.vcp_every <= 0:
+            return
+        ps, pt = self.prof
+        step = self.vcp_every * 100.0
+        ts = np.arange(step, pt[-1] - step * 0.5, step)
+        if len(ts):
+            self.vcp_s, self.vcp_t = np.interp(ts, pt, ps), ts
 
     def _phi(self, s, tick):
         """Seconds ahead of the ghost (negative = behind)."""
@@ -609,6 +627,14 @@ class TMEnv(gym.Env):
             n = float(np.linalg.norm(loc)) + 1e-6
             f += [float(np.arctan2(loc[0], loc[2]) / np.pi), float(loc[1] / n)]
         f += self._extras(t, q, pos, s)
+        for dist in self.PREVIEW:                                   # track memory: line ahead, far beyond the lidar
+            loc = to_car_frame(q, self._route_point(s + dist) - pos)
+            n = float(np.linalg.norm(loc)) + 1e-6
+            f += [float(np.arctan2(loc[0], loc[2]) / np.pi), float(loc[1] / n)]
+        lv, av = to_car_frame(q, v.linear_velocity), to_car_frame(q, v.angular_velocity)
+        self.mem = self.mem[1:] + [[float(np.clip(lv[0] / 30.0, -3, 3)), float(np.clip(av[1] / 5.0, -3, 3)),
+                                    float(v.speed) / 100.0]]
+        f += [x for row in self.mem for x in row]                    # oldest first
         hit = np.asarray(t.lidar.hit, dtype=bool)
         dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
@@ -635,6 +661,7 @@ class TMEnv(gym.Env):
         self.taken, self.slow, self.prev_speed, self.di = 0, 0, 0.0, 0
         self._prev_lv, self.since_hit, self.air = None, 20, 0
         self.pa = np.zeros(8)
+        self.mem = [[0.0, 0.0, 0.0]] * self.N_HIST
         self.limit = self._limit_ticks()
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
@@ -658,6 +685,7 @@ class TMEnv(gym.Env):
         self.di = 0
         self._s = self._global_progress(pos, self.taken) if self.start_i is not None else self._progress(pos, 0)
         self.phi = self._phi(self._s, tick)
+        self.vcp_i = int(np.searchsorted(self.vcp_s, self._s, side="right"))
         self.hist = [[*pos, tick, self.taken]]
         return self._obs(t, self._s), {}
 
@@ -679,12 +707,17 @@ class TMEnv(gym.Env):
         s = self._progress(pos, taken)
         speed = float(t.vehicle.speed)
         r["progress"] = W["w_progress"] * float(np.clip(s - self._s, -10.0, 10.0))
-        r["time"] = -W["w_time"]
+        tf = self.tf
+        r["time"] = -W["w_time"] * tf
         r["steer"] = -W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
         if taken > self.taken:
             r["checkpoint"] = W["w_checkpoint"]
             self.taken = taken
         phi = self._phi(s, tick)                                                 # seconds ahead of the ghost
+        while self.vcp_i < len(self.vcp_s) and s >= self.vcp_s[self.vcp_i]:   # virtual checkpoint passed
+            split = (self.vcp_t[self.vcp_i] - tick) / 100.0                      # seconds ahead of the PB/ghost here
+            r["vcp"] = r.get("vcp", 0.0) + W["w_vcp"] + float(np.clip(W["w_vsplit"] * split, -3.0, 3.0))
+            self.vcp_i += 1
         if self.prof is not None and W["ghost_weight"]:
             # time gained on the ghost this step, but only inside a window behind it: once a lap is far
             # behind, losing more time costs nothing extra, so ending the lap early can never pay off
@@ -695,27 +728,27 @@ class TMEnv(gym.Env):
             off = pos - self._route_point(s)                                     # but only while slower than it
             d = float(np.hypot(off[0], off[2]))
             behind = float(np.clip(-phi / 0.3, 0.0, 1.0))
-            r["guide"] = -W["w_guide"] * min(d / 8.0, 1.0) * behind
+            r["guide"] = -W["w_guide"] * tf * min(d / 8.0, 1.0) * behind
         r["crash"] = -W["w_crash"] * max(0.0, self.prev_speed - speed - 3.0)    # sudden speed loss = wall hit
         if mode == 2:
-            r["brake"] = -W["w_brake"]
+            r["brake"] = -W["w_brake"] * tf
         elif mode == 1:
-            r["coast"] = -W["w_coast"]
+            r["coast"] = -W["w_coast"] * tf
             if W["w_release"]:
-                r["release"] = -W["w_release"] * self._pointless_release(t, pos, s, speed)
+                r["release"] = -W["w_release"] * tf * self._pointless_release(t, pos, s, speed)
         if W["w_slip"]:
-            r["slip"] = -W["w_slip"] * float(np.mean(np.asarray(t.wheels.slipping, dtype=np.float32)))
+            r["slip"] = -W["w_slip"] * tf * float(np.mean(np.asarray(t.wheels.slipping, dtype=np.float32)))
         if W["w_air"] and not np.any(np.asarray(t.wheels.contact, dtype=bool)):
-            r["air"] = -W["w_air"]
+            r["air"] = -W["w_air"] * tf
         if W["w_speed"]:
-            r["speed"] = W["w_speed"] * speed / 100.0
+            r["speed"] = W["w_speed"] * tf * speed / 100.0
         if W["w_hit"] and self.extra:
-            r["hit"] = -W["w_hit"] * _f(t.runtime, "wall_hit_this_step")
+            r["hit"] = -W["w_hit"] * tf * _f(t.runtime, "wall_hit_this_step")
         if W["w_wall"]:                                                          # side rays of the fan
             hit = np.asarray(t.lidar.hit, dtype=bool)
             dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
-            r["wall"] = -W["w_wall"] * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
+            r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed, self._s = speed, s
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
         self.hist.append([*pos, tick, taken])
@@ -770,21 +803,35 @@ def _make_env(cfg, run_dir):
     return Monitor(TMEnv(cfg, run_dir))
 
 
-def run_episode(env, model):
+def run_episode(env, model, seed=None):
+    """seed None: the policy's single most likely action every step. A seed: slight, exactly reproducible
+    sampling (same weights + same seed = same lap), which gets through spots where the argmax stalls."""
+    import torch
+    if seed is not None:
+        torch.manual_seed(int(seed))
     obs, _ = env.reset()
     done, info = False, {}
     while not done:
-        act, _ = model.predict(obs, deterministic=True)
+        act, _ = model.predict(obs, deterministic=seed is None)
         obs, _, term, trunc, info = env.step(act)
         done = term or trunc
     return info
 
 
 # --- models: creation and warm-start migration between steering layouts ------------------------
+GAMMA = [0.995]
+
+
+def set_gamma(cfg):
+    """Discount from a planning horizon in seconds, independent of the decision interval."""
+    GAMMA[0] = float(np.clip(1.0 - cfg["ticks_per_step"] * 0.01 / max(cfg["horizon_s"], 1.0), 0.9, 0.9999))
+    return GAMMA[0]
+
+
 def make_model(env):
     from stable_baselines3 import PPO
     return PPO("MlpPolicy", env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
-               n_steps=512, batch_size=512, n_epochs=10, gamma=0.995, gae_lambda=0.95,
+               n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
                learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
 
@@ -972,9 +1019,19 @@ def _make_callback(cfg, run_dir):
                 if getattr(self, "ema", None) is not None:
                     self.model.policy.load_state_dict(self.ema)
                 try:
-                    info = run_episode(self.test_env, self.model)
+                    best_try = None                      # best of N: argmax lap + seeded laps, keep the fastest
+                    for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
+                        inf = run_episode(self.test_env, self.model, sd)
+                        tr = {"info": inf, "seed": sd, "hist": list(self.test_env.hist), "acts": list(self.test_env.acts),
+                              "rec": self.test_env.g.export()}
+                        key = (0, inf["race_ms"]) if inf["finished"] else (1, -inf.get("cp", 0))
+                        if best_try is None or key < best_try[0]:
+                            best_try = (key, tr)
+                    tr = best_try[1]
+                    info, self.test_env.hist, self.test_env.acts = tr["info"], tr["hist"], tr["acts"]
                     fin = bool(info["finished"])
-                    rec = self.test_env.g.export() if fin else None
+                    rec = tr["rec"] if fin else None
+                    self.test_seed = tr["seed"]
                     if fin and (self.best.get("champion_ms") is None or int(rec.finish_ms) < self.best["champion_ms"]):
                         self.model.save(run_dir / "champion")        # champion = the smoothed weights
                 finally:
@@ -985,7 +1042,7 @@ def _make_callback(cfg, run_dir):
                 return
             self.tests += 1
             try:                                                # watch any test in TICK, also failed ones
-                InputText.write(str(run_dir / "last_test.txt"), self.test_env.g.export().actions)
+                InputText.write(str(run_dir / "last_test.txt"), (rec or tr["rec"]).actions)
             except Exception:
                 pass
             ms = int(rec.finish_ms) if fin else None
@@ -996,6 +1053,7 @@ def _make_callback(cfg, run_dir):
             if fin and (champ is None or ms < champ):
                 promoted, self.bad = True, 0
                 self.best["champion_ms"] = champ = ms
+                self.best["champion_seed"] = self.test_seed
                 save_npy(run_dir / "champ_trace.npy", np.asarray(self.test_env.hist, dtype=np.float64))
 
                 InputText.write(str(run_dir / "champion.txt"), rec.actions)
@@ -1098,17 +1156,27 @@ def train(cfg):
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     prepare_guide(cfg, run_dir)
     venv = SubprocVecEnv([partial(_make_env, cfg, str(run_dir)) for _ in range(cfg["envs"])])
+    set_gamma(cfg)
     vn_file = run_dir / "vecnorm.pkl"
     env = None
     if cfg["resume"] and vn_file.exists():
         try:
             env = VecNormalize.load(str(vn_file), venv)
-            env.training = True
+            env.training, env.gamma = True, GAMMA[0]
             say("Loaded reward scaling (vecnorm.pkl)")
-        except Exception as e:
-            say(f"Could not load vecnorm.pkl ({str(e)[:60]}), relearning reward scale")
+        except Exception:                       # input size changed: keep just the reward scale
+            try:
+                import pickle
+                with open(vn_file, "rb") as fh:
+                    old = pickle.load(fh)
+                env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA[0])
+                env.ret_rms = old.ret_rms
+                say("Kept the reward scaling from vecnorm.pkl (input layout changed)")
+            except Exception as e:
+                env = None
+                say(f"Could not load vecnorm.pkl ({str(e)[:60]}), relearning reward scale")
     if env is None:
-        env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=0.995)
+        env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA[0])
     migrate(run_dir, cfg, env)
 
     model, latest = None, run_dir / "latest.zip"
@@ -1116,6 +1184,8 @@ def train(cfg):
         try:
             model = PPO.load(str(latest), env=env, device="cpu")
             model.target_kl = 0.02
+            model.gamma = model.rollout_buffer.gamma = GAMMA[0]
+            say(f"Planning horizon {cfg['horizon_s']:.0f} s -> gamma {GAMMA[0]:.4f} at {cfg['ticks_per_step'] * 10} ms")
             say("Resumed from latest.zip")
         except Exception as e:
             say(f"Cannot resume ({str(e)[:80]}), starting fresh")
@@ -1141,7 +1211,7 @@ def drive(cfg, model_path=None):
     model = PPO.load(model_path or str(run_dir / "champion.zip"), device="cpu")
     env = TMEnv(cfg, run_dir, shorten=False, role="play")
     say("Driving the champion (the lap is simulated in the background, the game window will not show it) ...")
-    info = run_episode(env, model)
+    info = run_episode(env, model, read_json(run_dir / "best.json").get("champion_seed"))
     res = {"t": time.time(), "finished": bool(info["finished"]), "end": info["end"], "ms": None, "file": None}
     if info["finished"]:
         rec = env.g.export()
