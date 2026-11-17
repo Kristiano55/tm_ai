@@ -17,8 +17,8 @@ A reinforcement-learning driver for Trackmania 2020. It trains on the game's own
 Optional check: `python tm_ai.py selftest --map "C:\path\to\map.Map.Gbx"` prints the car's observations and lists any telemetry fields that are missing.
 
 ## What it does
-- **PPO on CPU**, with parallel cars (each car is one gym).
-- **Observation (120 values):** car-frame velocity, wheels, route lookahead, ghost pace, offset from the racing line, effects, and 41 lidar rays.
+- **Two learning algorithms:** PPO, or **IQN** modelled on Linesight (the TMNF AI that beat world records): replay memory, distributional Q-learning, 3-step returns, 7 s mini-races, epsilon/Boltzmann exploration, champion tests in a background process. Pick it under *Learning algorithm* and use the *Linesight preset* for the rewards.
+- **Observation (~290 values):** 40 line points ahead in 3D (400 m), last 5 actions, recent slide/rotation history, car-frame velocity, wheels, route lookahead, ghost pace, offset from the racing line, effects, and 41 lidar rays.
 - **Actions:** 21 progressive steering levels × gas, coast or brake, deciding every 50 ms.
 - **Champion tests:** every 50 laps the AI drives one lap without exploration. If it's faster, it becomes the new champion (`champion.zip` + `champion.txt`); if training gets worse, it rolls back to the champion.
 - **Ghost and racing line:** reward for time gained on the fastest run so far. The racing line is rebuilt from each new champion.

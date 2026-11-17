@@ -222,7 +222,9 @@ class TMEnv(gym.Env):
     PREVIEW = (15, 30, 45, 60, 80, 100, 130, 160, 200, 250)    # track memory: where the line goes, far ahead
     N_HIST = 5                            # short memory: the last 5 decisions' slide / rotation / speed
     N_MEM = 2 * len(PREVIEW) + 3 * N_HIST
-    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM   # non-lidar features
+    PATH3D = 40                           # Linesight-style: 40 line points, every 10 m, x/y/z in the car frame
+    N_PATH = 3 * PATH3D + 12              # + 3 more previous actions (5 in total)
+    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH   # non-lidar features
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
@@ -635,6 +637,10 @@ class TMEnv(gym.Env):
         self.mem = self.mem[1:] + [[float(np.clip(lv[0] / 30.0, -3, 3)), float(np.clip(av[1] / 5.0, -3, 3)),
                                     float(v.speed) / 100.0]]
         f += [x for row in self.mem for x in row]                    # oldest first
+        for k in range(1, self.PATH3D + 1):                          # the line ahead in 3D, up to 400 m
+            loc = to_car_frame(q, self._route_point(s + 10.0 * k) - pos)
+            f += list(np.clip(loc / 100.0, -5.0, 5.0))
+        f += list(self.pa_old)
         hit = np.asarray(t.lidar.hit, dtype=bool)
         dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
@@ -662,6 +668,8 @@ class TMEnv(gym.Env):
         self._prev_lv, self.since_hit, self.air = None, 20, 0
         self.pa = np.zeros(8)
         self.mem = [[0.0, 0.0, 0.0]] * self.N_HIST
+        self.pa_old = np.zeros(12)
+        self.sbuf = []
         self.limit = self._limit_ticks()
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
@@ -750,6 +758,7 @@ class TMEnv(gym.Env):
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
             r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed, self._s = speed, s
+        self.pa_old = np.concatenate([self.pa[4:8], self.pa_old[:8]])
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
         self.hist.append([*pos, tick, taken])
 
@@ -770,7 +779,9 @@ class TMEnv(gym.Env):
             r["end"] = -(W["w_offzone"] + give_up)
         else:
             self.slow = self.slow + self.ticks if (speed < 1.5 and tick > 300) else 0
-            if self.slow >= 200:                                                # stuck for 2 s
+            self.sbuf = (self.sbuf + [s])[-max(2, 200 // self.ticks):]
+            no_progress = len(self.sbuf) >= 200 // self.ticks and self.sbuf[-1] - self.sbuf[0] < 2.0 and tick > 300
+            if self.slow >= 200 or no_progress:                                 # stuck: <2 m along the line in 2 s
                 terminated, end = True, "stuck"
                 r["end"] = -(W["w_stuck"] + give_up)
             elif (self.role == "training" and self.cut_behind and tick > 500
@@ -1287,4 +1298,8 @@ if __name__ == "__main__":
         cfg["resume"] = False
     if not cfg["map"]:
         raise SystemExit("No map set. Pass --map or set it in the dashboard (Settings).")
-    {"selftest": selftest, "train": train, "drive": lambda c: drive(c, a.model)}[a.cmd](cfg)
+    if cfg["algo"] == "iqn" and a.cmd in ("train", "drive"):
+        import iqn
+        {"train": iqn.train, "drive": iqn.drive}[a.cmd](cfg)
+    else:
+        {"selftest": selftest, "train": train, "drive": lambda c: drive(c, a.model)}[a.cmd](cfg)

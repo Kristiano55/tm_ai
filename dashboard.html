@@ -76,12 +76,12 @@ input[type=text],input[type=number],select{background:#101317;border:1px solid v
   <div class="card"><pre id="log"></pre></div>
 </main>
 <main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
-  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <span class="mut" id="saved"></span></p>
+  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <button id="bLs">Linesight preset</button> <span class="mut" id="saved"></span></p>
   <p class="mut">Training settings apply the next time you press Start training. Reward weights (and "end a lap when behind the ghost") are picked up live by running cars at the start of their next lap.</p></div></main>
 <script>
 const $=id=>document.getElementById(id);
 const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
-const FIELDS=[['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+const FIELDS=[['algo','Learning algorithm','select'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
  ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
@@ -90,12 +90,13 @@ const FIELDS=[['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['e
  ['ghost_window_s','Ghost reward counts within this far behind the ghost (s)','number'],
  ['vcp_every_s','Virtual checkpoints every N s of the PB/ghost pace (0 = off)','number'],['test_tries','Champion test = best of N laps','number'],
  ['horizon_s','Planning horizon (s)','number'],
+ ['minirace_s','IQN: mini-race length (s)','number'],['iqn_reuse','IQN: learn from each experience x times','number'],['iqn_buffer','IQN: replay memory size','number'],
  ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
  ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
  ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];
-const OPTS={steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
+const OPTS={algo:[['ppo','PPO (original)'],['iqn','IQN - Linesight-style (replay memory, mini-races; new model)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
 let cfgLoaded=false;
-let WMETA=[], LEAN={};
+let WMETA=[], LEAN={}, LINES={};
 function fillForm(c,w){ WMETA=w||WMETA;
   const fld=([k,l,t])=>t=='checkbox'?
     `<label class="ck"><input type="checkbox" id="f_${k}" ${c[k]?'checked':''}> ${l}</label>`:t=='select'?
@@ -111,6 +112,7 @@ $('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
 $('bStart').onclick=()=>post('/api/start'); $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
 $('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
 $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
+$('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
 $('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
 $('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
 
@@ -159,7 +161,7 @@ function drawMap(cv,track,ends){
 function movAvg(p,k){ const o=[];let s=0;for(let i=0;i<p.length;i++){s+=p[i][1];if(i>=k)s-=p[i-k][1];o.push([p[i][0],s/Math.min(i+1,k)])}return o }
 
 function render(s){
-  const c=s.config; if(!cfgLoaded){fillForm(c,s.weights);cfgLoaded=true} LEAN=s.lean||LEAN;
+  const c=s.config; if(!cfgLoaded){fillForm(c,s.weights);cfgLoaded=true} LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
   drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
   const run=s.state=='running'||s.state=='playing';

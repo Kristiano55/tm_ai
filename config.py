@@ -22,6 +22,10 @@ DEFAULTS = {
     "steer_mode": "progressive",   # "progressive" (fine near centre, coarse at the edges) or "uniform" (10% steps)
     "cut_behind_s": 5.0,
     "ghost_window_s": 2.0,
+    "algo": "ppo",             # "ppo" or "iqn" (Linesight-style: replay buffer, distributional Q, mini-races)
+    "minirace_s": 7.0,         # IQN: the AI maximises progress over the next N seconds (Linesight: 7)
+    "iqn_reuse": 16,           # IQN: how often each experience is learned from on average
+    "iqn_buffer": 300000,      # IQN: replay memory size (experiences)
     "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
     "horizon_s": 20.0,         # how far ahead (seconds) the AI weighs rewards     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
@@ -66,6 +70,10 @@ LEAN = {k: 0.0 for k in WEIGHTS}
 LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
             w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05)
 
+# "Linesight" preset: exactly two terms, at Linesight's ratio (0.01 per metre, -0.0012 per ms = -0.06 per 50 ms).
+LINESIGHT = {k: 0.0 for k in WEIGHTS}
+LINESIGHT.update(w_progress=0.01, w_time=0.06)
+
 
 def load():
     cfg, on_disk = dict(DEFAULTS), None
@@ -104,6 +112,8 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    if out["algo"] not in ("ppo", "iqn"):
+        out["algo"] = "ppo"
     if out["steer_mode"] not in ("progressive", "uniform"):
         out["steer_mode"] = DEFAULTS["steer_mode"]
     out["run"] = "".join(c for c in out["run"] if c.isalnum() or c in "-_") or "calm"

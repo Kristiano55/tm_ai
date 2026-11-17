@@ -153,7 +153,7 @@ def build_state():
         log = []
     return {
         "config": cfg, "state": state, "reason": reason,
-        "can_play": (rd / "champion.zip").exists(),
+        "can_play": (rd / ("champion.pt" if cfg["algo"] == "iqn" else "champion.zip")).exists(),
         "pb_ms": cfg["pb_seconds"] * 1000 if cfg["pb_seconds"] else None,
         "champion_ms": best.get("champion_ms"), "first_test_ms": best.get("first_test_ms"),
         "laps_total": S.n_all, "mid_laps": S.n_mid,
@@ -173,7 +173,7 @@ def build_state():
         "log": log,
         "rb": {k: sum(r.get(k, 0.0) for r in S.rbs[-5:]) / max(1, len(S.rbs[-5:]))
                for k in sorted({k for r in S.rbs[-5:] for k in r})},
-        "ends": S.ends[-1500:], "track": track_outline(rd), "lean": cfgmod.LEAN,
+        "ends": S.ends[-1500:], "track": track_outline(rd), "lean": cfgmod.LEAN, "linesight": cfgmod.LINESIGHT,
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
         "best_run": read_json(rd / "best_run.json") or None,
         "last_play": read_json(rd / "play_result.json") or None,
@@ -212,7 +212,7 @@ def start(kind):
         return 409, "Something is already running."
     if not cfg["map"]:
         return 400, "Set the map path in Settings first."
-    if kind == "play" and not (cfgmod.run_dir(cfg) / "champion.zip").exists():
+    if kind == "play" and not (cfgmod.run_dir(cfg) / ("champion.pt" if cfg["algo"] == "iqn" else "champion.zip")).exists():
         return 400, "No champion yet."
     rd = cfgmod.run_dir(cfg)
     logf = open(rd / "train.log", "a", encoding="utf-8")
