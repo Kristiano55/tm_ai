@@ -323,8 +323,9 @@ def train(cfg):
                 x = torch.from_numpy(np.concatenate([o, (tau / H)[:, None]], 1).astype(np.float32))
                 x2 = torch.from_numpy(np.concatenate([o2, (np.maximum(tau - k, 0) / H)[:, None]], 1).astype(np.float32))
                 with torch.no_grad():
-                    a2 = tgt.q(x2, N_Q).argmax(1)
-                    z2 = tgt(x2, torch.rand(BATCH, N_Q)).gather(2, a2[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
+                    zt = tgt(x2, torch.rand(BATCH, N_Q))                    # one target pass: pick + value
+                    a2 = zt.mean(1).argmax(1)
+                    z2 = zt.gather(2, a2[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
                     tgt_z = (torch.from_numpy(R.astype(np.float32))[:, None]
                              + torch.from_numpy((gamma ** k * boot).astype(np.float32))[:, None] * z2)
                 taus = torch.rand(BATCH, N_Q)
@@ -346,18 +347,15 @@ def train(cfg):
                             pt.mul_(0.98).add_(p, alpha=0.02)
 
             # --- tests, rollback, logging, stop ---
+            if not tester.is_alive():                                     # tester died: start a new one
+                T.say("Champion tester stopped unexpectedly, restarting it")
+                inbox, busy = ctx.Queue(), ctx.Value("i", 0)
+                tester = ctx.Process(target=test_worker, args=(cfg, str(run_dir), n_in, n_act, inbox, busy), daemon=True)
+                tester.start()
             if since >= cfg["test_every_laps"] and not busy.value:
                 busy.value = 1
                 since = 0
                 inbox.put({"sd": {k: v.clone() for k, v in net.state_dict().items()}, "lap_n": laps})
-            if (run_dir / "ROLLBACK").exists():
-                try:
-                    sd = torch.load(run_dir / "champion.pt", map_location="cpu")
-                    net.load_state_dict(sd)
-                    tgt.load_state_dict(sd)
-                except Exception as e:
-                    T.say(f"Rollback failed ({str(e)[:60]})")
-                (run_dir / "ROLLBACK").unlink(missing_ok=True)
             now = time.time()
             if now - last_log > 20 and losses:
                 log(k="upd", u=upd, steps=steps, v=float(np.mean(qs)), vl=float(np.mean(losses)), ent=eps, ev=0.0,
@@ -368,6 +366,14 @@ def train(cfg):
                 save()
             if now - last_chk > 2.0:
                 last_chk = now
+                if (run_dir / "ROLLBACK").exists():
+                    try:
+                        sd = torch.load(run_dir / "champion.pt", map_location="cpu")
+                        net.load_state_dict(sd)
+                        tgt.load_state_dict(sd)
+                    except Exception as e:
+                        T.say(f"Rollback failed ({str(e)[:60]})")
+                    (run_dir / "ROLLBACK").unlink(missing_ok=True)
                 if (run_dir / "STOP").exists():
                     reason = "stopped by user"
                     break
