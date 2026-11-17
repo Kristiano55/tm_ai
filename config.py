@@ -14,6 +14,8 @@ DEFAULTS = {
     "pb_seconds": 0.0,         # your personal best (0 = unset)
     "stop_at_pb": False,       # stop training once the champion beats the PB
     "time_limit_min": 0,       # stop after N minutes (0 = until stopped)
+    "discord_webhook": "",     # Discord channel webhook URL: training updates on your phone (empty = off)
+    "discord_every_min": 15,   # minutes between Discord summaries while training (new champions post at once)
     "test_every_laps": 50,     # champion test after this many training laps
     "rollback_after": 3,       # roll back to the champion after N bad tests in a row
     "rollback_margin_s": 1.0,  # a test counts as bad if slower than champion by this much

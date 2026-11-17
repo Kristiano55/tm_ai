@@ -76,12 +76,12 @@ input[type=text],input[type=number],select{background:#101317;border:1px solid v
   <div class="card"><pre id="log"></pre></div>
 </main>
 <main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
-  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <button id="bLs">Linesight preset</button> <span class="mut" id="saved"></span></p>
+  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <button id="bLs">Linesight preset</button> <button id="bDc">Send Discord test</button> <span class="mut" id="saved"></span></p>
   <p class="mut">Training settings apply the next time you press Start training. Reward weights (and "end a lap when behind the ghost") are picked up live by running cars at the start of their next lap.</p></div></main>
 <script>
 const $=id=>document.getElementById(id);
 const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
-const FIELDS=[['algo','Learning algorithm','select'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; empty = off)','text'],['discord_every_min','Discord summary every N minutes','number'],['algo','Learning algorithm','select'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
  ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
@@ -114,6 +114,7 @@ $('bStart').onclick=()=>post('/api/start'); $('bStop').onclick=()=>post('/api/st
 $('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
 $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
 $('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
+$('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('saved').textContent=j.message};
 $('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
 $('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
 

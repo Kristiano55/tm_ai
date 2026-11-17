@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config as cfgmod
@@ -180,6 +181,75 @@ def build_state():
     }
 
 
+# --- Discord updates (webhook: no bot needed) --------------------------------------------------------
+def _fmt(ms):
+    return "–" if ms is None else f"{ms / 1000:.3f} s"
+
+
+def discord_post(url, embed):
+    import urllib.request
+    data = json.dumps({"username": "Trackmania AI", "embeds": [embed]}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "tm_ai-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status
+
+
+def discord_embed(st, title, color):
+    c = st["config"]
+    pb, ch = st.get("pb_ms"), st.get("champion_ms")
+    vs = ""
+    if ch and pb:
+        d = (ch - pb) / 1000
+        vs = f"  ({'+' if d >= 0 else ''}{d:.3f} vs PB)"
+    last = st["tests"][-1] if st.get("tests") else None
+    last_txt = "–" if not last else (_fmt(last["ms"]) if last["ms"] else "no finish") + (" (new champion)" if last.get("promoted") else "")
+    br = st.get("best_run") or {}
+    f = [("Champion", _fmt(ch) + vs, False),
+         ("Your PB", _fmt(pb), True),
+         ("Fastest run saved", _fmt(br.get("ms")), True),
+         ("Best training lap", f"{st['best_lap']:.3f} s" if st.get("best_lap") else "–", True),
+         ("Recent average", f"{st['recent_avg']:.3f} s" if st.get("recent_avg") else "–", True),
+         ("Full laps finished", f"{st['finished_pct']}%" if st.get("finished_pct") is not None else "–", True),
+         ("Last champion test", last_txt, True),
+         ("Laps", f"{st['session_laps']:,} this session · {st['laps_total']:,} total", True),
+         ("Speed", f"{st['speed']:.0f}x real time" if st.get("speed") else "–", True),
+         ("Session", f"{st['session_min']:.0f} min · {st.get('steps', 0):,} steps", True)]
+    return {"title": title, "color": color,
+            "description": f"**{c['map'].replace('\\', '/').split('/')[-1].replace('.Map.Gbx', '')}** · run `{c['run']}` · {c.get('algo', 'ppo').upper()} · {c['envs']} cars",
+            "fields": [{"name": n, "value": v, "inline": i} for n, v, i in f],
+            "footer": {"text": "state: " + st["state"] + (f" ({st['reason']})" if st.get("reason") else "")},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def discord_loop():
+    last_post, last_champ, last_state = 0.0, None, None
+    while True:
+        time.sleep(20)
+        try:
+            cfg = cfgmod.load()
+            url = cfg.get("discord_webhook", "").strip()
+            if not url:
+                continue
+            st = build_state()
+            ch, state = st.get("champion_ms"), st["state"]
+            if last_champ is None:
+                last_champ = ch or 0
+            if ch and last_champ and ch < last_champ:
+                discord_post(url, discord_embed(st, f"🏁 New champion: {_fmt(ch)}", 0x39C46A))
+                last_post = time.time()
+            last_champ = ch or last_champ
+            if last_state == "running" and state != "running":
+                discord_post(url, discord_embed(st, "⏹ Training stopped", 0xE5484D if "crash" in st.get("reason", "")
+                                                or "unexpected" in st.get("reason", "") else 0x8B93A0))
+            elif state == "running" and time.time() - last_post >= max(1, cfg.get("discord_every_min", 15)) * 60:
+                discord_post(url, discord_embed(st, "📊 Training update", 0x3B8BEA))
+                last_post = time.time()
+            last_state = state
+        except Exception:
+            pass
+
+
 def frozen_guard():
     """Training that stopped moving (no heartbeat for 150 s) is restarted from its last checkpoint."""
     restarts = []
@@ -278,6 +348,16 @@ class Handler(BaseHTTPRequestHandler):
             code, msg = start("play")
         elif self.path == "/api/stop":
             stop()
+        elif self.path == "/api/discord_test":
+            url = cfgmod.load().get("discord_webhook", "").strip()
+            if not url:
+                code, msg = 400, "Save a Discord webhook URL in Settings first."
+            else:
+                try:
+                    discord_post(url, discord_embed(build_state(), "✅ Test message from your Trackmania AI", 0x3B8BEA))
+                    msg = "Sent - check your Discord channel."
+                except Exception as e:
+                    code, msg = 502, f"Discord refused it: {str(e)[:120]}"
         elif self.path == "/api/open":
             open_folder(cfgmod.run_dir(cfgmod.load()))
         else:
@@ -294,6 +374,7 @@ if __name__ == "__main__":
     print("Trackmania AI dashboard:", url, "(Ctrl+C to quit)")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     threading.Thread(target=frozen_guard, daemon=True).start()
+    threading.Thread(target=discord_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
