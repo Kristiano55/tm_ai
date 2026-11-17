@@ -291,6 +291,9 @@ class TMEnv(gym.Env):
             m = os.path.getmtime(f)
         except OSError:
             m = None
+        done = bool(self.champ_ms) or (self.run_dir / "best_run.json").exists()   # the AI has finished a lap
+        if not done:                            # no mid-track starts until then: learn the start first
+            return
         if m == self._ca_m:
             return
         self._ca_m = m
