@@ -41,7 +41,6 @@ def sched(points, x):
 
 
 LR = [(0, 1e-3), (3e6, 5e-5), (15e6, 1e-5)]
-EPS = [(0, 1.0), (50e3, 1.0), (300e3, 0.1), (3e6, 0.03)]
 BOLTZ = [(0, 0.15), (3e6, 0.03)]
 GAMMA = [(0, 0.999), (2.5e6, 1.0)]
 TAU_B = 0.01
@@ -205,13 +204,23 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy):
 
 
 # --- training ---------------------------------------------------------------------------------------
+def eps_points(cfg):
+    """Random-action schedule from the settings: 1.0 for the first steps, then mid, then end."""
+    f, m, e = cfg["iqn_eps_full_steps"], max(cfg["iqn_eps_mid_steps"], cfg["iqn_eps_full_steps"] + 1), cfg["iqn_eps_end_steps"]
+    return [(0, 1.0), (f, 1.0), (m, cfg["iqn_eps_mid"]), (max(e, m + 1), cfg["iqn_eps_end"])]
+
+
+PUBLISH_EVERY = 20        # learner updates between weight copies to the driving network (Linesight-style)
+
+
 def train(cfg):
+    import threading
     from stable_baselines3.common.vec_env import SubprocVecEnv
 
     run_dir = cfgmod.run_dir(cfg)
     (run_dir / "STOP").unlink(missing_ok=True)
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
-    torch.set_num_threads(4)
+    torch.set_num_threads(1)                                  # driving: tiny batches, one thread is fastest
     T.prepare_guide(cfg, run_dir)
     events, status_file = run_dir / "events.jsonl", run_dir / "status.json"
 
@@ -227,16 +236,20 @@ def train(cfg):
                                    "started": t0})
 
     n_env = cfg["envs"]
+    if n_env + 3 > (os.cpu_count() or 1):
+        T.say(f"Warning: {n_env} cars + learner + tester need ~{n_env + 3} CPU threads, this PC has "
+              f"{os.cpu_count()}: fewer cars may run faster.")
     envs = SubprocVecEnv([partial(T._make_env, cfg, str(run_dir)) for _ in range(n_env)])
     dim = envs.observation_space.shape[0]
     n_act = int(envs.action_space.nvec[0] * envs.action_space.nvec[1])
     n_in = dim + 1
     H = max(N_STEP + 1, int(round(cfg["minirace_s"] * 100 / cfg["ticks_per_step"])))      # mini-race, in steps
     time_cost = cfg["w_time"] * cfg["ticks_per_step"] / 5.0
+    EPS_PTS = eps_points(cfg)
 
-    net, tgt = IQNNet(n_in, n_act), IQNNet(n_in, n_act)
+    net, tgt, act = IQNNet(n_in, n_act), IQNNet(n_in, n_act), IQNNet(n_in, n_act)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, eps=1e-4)
-    steps, trained, upd = 0, 0, 0
+    S = {"steps": 0, "trained": 0, "upd": 0}                # shared with the learner thread
     ckpt = run_dir / "latest.pt"
     meta = T.read_json(run_dir / "iqn.json")
     if cfg["resume"] and ckpt.exists() and meta.get("n_in") == n_in and meta.get("n_act") == n_act:
@@ -245,40 +258,101 @@ def train(cfg):
             net.load_state_dict(d["net"])
             tgt.load_state_dict(d["tgt"])
             opt.load_state_dict(d["opt"])
-            steps = int(d.get("steps", 0))
-            trained = max(0, (steps - WARMUP)) * cfg["iqn_reuse"]
-            T.say(f"Resumed IQN from latest.pt ({steps:,} steps)")
+            S["steps"] = int(d.get("steps", 0))
+            S["trained"] = max(0, (S["steps"] - WARMUP)) * cfg["iqn_reuse"]
+            T.say(f"Resumed IQN from latest.pt ({S['steps']:,} steps)")
         except Exception as e:
             T.say(f"Cannot resume IQN ({str(e)[:80]}), starting fresh")
     else:
         tgt.load_state_dict(net.state_dict())
+    act.load_state_dict(net.state_dict())
     T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act})
     buf = Replay(cfg["iqn_buffer"], dim)
+    buf_lock, net_lock, act_lock = threading.Lock(), threading.Lock(), threading.Lock()
+    stop_evt, err = threading.Event(), []
+    stats = {"losses": [], "qs": []}
 
     ctx = mp.get_context("spawn")
-    inbox, busy = ctx.Queue(), ctx.Value("i", 0)
-    tester = ctx.Process(target=test_worker, args=(cfg, str(run_dir), n_in, n_act, inbox, busy), daemon=True)
-    tester.start()
+    tester = inbox = busy = None
+
+    def start_tester():
+        nonlocal tester, inbox, busy
+        inbox, busy = ctx.Queue(), ctx.Value("i", 0)
+        tester = ctx.Process(target=test_worker, args=(cfg, str(run_dir), n_in, n_act, inbox, busy), daemon=True)
+        tester.start()
+
+    start_tester()
 
     def save():
-        torch.save({"net": net.state_dict(), "tgt": tgt.state_dict(), "opt": opt.state_dict(), "steps": steps}, ckpt)
+        with net_lock:
+            torch.save({"net": net.state_dict(), "tgt": tgt.state_dict(), "opt": opt.state_dict(),
+                        "steps": S["steps"]}, ckpt)
+
+    # --- learner: runs beside the cars (torch releases the GIL), aims for reuse x the collected experience ---
+    def learner():
+        torch.set_num_threads(2)
+        try:
+            while not stop_evt.is_set():
+                steps = S["steps"]
+                if buf.n < WARMUP or S["trained"] >= (steps - WARMUP) * cfg["iqn_reuse"]:
+                    time.sleep(0.002)                         # ahead of the target: wait for more driving
+                    continue
+                gamma = sched(GAMMA, steps)
+                with buf_lock:
+                    o, ac, r, k, o2, end, c = buf.sample(BATCH)
+                tau = np.random.randint(1, H + 1, BATCH)                  # time left in this sample's mini-race
+                m = np.minimum(k, tau)
+                disc = gamma ** np.arange(N_STEP)
+                mask = np.arange(N_STEP)[None, :] < m[:, None]
+                R = (r * disc * mask).sum(1)
+                # a failed race keeps paying the time cost for the rest of its mini-race (giving up never pays)
+                R -= np.where(end == 2, c * np.maximum(tau - m, 0), 0.0)
+                boot = (end == 0) & (tau > k)
+                x = torch.from_numpy(np.concatenate([o, (tau / H)[:, None]], 1).astype(np.float32))
+                x2 = torch.from_numpy(np.concatenate([o2, (np.maximum(tau - k, 0) / H)[:, None]], 1).astype(np.float32))
+                with net_lock:
+                    for g in opt.param_groups:
+                        g["lr"] = sched(LR, steps)
+                    with torch.no_grad():
+                        zt = tgt(x2, torch.rand(BATCH, N_Q))                    # one target pass: pick + value
+                        a2 = zt.mean(1).argmax(1)
+                        z2 = zt.gather(2, a2[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
+                        tgt_z = (torch.from_numpy(R.astype(np.float32))[:, None]
+                                 + torch.from_numpy((gamma ** k * boot).astype(np.float32))[:, None] * z2)
+                    taus = torch.rand(BATCH, N_Q)
+                    z = net(x, taus).gather(2, torch.from_numpy(ac)[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
+                    td = tgt_z[:, None, :] - z[:, :, None]
+                    hub = torch.where(td.abs() <= KAPPA, 0.5 * td ** 2 / KAPPA, td.abs() - 0.5 * KAPPA)
+                    loss = ((taus[:, :, None] - (td.detach() < 0).float()).abs() * hub).sum(1).mean()
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(net.parameters(), 30.0)
+                    opt.step()
+                    S["trained"] += BATCH
+                    S["upd"] += 1
+                    if S["upd"] % 4 == 0:                                  # soft target update
+                        with torch.no_grad():
+                            for p, pt in zip(net.parameters(), tgt.parameters()):
+                                pt.mul_(0.98).add_(p, alpha=0.02)
+                    if S["upd"] % PUBLISH_EVERY == 0:                      # fresh weights for the cars
+                        sd = {kk: v.detach().clone() for kk, v in net.state_dict().items()}
+                        with act_lock:
+                            act.load_state_dict(sd)
+                stats["losses"].append(loss.item())
+                stats["qs"].append(float(z.detach().mean()))
+        except Exception as e:
+            err.append(e)
+            stop_evt.set()
 
     rng = np.random.default_rng()
-    obs = envs.reset()
     pend = [[] for _ in range(n_env)]          # n-step windows: (obs, action, reward)
-    laps = since = 0
-    rb, rb_steps, last_log, last_chk, losses, qs = {}, 0, time.time(), 0.0, [], []
-    reason = "stopped"
-    log(k="start", cfg=cfg)
-    status("running")
-    T.say(f"Training started: IQN, {n_env} cars, mini-race {cfg['minirace_s']:.0f} s, reuse x{cfg['iqn_reuse']}, CPU.")
-    try:
-        while True:
-            T.watchdog()
-            eps, beps = sched(EPS, steps), sched(BOLTZ, steps)
-            a = choose(net, obs, eps, beps, rng)
-            nobs, rew, dones, infos = envs.step(np.stack([act_index(x) for x in a]))
-            steps += n_env
+    C = {"laps": 0, "since": 0}
+    rb, rb_steps = {}, 0
+
+    def collect(obs, a, nobs, rew, dones, infos):
+        """Turn one step of every car into n-step samples; log finished laps."""
+        nonlocal rb, rb_steps
+        with buf_lock:
             for i in range(n_env):
                 pend[i].append((obs[i], int(a[i]), float(rew[i])))
                 if dones[i]:
@@ -292,88 +366,112 @@ def train(cfg):
                         o2 = last if ends_here else pend[i][j + N_STEP][0]
                         buf.add(w[0][0], w[0][1], [x[2] for x in w], len(w), o2, end if ends_here else 0, time_cost)
                     pend[i] = []
-                    laps += 1
-                    since += 1
-                    fin = bool(info.get("finished"))
-                    log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
-                        end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
-                    for kk, vv in (info.get("rb") or {}).items():
-                        rb[kk] = rb.get(kk, 0.0) + vv
-                    rb_steps += int(info.get("rsteps", 0))
                 elif len(pend[i]) > N_STEP:
                     w = pend[i][:N_STEP]
                     buf.add(w[0][0], w[0][1], [x[2] for x in w], N_STEP, pend[i][N_STEP][0], 0, time_cost)
                     pend[i].pop(0)
-            obs = nobs
+        for i in range(n_env):
+            if dones[i]:
+                info = infos[i]
+                C["laps"] += 1
+                C["since"] += 1
+                fin = bool(info.get("finished"))
+                log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
+                    end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
+                for kk, vv in (info.get("rb") or {}).items():
+                    rb[kk] = rb.get(kk, 0.0) + vv
+                rb_steps += int(info.get("rsteps", 0))
 
-            # --- learning: keep (experiences learned from) ~= reuse x (experiences collected) ---
-            gamma = sched(GAMMA, steps)
-            for g in opt.param_groups:
-                g["lr"] = sched(LR, steps)
-            while buf.n >= WARMUP and trained < (steps - WARMUP) * cfg["iqn_reuse"]:
-                o, ac, r, k, o2, end, c = buf.sample(BATCH)
-                tau = np.random.randint(1, H + 1, BATCH)                  # time left in this sample's mini-race
-                m = np.minimum(k, tau)
-                disc = gamma ** np.arange(N_STEP)
-                mask = np.arange(N_STEP)[None, :] < m[:, None]
-                R = (r * disc * mask).sum(1)
-                # a failed race keeps paying the time cost for the rest of its mini-race (giving up never pays)
-                R -= np.where(end == 2, c * np.maximum(tau - m, 0), 0.0)
-                boot = (end == 0) & (tau > k)
-                x = torch.from_numpy(np.concatenate([o, (tau / H)[:, None]], 1).astype(np.float32))
-                x2 = torch.from_numpy(np.concatenate([o2, (np.maximum(tau - k, 0) / H)[:, None]], 1).astype(np.float32))
-                with torch.no_grad():
-                    zt = tgt(x2, torch.rand(BATCH, N_Q))                    # one target pass: pick + value
-                    a2 = zt.mean(1).argmax(1)
-                    z2 = zt.gather(2, a2[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
-                    tgt_z = (torch.from_numpy(R.astype(np.float32))[:, None]
-                             + torch.from_numpy((gamma ** k * boot).astype(np.float32))[:, None] * z2)
-                taus = torch.rand(BATCH, N_Q)
-                z = net(x, taus).gather(2, torch.from_numpy(ac)[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
-                td = tgt_z[:, None, :] - z[:, :, None]
-                hub = torch.where(td.abs() <= KAPPA, 0.5 * td ** 2 / KAPPA, td.abs() - 0.5 * KAPPA)
-                loss = ((taus[:, :, None] - (td.detach() < 0).float()).abs() * hub).sum(1).mean()
-                opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(net.parameters(), 30.0)
-                opt.step()
-                trained += BATCH
-                upd += 1
-                losses.append(loss.item())
-                qs.append(float(z.mean()))
-                if upd % 4 == 0:                                          # soft target update
-                    with torch.no_grad():
-                        for p, pt in zip(net.parameters(), tgt.parameters()):
-                            pt.mul_(0.98).add_(p, alpha=0.02)
+    def check_rollback():
+        if not (run_dir / "ROLLBACK").exists():
+            return
+        try:
+            sd = torch.load(run_dir / "champion.pt", map_location="cpu")
+            with net_lock:
+                net.load_state_dict(sd)
+                tgt.load_state_dict(sd)
+            with act_lock:
+                act.load_state_dict(sd)
+        except Exception as e:
+            T.say(f"Rollback failed ({str(e)[:60]})")
+        (run_dir / "ROLLBACK").unlink(missing_ok=True)
+
+    obs = envs.reset()
+    reason = "stopped"
+    log(k="start", cfg=cfg)
+    status("running")
+
+    warm = cfg["iqn_warm_run"]
+    if warm and S["steps"] == 0:
+        src = cfgmod.ROOT / "runs" / warm / "champion.zip"
+        try:
+            from stable_baselines3 import PPO
+            if not src.exists():
+                raise FileNotFoundError(f"no champion.zip in run '{warm}'")
+            ppo = PPO.load(str(src), device="cpu")
+            if ppo.observation_space.shape != (dim,):
+                raise ValueError("that run uses a different input layout")
+            T.say(f"Warm start: driving ~50k steps with the champion of PPO run '{warm}' into the replay memory ...")
+            nv = envs.action_space.nvec
+            while S["steps"] < 50000:
+                T.watchdog()
+                pa, _ = ppo.predict(obs, deterministic=True)
+                rnd = rng.random(n_env) < 0.1
+                pa[rnd] = np.stack([rng.integers(nv[0], size=rnd.sum()), rng.integers(nv[1], size=rnd.sum())], 1)
+                nobs, rew, dones, infos = envs.step(pa)
+                collect(obs, pa[:, 0] * nv[1] + pa[:, 1], nobs, rew, dones, infos)
+                S["steps"] += n_env
+                obs = nobs
+                if (run_dir / "STOP").exists():
+                    break
+            S["trained"] = 0
+            T.say(f"Warm start done: {buf.n:,} experiences from the PPO champion.")
+        except Exception as e:
+            T.say(f"Warm start skipped ({str(e)[:100]})")
+
+    T.say(f"Training started: IQN, {n_env} cars, mini-race {cfg['minirace_s']:.0f} s, reuse x{cfg['iqn_reuse']}, CPU "
+          "(learning runs beside the driving).")
+    th = threading.Thread(target=learner, daemon=True)
+    th.start()
+    last_log, last_chk = time.time(), 0.0
+    try:
+        while True:
+            T.watchdog()
+            if err:
+                raise err[0]
+            steps = S["steps"]
+            eps, beps = sched(EPS_PTS, steps), sched(BOLTZ, steps)
+            with act_lock:
+                a = choose(act, obs, eps, beps, rng)
+            nobs, rew, dones, infos = envs.step(np.stack([act_index(x) for x in a]))
+            S["steps"] += n_env
+            collect(obs, a, nobs, rew, dones, infos)
+            obs = nobs
 
             # --- tests, rollback, logging, stop ---
             if not tester.is_alive():                                     # tester died: start a new one
                 T.say("Champion tester stopped unexpectedly, restarting it")
-                inbox, busy = ctx.Queue(), ctx.Value("i", 0)
-                tester = ctx.Process(target=test_worker, args=(cfg, str(run_dir), n_in, n_act, inbox, busy), daemon=True)
-                tester.start()
-            if since >= cfg["test_every_laps"] and not busy.value:
+                start_tester()
+            if C["since"] >= cfg["test_every_laps"] and not busy.value:
+                check_rollback()                                          # never test before a pending rollback
                 busy.value = 1
-                since = 0
-                inbox.put({"sd": {k: v.clone() for k, v in net.state_dict().items()}, "lap_n": laps})
+                C["since"] = 0
+                with net_lock:
+                    sd = {k: v.clone() for k, v in net.state_dict().items()}
+                inbox.put({"sd": sd, "lap_n": C["laps"]})
             now = time.time()
-            if now - last_log > 20 and losses:
-                log(k="upd", u=upd, steps=steps, v=float(np.mean(qs)), vl=float(np.mean(losses)), ent=eps, ev=0.0,
-                    speed=steps * cfg["ticks_per_step"] / 100.0 / max(now - t0, 1e-6))
+            if now - last_log > 20 and stats["losses"]:
+                losses, qs = stats["losses"], stats["qs"]
+                stats["losses"], stats["qs"] = [], []
+                log(k="upd", u=S["upd"], steps=S["steps"], v=float(np.mean(qs)), vl=float(np.mean(losses)), ent=eps,
+                    ev=0.0, speed=S["steps"] * cfg["ticks_per_step"] / 100.0 / max(now - t0, 1e-6))
                 if rb_steps:
                     log(k="rb", r={kk: round(vv / rb_steps, 5) for kk, vv in rb.items()})
-                rb, rb_steps, losses, qs, last_log = {}, 0, [], [], now
+                rb, rb_steps, last_log = {}, 0, now
                 save()
             if now - last_chk > 2.0:
                 last_chk = now
-                if (run_dir / "ROLLBACK").exists():
-                    try:
-                        sd = torch.load(run_dir / "champion.pt", map_location="cpu")
-                        net.load_state_dict(sd)
-                        tgt.load_state_dict(sd)
-                    except Exception as e:
-                        T.say(f"Rollback failed ({str(e)[:60]})")
-                    (run_dir / "ROLLBACK").unlink(missing_ok=True)
+                check_rollback()
                 if (run_dir / "STOP").exists():
                     reason = "stopped by user"
                     break
@@ -391,6 +489,8 @@ def train(cfg):
         reason = f"crashed: {str(e)[:120]}"
         raise
     finally:
+        stop_evt.set()
+        th.join(timeout=30)
         save()
         log(k="stop", reason=reason)
         status("stopped", reason)

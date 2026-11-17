@@ -96,6 +96,15 @@ def to_car_frame(q, v):
     return v + w * t + np.cross(qv, t)
 
 
+def to_car_frame_many(q, vs):
+    """to_car_frame for a batch of world vectors vs [N, 3] (same numbers, one numpy call)."""
+    x, y, z, w = (float(c) for c in q)
+    qv = np.array([-x, -y, -z])
+    vs = np.asarray(vs, dtype=np.float64)
+    t = 2.0 * np.cross(qv, vs)
+    return vs + w * t + np.cross(qv, t)
+
+
 # --- reference line (the driven path of a finished lap) ---------------------------------------
 def make_line(xyz):
     """Smooth a driven path and thin it to ~1 m spacing."""
@@ -224,12 +233,14 @@ class TMEnv(gym.Env):
     N_MEM = 2 * len(PREVIEW) + 3 * N_HIST
     PATH3D = 40                           # Linesight-style: 40 line points, every 10 m, x/y/z in the car frame
     N_PATH = 3 * PATH3D + 12              # + 3 more previous actions (5 in total)
+    _ARCS = np.array(LOOK + PREVIEW + tuple(10.0 * k for k in range(1, PATH3D + 1)))
     N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH   # non-lidar features
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
         self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
+        self.iqn = cfg.get("algo") == "iqn"          # IQN charges failure itself: no give-up penalty here
         self.cut_behind = float(cfg["cut_behind_s"])
         self.ghost_window = float(cfg["ghost_window_s"])
         self.vcp_every = float(cfg["vcp_every_s"])
@@ -550,6 +561,16 @@ class TMEnv(gym.Env):
         arc = arc % self.lap_len if self.multilap else min(arc, self.lap_len)
         return np.array([np.interp(arc, self.cum, self.route[:, k]) for k in range(3)])
 
+    def _route_points(self, arcs):
+        """_route_point for many arc lengths at once: [N] -> [N, 3]."""
+        arcs = np.asarray(arcs, dtype=np.float64)
+        if self.dense is not None:
+            pts, _, cum = self.dense
+            a = np.minimum(np.maximum(arcs, 0.0), cum[-1])
+            return np.stack([np.interp(a, cum, pts[:, k]) for k in range(3)], 1)
+        a = arcs % self.lap_len if self.multilap else np.minimum(arcs, self.lap_len)
+        return np.stack([np.interp(a, self.cum, self.route[:, k]) for k in range(3)], 1)
+
     def _behind_champ(self, s, tick, phi):
         if self.cprof is not None:                       # only the AI's own champion; no champion yet = no cut
             return float((np.interp(s, self.cprof[0], self.cprof[1]) - tick) / 100.0)
@@ -562,9 +583,9 @@ class TMEnv(gym.Env):
             return 0.0
         q = t.vehicle.rotation
         ang = 0.0
-        for d in (25.0, 50.0, max(60.0, speed * 1.5)):          # how much the route bends in the next ~1.5 s
-            loc = to_car_frame(q, self._route_point(s + d) - pos)
-            ang = max(ang, abs(float(np.arctan2(loc[0], loc[2]))))
+        ds = np.array([25.0, 50.0, max(60.0, speed * 1.5)])     # how much the route bends in the next ~1.5 s
+        loc = to_car_frame_many(q, self._route_points(s + ds) - pos)
+        ang = max(ang, float(np.max(np.abs(np.arctan2(loc[:, 0], loc[:, 2])))))
         straight = float(np.clip(1.0 - ang / 0.12, 0.0, 1.0))   # fades out from ~0 to ~7 degrees of bend
         hit = np.asarray(t.lidar.hit, dtype=bool)
         dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
@@ -603,7 +624,7 @@ class TMEnv(gym.Env):
         else:
             out += [0.0] * 5
         length = self.dense[2][-1] if self.dense is not None else self.lap_len
-        cp, ahead = self._route_point(s), self._route_point(s + 5.0)
+        cp, ahead = self._route_points([s, s + 5.0])
         off, tan = to_car_frame(q, cp - pos), to_car_frame(q, ahead - cp)
         out += [min(s / max(length, 1.0), 2.0), float(np.clip(off[0] / 10.0, -3.0, 3.0)),
                 float(np.arctan2(tan[0], tan[2]) / np.pi)]
@@ -624,22 +645,20 @@ class TMEnv(gym.Env):
         f += list(np.asarray(w.slipping, dtype=np.float32))
         f += [d.steer / 127.0, d.gear / 5.0]
         f += list(self.pa)                                          # last two actions (input latency)
-        for dist in self.LOOK:                                      # where the route goes next
-            loc = to_car_frame(q, self._route_point(s + dist) - pos)
+        nl, npv = len(self.LOOK), len(self.PREVIEW)                 # all route points of this step in one go
+        locs = to_car_frame_many(q, self._route_points(s + self._ARCS) - pos)
+        for loc in locs[:nl]:                                       # where the route goes next
             n = float(np.linalg.norm(loc)) + 1e-6
             f += [float(np.arctan2(loc[0], loc[2]) / np.pi), float(loc[1] / n)]
         f += self._extras(t, q, pos, s)
-        for dist in self.PREVIEW:                                   # track memory: line ahead, far beyond the lidar
-            loc = to_car_frame(q, self._route_point(s + dist) - pos)
+        for loc in locs[nl:nl + npv]:                               # track memory: line ahead, far beyond the lidar
             n = float(np.linalg.norm(loc)) + 1e-6
             f += [float(np.arctan2(loc[0], loc[2]) / np.pi), float(loc[1] / n)]
         lv, av = to_car_frame(q, v.linear_velocity), to_car_frame(q, v.angular_velocity)
         self.mem = self.mem[1:] + [[float(np.clip(lv[0] / 30.0, -3, 3)), float(np.clip(av[1] / 5.0, -3, 3)),
                                     float(v.speed) / 100.0]]
         f += [x for row in self.mem for x in row]                    # oldest first
-        for k in range(1, self.PATH3D + 1):                          # the line ahead in 3D, up to 400 m
-            loc = to_car_frame(q, self._route_point(s + 10.0 * k) - pos)
-            f += list(np.clip(loc / 100.0, -5.0, 5.0))
+        f += list(np.clip(locs[nl + npv:] / 100.0, -5.0, 5.0).ravel())   # the line ahead in 3D, up to 400 m
         f += list(self.pa_old)
         hit = np.asarray(t.lidar.hit, dtype=bool)
         dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
@@ -767,6 +786,8 @@ class TMEnv(gym.Env):
         # Ending a lap early (stuck / off the track) costs what driving the rest of it would have paid,
         # so giving up is never cheaper than pushing on through a bad section.
         give_up = W["w_progress"] * max(0.0, length - s)
+        if self.iqn:                            # IQN charges failure itself (time cost for the rest of the mini-race)
+            give_up = 0.0
         if t.finished:
             terminated, end = True, "finished"
             ref = self.champ_ms if self.champ_ms else self.max_ticks * 10

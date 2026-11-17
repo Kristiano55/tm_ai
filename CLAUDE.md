@@ -17,8 +17,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   `python tm_ai.py selftest|train|drive` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
-  epsilon + Boltzmann exploration, Linesight LR/eps schedules, soft target updates, **champion tests in a separate
-  spawn process** (sends `ROLLBACK` file to the learner). Saves `latest.pt`, `champion.pt`, `iqn.json`.
+  epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
+  **learner in a background thread** (2 torch threads; cars keep driving with an acting copy of the net refreshed
+  every 20 updates; replay shared under a lock; `iqn_reuse` is a target, cars never wait), **champion tests in a
+  separate spawn process** (sends `ROLLBACK` file to the learner), optional **warm start** (`iqn_warm_run`: ~50k
+  steps of a PPO run's `champion.zip`, eps 0.1, into the replay memory; fresh runs only).
+  Saves `latest.pt`, `champion.pt`, `iqn.json`.
 - `config.py` — `DEFAULTS`, `WEIGHTS` (reward weights: key -> (default, label, hint)), presets `LEAN`, `LINESIGHT`,
   `load()/coerce()/save()` (atomic), `reward_v` migration of old configs, `run_dir()`.
 - `dashboard.py` + `dashboard.html` — stdlib HTTP server on 127.0.0.1:8765; starts/stops `tm_ai.py` as a subprocess,
@@ -42,13 +46,16 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Observations** (~290 + 41 lidar): car-frame velocity/rotation/up, wheels, steer/gear, last actions, route
   lookahead, 41 extras (effects/runtime/ghost/line offset), track preview (10 pts), short history (5 steps),
   40-point 3D line preview every 10 m (Linesight), 3 older actions, lidar (32 fan + 4 down + 5 up).
+  All route points of a step are interpolated in one batch (`_route_points`, `to_car_frame_many`): ~5x faster obs.
   **New features must be appended at the end of the non-lidar block** so `migrate()` / `widen_columns()` can
   convert old PPO checkpoints (new input weights start at 0 = same behaviour). IQN checkpoints don't convert.
 - **`icing` and `on_ice` inputs are forced to 0**: on a summer map selftest read 1.0 for both (unknown semantics).
 - **Rewards** are a dict per step (`r[...]`), summed; per-term averages are logged (`rb`) for the dashboard's
   reward breakdown. Lessons learned the hard way:
-  - Giving up must never pay: stuck/off-zone cost `w_stuck/w_offzone + w_progress * remaining metres`; IQN charges
-    the time cost for the rest of the mini-race on failure.
+  - Giving up must never pay: stuck/off-zone cost `w_stuck/w_offzone + w_progress * remaining metres` (PPO); with
+    IQN the remaining-metres part is skipped and IQN charges the time cost for the rest of the mini-race instead.
+  - LINESIGHT preset is progress 0.03/m, time 0.06 per 50 ms (driving pays from ~40 m/s; Linesight's TMNF ratio
+    0.01/m broke even at 120 m/s, so IQN on TM2020 got stuck at ~17 m/s).
   - Ghost reward only within `ghost_window_s` behind the ghost, otherwise slow laps learned to quit.
   - Laps are cut only against the AI's **own champion** pace (`champ_trace`), never before a champion exists.
   - A dense positive "while driving" reward is required for PPO; dashboard warns when it goes negative.

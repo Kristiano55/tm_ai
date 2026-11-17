@@ -26,6 +26,12 @@ DEFAULTS = {
     "minirace_s": 7.0,         # IQN: the AI maximises progress over the next N seconds (Linesight: 7)
     "iqn_reuse": 16,           # IQN: how often each experience is learned from on average
     "iqn_buffer": 300000,      # IQN: replay memory size (experiences)
+    "iqn_eps_full_steps": 10000,    # IQN: fully random driving for the first N steps
+    "iqn_eps_mid": 0.1,             # IQN: random-action share reached at iqn_eps_mid_steps
+    "iqn_eps_mid_steps": 100000,
+    "iqn_eps_end": 0.03,            # IQN: final random-action share, reached at iqn_eps_end_steps
+    "iqn_eps_end_steps": 1000000,
+    "iqn_warm_run": "",             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
     "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
     "horizon_s": 20.0,         # how far ahead (seconds) the AI weighs rewards     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
@@ -70,9 +76,10 @@ LEAN = {k: 0.0 for k in WEIGHTS}
 LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
             w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05)
 
-# "Linesight" preset: exactly two terms, at Linesight's ratio (0.01 per metre, -0.0012 per ms = -0.06 per 50 ms).
+# "Linesight" preset: exactly two terms. Linesight's 0.01/m vs 0.06 per 50 ms breaks even at 120 m/s (TMNF);
+# for TM2020 progress is 0.03/m, so driving pays from ~40 m/s (0.06 / 0.05 s / 0.03 per m).
 LINESIGHT = {k: 0.0 for k in WEIGHTS}
-LINESIGHT.update(w_progress=0.01, w_time=0.06)
+LINESIGHT.update(w_progress=0.03, w_time=0.06)
 
 
 def load():
@@ -117,6 +124,7 @@ def coerce(cfg):
     if out["steer_mode"] not in ("progressive", "uniform"):
         out["steer_mode"] = DEFAULTS["steer_mode"]
     out["run"] = "".join(c for c in out["run"] if c.isalnum() or c in "-_") or "calm"
+    out["iqn_warm_run"] = "".join(c for c in out["iqn_warm_run"] if c.isalnum() or c in "-_")
     return out
 
 
