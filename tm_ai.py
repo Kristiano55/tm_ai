@@ -602,17 +602,20 @@ class TMEnv(gym.Env):
     # --- gym API ---------------------------------------------------------------------------
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        try:
-            t = self.g.reset(seed=0)            # physics is deterministic
-        except TransportError:
-            self._connect()
-            t = self.g.reset(seed=0)
         self._read_weights()
         self._read_best()
         self._load_line()
         self._load_profile()
         self._load_champ()
-        self._build_starts()
+        try:
+            self._build_starts()                # replays runs to take snapshots: must happen BEFORE the reset
+        except TransportError:
+            self._connect()
+        try:
+            t = self.g.reset(seed=0)            # physics is deterministic
+        except TransportError:
+            self._connect()
+            t = self.g.reset(seed=0)
         self.taken, self.slow, self.prev_speed, self.di = 0, 0, 0.0, 0
         self._prev_lv, self.since_hit, self.air = None, 20, 0
         self.pa = np.zeros(8)
@@ -631,6 +634,8 @@ class TMEnv(gym.Env):
             for st in self.starts:
                 st["s"] = self._global_progress(st["pos"], st["taken"])
             self._starts_line = self._line_m
+        if self.start_i is None and int(t.race.race_tick) > 0:     # never hand a car a half-driven lap
+            t = self.g.reset(seed=0)
         pos = np.asarray(t.vehicle.position, dtype=np.float64)
         tick = int(t.race.race_tick) if self.start_i is not None else 0
         self.di = 0
