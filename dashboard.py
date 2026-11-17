@@ -215,8 +215,9 @@ def discord_embed(st, title, color):
          ("Laps", f"{st['session_laps']:,} this session · {st['laps_total']:,} total", True),
          ("Speed", f"{st['speed']:.0f}x real time" if st.get("speed") else "–", True),
          ("Session", f"{st['session_min']:.0f} min · {st.get('steps', 0):,} steps", True)]
+    map_name = c["map"].replace(chr(92), "/").split("/")[-1].replace(".Map.Gbx", "")
     return {"title": title, "color": color,
-            "description": f"**{c['map'].replace('\\', '/').split('/')[-1].replace('.Map.Gbx', '')}** · run `{c['run']}` · {c.get('algo', 'ppo').upper()} · {c['envs']} cars",
+            "description": f"**{map_name}** · run `{c['run']}` · {c.get('algo', 'ppo').upper()} · {c['envs']} cars",
             "fields": [{"name": n, "value": v, "inline": i} for n, v, i in f],
             "footer": {"text": "state: " + st["state"] + (f" ({st['reason']})" if st.get("reason") else "")},
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
