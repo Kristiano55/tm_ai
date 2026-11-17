@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trackmania AI</title>
+<style>
+:root{--bg:#0e1013;--card:#171a1f;--line:#262b32;--tx:#e8eaed;--mut:#8b93a0;--blue:#3b8bea;--org:#e8622a;--grn:#39c46a;--red:#e5484d}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 "Segoe UI",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:28px;padding:12px 18px}
+.logo{width:40px;height:40px;border-radius:8px;background:var(--blue);display:grid;place-items:center;font-weight:700;font-size:18px}
+h1{margin:0;font-size:20px;font-weight:600}.sub{color:var(--mut);font-size:12px}
+nav{display:flex;gap:6px}nav a{padding:8px 12px;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent}
+nav a.on{color:var(--tx);border-color:var(--blue)}
+.sp{flex:1}.pill{display:flex;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:9px 14px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}.dot.run{background:var(--grn)}.dot.err{background:var(--red)}
+button{font:inherit;border:0;border-radius:6px;padding:10px 18px;color:var(--tx);background:#2a2f37;cursor:pointer}
+button.p{background:var(--blue);color:#fff}button:disabled{opacity:.4;cursor:default}
+main{padding:0 18px 24px;display:grid;gap:14px}.row{display:grid;gap:14px}
+.r2{grid-template-columns:2fr 1.2fr}.r6{grid-template-columns:repeat(6,1fr)}.r3{grid-template-columns:1.3fr 1fr 1fr}
+@media(max-width:1000px){.r2,.r6,.r3{grid-template-columns:1fr 1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:16px 18px;min-width:0}
+.lab{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut)}
+.big{font-size:38px;font-weight:600;margin:4px 0}.mid{font-size:24px;font-weight:600;margin:6px 0 2px}.mut{color:var(--mut);font-size:12px}
+.bar{height:12px;background:#22262c;border-radius:6px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--org);width:0;transition:width .5s}
+.flex{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+h3{margin:0 0 8px;font-size:15px}h3 small{font-weight:400;color:var(--mut);margin-left:8px;font-size:12px}
+canvas{width:100%;height:210px;display:block}canvas.t{height:240px}
+.lg{display:flex;gap:14px;font-size:12px;color:var(--mut);float:right}.lg b{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;min-height:90px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:26px}h3.sec{margin:6px 0 12px;font-size:16px}label small{color:var(--mut);font-size:11px}
+label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
+input[type=text],input[type=number],select{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
+.hide{display:none}
+</style></head><body>
+<header>
+  <div class="logo">&raquo;</div>
+  <div><h1>Trackmania AI</h1><div class="sub" id="sub">&nbsp;</div></div>
+  <nav><a id="n1" class="on">Dashboard</a><a id="n2">Settings</a></nav>
+  <div class="sp"></div>
+  <div class="pill"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
+  <button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button>
+</header>
+<main id="dash">
+  <div class="row r2">
+    <div class="card"><div class="lab">Road to your PB</div>
+      <div><span class="big" id="champ">–</span> <span id="vsPb" style="margin-left:10px"></span></div>
+      <div class="bar"><i id="pbBar"></i></div>
+      <div class="flex mut"><span id="first"></span><span id="pbTxt"></span></div>
+      <div class="flex mut" style="margin-top:10px"><span id="bestRun"></span><a href="#" id="bOpen" style="color:var(--blue)">Open run folder</a></div></div>
+    <div class="card"><div class="lab">This session</div>
+      <div><span class="big" id="sMin">0 min</span> <span class="mut" id="sLaps"></span></div>
+      <div class="mut" id="mode"></div><div class="bar"><i id="stopBar" style="background:#3a4048"></i></div>
+      <div class="mut" id="nextTest"></div></div>
+  </div>
+  <div class="card hide" id="playCard"><div class="lab">Champion play</div><div id="playTxt" style="margin-top:4px"></div></div>
+  <div class="row r6">
+    <div class="card"><div class="lab">Training laps</div><div class="mid" id="kLaps">0</div><div class="mut" id="kFin"></div></div>
+    <div class="card"><div class="lab">Recent average</div><div class="mid" id="kAvg">–</div><div class="mut">last 20 finished laps, with exploration</div></div>
+    <div class="card"><div class="lab">Best training lap</div><div class="mid" id="kBest">–</div><div class="mut" id="kBestPb"></div></div>
+    <div class="card"><div class="lab">Training speed</div><div class="mid" id="kSpeed">–</div><div class="mut" id="kCars"></div></div>
+    <div class="card"><div class="lab">Champion tests</div><div class="mid" id="kTests">0</div><div class="mut" id="kProm"></div></div>
+    <div class="card"><div class="lab">Learning updates</div><div class="mid" id="kUpd">0</div><div class="mut" id="kSteps"></div></div>
+  </div>
+  <div class="card"><div class="lg"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span></div>
+    <h3>Lap times <small>every finished training lap, lower is faster</small></h3><canvas id="c1" class="t"></canvas></div>
+  <div class="row r3">
+    <div class="card"><div class="lg"><span><b style="background:var(--blue)"></b>Current driver</span><span><b style="background:var(--org)"></b>Champion</span></div>
+      <h3>Champion tests <small>↑ promoted &nbsp; ↺ rolled back</small></h3><canvas id="c2"></canvas></div>
+    <div class="card"><h3>Value estimate <small>average V</small></h3><canvas id="c3"></canvas></div>
+    <div class="card"><h3>Value loss <small>critic loss</small></h3><canvas id="c4"></canvas></div>
+  </div>
+  <div class="card"><pre id="log"></pre></div>
+</main>
+<main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
+  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <span class="mut" id="saved"></span></p>
+  <p class="mut">Training settings apply the next time you press Start training. Reward weights (and "end a lap when behind the ghost") are picked up live by running cars at the start of their next lap.</p></div></main>
+<script>
+const $=id=>document.getElementById(id);
+const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
+const FIELDS=[['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+ ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
+ ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
+ ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
+ ['decay_steps','Learning rate / exploration halve every N env steps (0 = off)','number'],
+ ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
+ ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
+ ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];
+const OPTS={steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
+let cfgLoaded=false;
+let WMETA=[];
+function fillForm(c,w){ WMETA=w||WMETA;
+  const fld=([k,l,t])=>t=='checkbox'?
+    `<label class="ck"><input type="checkbox" id="f_${k}" ${c[k]?'checked':''}> ${l}</label>`:t=='select'?
+    `<label>${l}<select id="f_${k}">${OPTS[k].map(([v,n])=>`<option value="${v}" ${c[k]==v?'selected':''}>${n}</option>`).join('')}</select></label>`:
+    `<label>${l}<input type="${t}" step="any" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}"></label>`;
+  const wt=m=>`<label>${m.label}<input type="number" step="any" id="f_${m.k}" value="${c[m.k]}"><small>${m.hint} · default ${m.default}</small></label>`;
+  $('form').innerHTML=`<h3 class="sec">Training settings</h3><div class="grid">${FIELDS.map(fld).join('')}</div>
+    <h3 class="sec">Reward weights</h3><div class="grid">${WMETA.map(wt).join('')}</div>` }
+function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); o[k]=t=='checkbox'?e.checked:e.value}
+  for(const m of WMETA) o[m.k]=$('f_'+m.k).value; return o }
+async function post(p,b){ const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}); const j=await r.json(); if(r.status>=400) alert(j.message); setTimeout(tick,300) }
+$('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
+$('bStart').onclick=()=>post('/api/start'); $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
+$('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
+$('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
+$('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
+
+function draw(cv,layers,fmt){
+  const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight; cv.width=w*d; cv.height=h*d;
+  const g=cv.getContext('2d'); g.scale(d,d); g.font='11px Segoe UI,sans-serif';
+  let xs=[],ys=[]; for(const l of layers){ if(l.t=='h'){ys.push(l.y)} else if(l.t!='m'){for(const p of l.p){xs.push(p[0]);ys.push(p[1])}} }
+  if(!xs.length){g.fillStyle='#8b93a0';g.fillText('no data yet',w/2-28,h/2);return}
+  const mn=a=>a.reduce((x,y)=>Math.min(x,y)),mx=a=>a.reduce((x,y)=>Math.max(x,y));
+  let x0=mn(xs),x1=mx(xs),y0=mn(ys),y1=mx(ys); if(x1==x0)x1=x0+1; const pad=(y1-y0||1)*.08; y0-=pad;y1+=pad;
+  const L=52,R=10,T=10,B=22,X=v=>L+(v-x0)/(x1-x0)*(w-L-R),Y=v=>T+(1-(v-y0)/(y1-y0))*(h-T-B);
+  g.strokeStyle='#262b32';g.fillStyle='#8b93a0';g.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=y0+(y1-y0)*i/4,y=Y(v);g.beginPath();g.moveTo(L,y);g.lineTo(w-R,y);g.stroke();g.fillText(fmt(v),4,y+4)}
+  for(let i=0;i<=4;i++){const v=x0+(x1-x0)*i/4;g.fillText(Math.round(v),X(v)-8,h-6)}
+  g.save();g.beginPath();g.rect(L,T,w-L-R,h-T-B);g.clip();
+  for(const l of layers){ g.strokeStyle=g.fillStyle=l.c||'#3b8bea';
+    if(l.t=='d'){g.globalAlpha=.8;for(const p of l.p){g.beginPath();g.arc(X(p[0]),Y(p[1]),l.r||2,0,7);g.fill()}g.globalAlpha=1}
+    else if(l.t=='l'){g.lineWidth=l.w||1.5;g.beginPath();l.p.forEach((p,i)=>i?g.lineTo(X(p[0]),Y(p[1])):g.moveTo(X(p[0]),Y(p[1])));g.stroke()}
+    else if(l.t=='h'){g.setLineDash([6,5]);g.beginPath();g.moveTo(L,Y(l.y));g.lineTo(w-R,Y(l.y));g.stroke();g.setLineDash([]);if(l.s){g.fillText(l.s,L+8,Y(l.y)-5)}}
+    else if(l.t=='m'){g.font='13px Segoe UI,sans-serif';for(const x of l.x){g.fillText(l.ch,X(x)-4,T+12)}g.font='11px Segoe UI,sans-serif'} }
+  g.restore()
+}
+function movAvg(p,k){ const o=[];let s=0;for(let i=0;i<p.length;i++){s+=p[i][1];if(i>=k)s-=p[i-k][1];o.push([p[i][0],s/Math.min(i+1,k)])}return o }
+
+function render(s){
+  const c=s.config; if(!cfgLoaded){fillForm(c,s.weights);cfgLoaded=true}
+  $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
+  const run=s.state=='running'||s.state=='playing';
+  $('dot').className='dot'+(s.state=='running'||s.state=='playing'?' run':(s.reason.startsWith('crash')||s.reason.includes('unexpected')?' err':''));
+  $('st').textContent=s.state=='running'?'Running':s.state=='playing'?'Playing':s.state=='idle'?'Idle':'Stopped'; $('why').textContent=s.reason;
+  $('bStart').disabled=s.state=='running'; $('bPlay').disabled=s.state=='playing'||!s.can_play; $('bStop').disabled=!run;
+  const lp=s.last_play, pc=$('playCard');
+  if(s.state=='playing'){pc.className='card';$('playTxt').textContent='Simulating the champion lap in the background …'}
+  else if(lp){pc.className='card';const when=new Date(lp.t*1000).toLocaleTimeString();
+    $('playTxt').innerHTML=lp.finished?`${when} · finished in <b>${ms(lp.ms)}</b>. The game window does not show it – load <code>${lp.file.split(/[\\/]/).pop()}</code> from the run folder in TICK to watch it.`:`${when} · no finish (${lp.end}). The saved champion weights did not reproduce a finishing lap.`}
+  const br=s.best_run; $('bestRun').textContent=br?`Fastest run saved: ${ms(br.ms)} (${br.source}) → best_run.txt`:'No finished run saved yet';
+  const ch=s.champion_ms,pb=s.pb_ms,f=s.first_test_ms;
+  $('champ').textContent=ms(ch);
+  $('vsPb').textContent=ch&&pb?(ch<=pb?`${((pb-ch)/1000).toFixed(3)} s under your PB!`:`${((ch-pb)/1000).toFixed(3)} s over your PB`):(ch?'':'no champion yet – first test comes after '+c.test_every_laps+' laps');
+  let pct=null; if(ch&&pb&&f&&f>pb) pct=(f-ch)/(f-pb)*100; else if(ch&&pb&&f) pct=ch<=pb?100:0;
+  $('pbBar').style.width=(pct==null?0:Math.max(0,Math.min(100,pct)))+'%';
+  $('first').textContent=f?`first test ${ms(f)}  ·  ${pct==null?'':Math.round(pct)+'% of the way'}`:''; $('pbTxt').textContent=pb?`your PB ${ms(pb)}`:'set your PB in Settings';
+  $('sMin').textContent=Math.round(s.session_min)+' min'; $('sLaps').textContent=`${n0(s.session_laps)} training laps (this session)`;
+  $('mode').textContent=c.stop_at_pb&&pb?'Stops at your PB':(c.time_limit_min?`Stops after ${c.time_limit_min} min`:'Trains until you stop it');
+  $('nextTest').textContent=`Next champion test in ${s.next_test_in} training laps`; $('stopBar').style.width=(100-100*s.next_test_in/Math.max(1,c.test_every_laps))+'%';
+  $('kLaps').textContent=n0(s.laps_total); $('kFin').textContent=(s.finished_pct==null?'':`${s.finished_pct}% of full laps finished`)+(s.mid_laps?` · ${n0(s.mid_laps)} mid-track`:'');
+  $('kAvg').textContent=sec(s.recent_avg); $('kBest').textContent=sec(s.best_lap);
+  $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'')}${(s.best_lap-pb/1000).toFixed(2)} s vs PB`:'';
+  $('kSpeed').textContent=s.speed?Math.round(s.speed)+'x':'–'; $('kCars').textContent=`vs real time · league of ${c.envs} cars`;
+  $('kTests').textContent=n0(s.tests_total); $('kProm').textContent=`${s.promotions} faster champions found`;
+  $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;
+  $('log').textContent=s.log.join('\n');
+  const laps=s.laps, tests=s.tests.filter(t=>t.ms);
+  draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},
+     {t:'d',p:tests.filter(t=>t.promoted).map(t=>[t.lap_n,t.ms/1000]),c:'#e8622a',r:4},
+     ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[])],v=>v.toFixed(1)+' s');
+  const all=s.tests.map((t,i)=>[i+1,t]);
+  draw($('c2'),[{t:'l',p:all.filter(([,t])=>t.ms).map(([i,t])=>[i,t.ms/1000]),c:'#3b8bea'},{t:'l',p:all.filter(([,t])=>t.champ_ms).map(([i,t])=>[i,t.champ_ms/1000]),c:'#e8622a'},
+     {t:'m',ch:'↑',c:'#e8622a',x:all.filter(([,t])=>t.promoted).map(([i])=>i)},{t:'m',ch:'↺',c:'#8b93a0',x:all.filter(([,t])=>t.rolled_back).map(([i])=>i)}],v=>v.toFixed(1)+' s');
+  draw($('c3'),[{t:'l',p:s.v,c:'#3b8bea',w:1}],v=>v.toFixed(1));
+  draw($('c4'),[{t:'l',p:s.vl,c:'#3b8bea',w:1}],v=>v.toFixed(3));
+}
+async function tick(){ try{ render(await (await fetch('/api/state')).json()) }catch(e){} }
+tick(); setInterval(tick,2000); addEventListener('resize',tick);
+</script></body></html>

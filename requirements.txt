@@ -1,0 +1,5 @@
+tickgym
+numpy
+gymnasium
+stable-baselines3
+torch
