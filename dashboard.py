@@ -31,8 +31,9 @@ def alive():
     return PROC["p"] is not None and PROC["p"].poll() is None
 
 
-def kill_proc():
-    p = PROC["p"]
+def kill_proc(p=None):
+    """Kill a training process (and its car workers). Pass the process to kill a specific one."""
+    p = PROC["p"] if p is None else p
     if p is None or p.poll() is not None:
         return
     if sys.platform == "win32":       # also kills the car worker processes
@@ -307,7 +308,8 @@ def stop():
         kill_proc()
         return
     (rd / "STOP").write_text("stop")                       # graceful: saves the model first
-    threading.Timer(90, kill_proc).start()                 # hard stop if it hangs
+    # hard stop if it hangs - only THIS process: a training started later must never be killed by this timer
+    threading.Timer(90, kill_proc, args=(PROC["p"],)).start()
 
 
 def open_folder(path):
