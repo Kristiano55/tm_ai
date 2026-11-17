@@ -8,8 +8,10 @@ Trackmania 2020 RL agent on tickgym (PPO, runs on CPU).
 Normally you start/stop all of this from the dashboard: python dashboard.py
 """
 import argparse
+import faulthandler
 import json
 import os
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -44,6 +46,15 @@ STEER_LEVELS = {
     "uniform": np.round(np.arange(-10, 11) * 12.7).astype(int),
     "progressive": np.concatenate([-_P[::-1], [0], _P]),
 }
+
+
+def watchdog(seconds=90):
+    """Re-armed while things move; if a process is stuck this long, its stack is written to the log."""
+    try:
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(seconds, repeat=False, file=sys.stderr)
+    except Exception:
+        pass
 
 
 def say(msg):
@@ -515,9 +526,9 @@ class TMEnv(gym.Env):
         return np.array([np.interp(arc, self.cum, self.route[:, k]) for k in range(3)])
 
     def _behind_champ(self, s, tick, phi):
-        if self.cprof is not None:
+        if self.cprof is not None:                       # only the AI's own champion; no champion yet = no cut
             return float((np.interp(s, self.cprof[0], self.cprof[1]) - tick) / 100.0)
-        return phi if self.prof is not None else 0.0
+        return 0.0
 
     def _pointless_release(self, t, pos, s, speed):
         """0..1: how clearly releasing is pointless here. 1 = straight road ahead and nothing in front;
@@ -645,6 +656,7 @@ class TMEnv(gym.Env):
         return self._obs(t, self._s), {}
 
     def step(self, action):
+        watchdog()
         si, mode = int(action[0]), int(action[1])
         steer = int(self.STEER[si])
         self.acts.append((steer, mode))
@@ -894,6 +906,7 @@ def _make_callback(cfg, run_dir):
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                         end=info.get("end", ""), mid=1 if info.get("mid") else 0)
             now = time.time()
+            watchdog()
             if now - self.last_chk > 2.0:
                 self.last_chk = now
                 if (run_dir / "STOP").exists():

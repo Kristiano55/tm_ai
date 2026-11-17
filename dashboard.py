@@ -160,6 +160,32 @@ def build_state():
     }
 
 
+def frozen_guard():
+    """Training that stopped moving (no heartbeat for 150 s) is restarted from its last checkpoint."""
+    restarts = []
+    while True:
+        time.sleep(15)
+        try:
+            if not (alive() and PROC["kind"] == "train"):
+                continue
+            cfg = cfgmod.load()
+            rd = cfgmod.run_dir(cfg)
+            st = read_json(rd / "status.json")
+            if (rd / "STOP").exists() or time.time() - PROC.get("t0", 0) < 180:
+                continue
+            if st.get("state") == "running" and time.time() - st.get("heartbeat", time.time()) > 150:
+                restarts[:] = [t for t in restarts if time.time() - t < 3600] + [time.time()]
+                with open(rd / "train.log", "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S ") + "Training froze for 150 s; restarting from the last "
+                            "checkpoint (see the stack dump above for where it hung).\n")
+                kill_proc()
+                time.sleep(5)
+                if len(restarts) <= 5:
+                    start("train")
+        except Exception:
+            pass
+
+
 def start(kind):
     cfg = cfgmod.load()
     if alive():
@@ -172,7 +198,7 @@ def start(kind):
     logf = open(rd / "train.log", "a", encoding="utf-8")
     PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", "train" if kind == "train" else "drive"],
                                  cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
-    PROC["kind"] = kind
+    PROC["kind"], PROC["t0"] = kind, time.time()
     return 200, "ok"
 
 
@@ -247,6 +273,7 @@ if __name__ == "__main__":
     url = f"http://127.0.0.1:{port}"
     print("Trackmania AI dashboard:", url, "(Ctrl+C to quit)")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    threading.Thread(target=frozen_guard, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
