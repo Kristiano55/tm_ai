@@ -226,6 +226,7 @@ class TMEnv(gym.Env):
         self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
         self.cut_behind = float(cfg["cut_behind_s"])
+        self.ghost_window = float(cfg["ghost_window_s"])
         self.run_dir, self.role, self.shorten = (Path(run_dir) if run_dir else None), role, shorten
         self.dense, self._line_m, self.prof, self._prof_m, self.champ_ms = None, None, None, None, None
         self.phi, self._prev_lv, self.since_hit, self.air = 0.0, None, 20, 0
@@ -392,10 +393,11 @@ class TMEnv(gym.Env):
                 self.W[k] = float(d[k])
             except (KeyError, TypeError, ValueError):
                 pass
-        try:
-            self.cut_behind = float(d["cut_behind_s"])
-        except (KeyError, TypeError, ValueError):
-            pass
+        for k, a in (("cut_behind_s", "cut_behind"), ("ghost_window_s", "ghost_window")):
+            try:
+                setattr(self, a, float(d[k]))
+            except (KeyError, TypeError, ValueError):
+                pass
 
     def _read_best(self):
         self.champ_ms = read_json(self.run_dir / "best.json").get("champion_ms") if self.run_dir else None
@@ -684,7 +686,10 @@ class TMEnv(gym.Env):
             self.taken = taken
         phi = self._phi(s, tick)                                                 # seconds ahead of the ghost
         if self.prof is not None and W["ghost_weight"]:
-            r["ghost"] = float(np.clip(W["ghost_weight"] * (phi - self.phi), -5.0, 5.0))   # = time gained this step
+            # time gained on the ghost this step, but only inside a window behind it: once a lap is far
+            # behind, losing more time costs nothing extra, so ending the lap early can never pay off
+            lo = -max(self.ghost_window, 0.1)
+            r["ghost"] = float(np.clip(W["ghost_weight"] * (max(phi, lo) - max(self.phi, lo)), -5.0, 5.0))
         self.phi = phi
         if self.guide and W["w_guide"] and self.dense is not None:            # pulled toward the target line,
             off = pos - self._route_point(s)                                     # but only while slower than it

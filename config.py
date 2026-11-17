@@ -20,7 +20,8 @@ DEFAULTS = {
     "resume": True,            # continue from runs/<run>/latest.zip if it fits
     "extra_obs": True,         # extra observations: effects/runtime telemetry, ghost speed, line offset ...
     "steer_mode": "progressive",   # "progressive" (fine near centre, coarse at the edges) or "uniform" (10% steps)
-    "cut_behind_s": 5.0,       # end a lap that falls this far behind the ghost (0 = off)
+    "cut_behind_s": 5.0,
+    "ghost_window_s": 2.0,     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
     "decay_steps": 4000000,    # learning rate + exploration halve every N env steps (0 = off)
     "line_refresh_s": 0.2,
     "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
