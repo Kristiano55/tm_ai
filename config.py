@@ -26,14 +26,14 @@ DEFAULTS = {
     "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
     "mid_start_p": 0.6,        # share of training laps that start partway along the champion's lap (0 = off)
     "mid_start_every_s": 2.0,  # spacing of those start points along the champion lap, seconds     # rebuild the reference line + ghost when the champion beats it by this much (0 = never)
-    "reward_v": 2,             # reward layout version (old configs are upgraded once)
+    "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }
 
 
 # Reward weights: key -> (default, label, hint). They are read live: running cars pick up a saved
 # change at the start of their next lap (no restart needed).
 WEIGHTS = {
-    "w_progress": (0.02, "Progress", "reward per metre driven along the route (keep small: it pays the same for slow and fast laps)"),
+    "w_progress": (0.05, "Progress", "reward per metre driven along the route (keep small: it pays the same for slow and fast laps)"),
     "w_time": (0.02, "Time penalty", "cost per 50 ms step; this is what makes going fast pay"),
     "w_guide": (0.05, "Pull toward the target line", "per step, by distance from the PB/best line; only while behind its pace"),
     "ghost_weight": (10.0, "Ghost", "reward per second gained on the fastest run so far (0 = off)"),
@@ -42,8 +42,8 @@ WEIGHTS = {
     "w_finish_time": (10.0, "Finish speed bonus", "reward per second faster than the champion at the finish (negative if slower)"),
     "w_steer_smooth": (0.002, "Smooth steering", "penalty per unit of steering change between steps"),
     "w_crash": (0.05, "Crash penalty", "per m/s of sudden speed loss (wall hits)"),
-    "w_offzone": (10.0, "Off-zone penalty", "when the car leaves the playable area"),
-    "w_stuck": (5.0, "Stuck penalty", "when the car stands still for 2 s"),
+    "w_offzone": (20.0, "Off-zone penalty", "when the car leaves the playable area (plus the progress it gave up)"),
+    "w_stuck": (20.0, "Stuck penalty", "when the car stands still for 2 s (plus the progress it gave up)"),
     "w_brake": (0.0, "Brake penalty", "per step while braking"),
     "w_coast": (0.0, "Coast penalty", "per step with neither gas nor brake, everywhere"),
     "w_release": (0.03, "Pointless release penalty", "per step released on a straight with nothing ahead; corners stay free"),
@@ -55,6 +55,11 @@ WEIGHTS = {
 }
 DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 
+# "Lean" preset: only the terms that define the task; everything else off.
+LEAN = {k: 0.0 for k in WEIGHTS}
+LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
+            w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05)
+
 
 def load():
     cfg, on_disk = dict(DEFAULTS), None
@@ -64,10 +69,11 @@ def load():
             cfg.update(on_disk)
         except Exception:
             pass
-    if on_disk is not None and int(on_disk.get("reward_v", 1) or 1) < 2:       # v2: progress no longer dominates, finish bonus vs champion
-        for k in ("w_progress", "w_finish_time"):
+    v = int(on_disk.get("reward_v", 1) or 1) if on_disk is not None else 3
+    if v < 3:            # v2: finish bonus vs champion; v3: progress always beats the time penalty, giving up costs
+        for k in (("w_finish_time",) if v < 2 else ()) + ("w_progress", "w_stuck", "w_offzone"):
             cfg[k] = WEIGHTS[k][0]
-        cfg["reward_v"] = 2
+        cfg["reward_v"] = 3
         try:
             save(cfg)
         except OSError:

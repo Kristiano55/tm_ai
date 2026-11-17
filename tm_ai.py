@@ -635,6 +635,7 @@ class TMEnv(gym.Env):
         self.pa = np.zeros(8)
         self.limit = self._limit_ticks()
         self.start_i, self.acts = None, []
+        self.rsum, self.rsteps = {}, 0
         if self.starts and self.np_random.random() < self.mid_p:
             try:
                 i = self._pick_start()
@@ -670,72 +671,86 @@ class TMEnv(gym.Env):
             info = {"finished": False, "race_ms": 0, "cp": self.taken, "tick": 0, "end": "gym lost"}
             return self._last_obs, 0.0, False, True, info
 
-        W = self.W
+        W, r = self.W, {}
         pos = np.asarray(t.vehicle.position, dtype=np.float64)
         taken, tick = int(t.race.checkpoints_taken), int(t.race.race_tick)
         s = self._progress(pos, taken)
         speed = float(t.vehicle.speed)
-        reward = W["w_progress"] * float(np.clip(s - self._s, -10.0, 10.0)) - W["w_time"]
-        reward -= W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
+        r["progress"] = W["w_progress"] * float(np.clip(s - self._s, -10.0, 10.0))
+        r["time"] = -W["w_time"]
+        r["steer"] = -W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
         if taken > self.taken:
-            reward += W["w_checkpoint"]
+            r["checkpoint"] = W["w_checkpoint"]
             self.taken = taken
         phi = self._phi(s, tick)                                                 # seconds ahead of the ghost
         if self.prof is not None and W["ghost_weight"]:
-            reward += float(np.clip(W["ghost_weight"] * (phi - self.phi), -5.0, 5.0))   # = time gained this step
+            r["ghost"] = float(np.clip(W["ghost_weight"] * (phi - self.phi), -5.0, 5.0))   # = time gained this step
         self.phi = phi
         if self.guide and W["w_guide"] and self.dense is not None:            # pulled toward the target line,
             off = pos - self._route_point(s)                                     # but only while slower than it
             d = float(np.hypot(off[0], off[2]))
             behind = float(np.clip(-phi / 0.3, 0.0, 1.0))
-            reward -= W["w_guide"] * min(d / 8.0, 1.0) * behind
-        reward -= W["w_crash"] * max(0.0, self.prev_speed - speed - 3.0)         # sudden speed loss = wall hit
+            r["guide"] = -W["w_guide"] * min(d / 8.0, 1.0) * behind
+        r["crash"] = -W["w_crash"] * max(0.0, self.prev_speed - speed - 3.0)    # sudden speed loss = wall hit
         if mode == 2:
-            reward -= W["w_brake"]
+            r["brake"] = -W["w_brake"]
         elif mode == 1:
-            reward -= W["w_coast"]
+            r["coast"] = -W["w_coast"]
             if W["w_release"]:
-                reward -= W["w_release"] * self._pointless_release(t, pos, s, speed)
+                r["release"] = -W["w_release"] * self._pointless_release(t, pos, s, speed)
         if W["w_slip"]:
-            reward -= W["w_slip"] * float(np.mean(np.asarray(t.wheels.slipping, dtype=np.float32)))
+            r["slip"] = -W["w_slip"] * float(np.mean(np.asarray(t.wheels.slipping, dtype=np.float32)))
         if W["w_air"] and not np.any(np.asarray(t.wheels.contact, dtype=bool)):
-            reward -= W["w_air"]
+            r["air"] = -W["w_air"]
         if W["w_speed"]:
-            reward += W["w_speed"] * speed / 100.0
+            r["speed"] = W["w_speed"] * speed / 100.0
         if W["w_hit"] and self.extra:
-            reward -= W["w_hit"] * _f(t.runtime, "wall_hit_this_step")
+            r["hit"] = -W["w_hit"] * _f(t.runtime, "wall_hit_this_step")
         if W["w_wall"]:                                                          # side rays of the fan
             hit = np.asarray(t.lidar.hit, dtype=bool)
             dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
-            reward -= W["w_wall"] * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
+            r["wall"] = -W["w_wall"] * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed, self._s = speed, s
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
         self.hist.append([*pos, tick, taken])
 
         end, terminated, truncated = "", False, False
+        length = self.dense[2][-1] if self.dense is not None else self.lap_len
+        # Ending a lap early (stuck / off the track) costs what driving the rest of it would have paid,
+        # so giving up is never cheaper than pushing on through a bad section.
+        give_up = W["w_progress"] * max(0.0, length - s)
         if t.finished:
             terminated, end = True, "finished"
             ref = self.champ_ms if self.champ_ms else self.max_ticks * 10
             gain = (ref - int(t.race.race_time_ms)) / 1000.0                     # seconds faster than the champion
-            reward += W["w_finish"] + float(np.clip(W["w_finish_time"] * gain, -20.0, 20.0))
+            r["finish"] = W["w_finish"] + float(np.clip(W["w_finish_time"] * gain, -20.0, 20.0))
             if self.start_i is None:            # mid-track laps are not full runs: not saved as best run / ghost
                 self._finished(int(t.race.race_time_ms))
         elif t.race.entered_off_zone:
-            terminated, end, reward = True, "off-zone", reward - W["w_offzone"]
+            terminated, end = True, "off-zone"
+            r["end"] = -(W["w_offzone"] + give_up)
         else:
             self.slow = self.slow + self.ticks if (speed < 1.5 and tick > 300) else 0
             if self.slow >= 200:                                                # stuck for 2 s
-                terminated, end, reward = True, "stuck", reward - W["w_stuck"]
+                terminated, end = True, "stuck"
+                r["end"] = -(W["w_stuck"] + give_up)
             elif (self.role == "training" and self.cut_behind and tick > 500
                   and self._behind_champ(s, tick, phi) < -self.cut_behind):      # tests always drive the full lap
                 truncated, end = True, "behind ghost"                            # hopeless lap: save the time
             elif tick >= self.limit:
                 truncated, end = True, "timeout"
+        for k, v in r.items():
+            self.rsum[k] = self.rsum.get(k, 0.0) + v
+        self.rsteps += 1
+        reward = float(sum(r.values()))
         if terminated or truncated:
             self._blame(s, end not in ("finished",))
         info = {"finished": bool(t.finished), "race_ms": int(t.race.race_time_ms),
-                "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None}
+                "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None,
+                "x": round(float(pos[0]), 1), "z": round(float(pos[2]), 1)}
+        if terminated or truncated:
+            info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
         return self._obs(t, s), float(reward), terminated, truncated, info
 
     def close(self):
@@ -861,6 +876,7 @@ def _make_callback(cfg, run_dir):
             self.reason, self.last_v, self.test_env, self.tests_off = "step budget reached", 0.0, None, False
             self.best = read_json(best_file)
             self.ema_update(reset=True)
+            self.rb, self.rb_steps, self.neg = {}, 0, 0
             log(k="start", cfg=cfg)
             self.status("running")
             say("Training started: %d cars, %s steering, CPU." % (cfg["envs"], cfg["steer_mode"]))
@@ -899,6 +915,18 @@ def _make_callback(cfg, run_dir):
                     ent=float(nv.get("train/entropy_loss", 0.0)), ev=float(nv.get("train/explained_variance", 0.0)),
                     speed=steps * cfg["ticks_per_step"] / 100.0 / max(time.time() - self.t0, 1e-6))
                 self.save_all()
+            if self.rb_steps:                                  # reward breakdown, per step, since the last update
+                per = {k: v / self.rb_steps for k, v in self.rb.items()}
+                log(k="rb", r={k: round(v, 5) for k, v in per.items()})
+                running = sum(v for k, v in per.items() if k not in ("finish", "end", "checkpoint"))
+                if running < 0:
+                    self.neg += 1
+                    if self.neg in (3, 20, 100):
+                        say(f"Warning: driving earns {running:+.4f} per step on average (before finish/checkpoint "
+                            "bonuses). Stopping can look attractive; lower penalties or raise Progress.")
+                else:
+                    self.neg = 0
+                self.rb, self.rb_steps = {}, 0
 
         def _on_step(self):
             for info, done in zip(self.locals["infos"], self.locals["dones"]):
@@ -907,7 +935,10 @@ def _make_callback(cfg, run_dir):
                     self.since += 1
                     fin = bool(info.get("finished"))
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
-                        end=info.get("end", ""), mid=1 if info.get("mid") else 0)
+                        end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
+                    for kk, vv in (info.get("rb") or {}).items():
+                        self.rb[kk] = self.rb.get(kk, 0.0) + vv
+                    self.rb_steps += int(info.get("rsteps", 0))
             now = time.time()
             watchdog()
             if now - self.last_chk > 2.0:
@@ -948,6 +979,10 @@ def _make_callback(cfg, run_dir):
                 say(f"Champion tests disabled: {e}. Lower 'envs' by one to enable them.")
                 return
             self.tests += 1
+            try:                                                # watch any test in TICK, also failed ones
+                InputText.write(str(run_dir / "last_test.txt"), self.test_env.g.export().actions)
+            except Exception:
+                pass
             ms = int(rec.finish_ms) if fin else None
             champ = self.best.get("champion_ms")
             promoted = rolled = False

@@ -58,6 +58,7 @@ class Store:
         self.off = 0
         self.laps, self.tests, self.upds = [], [], []     # laps: (lap number, ms) of full laps only
         self.n_all, self.n_mid = 0, 0
+        self.rbs, self.ends = [], []
         self.sess_t0, self.sess_lap0, self.last_t = None, 0, None
 
     def refresh(self, path):
@@ -89,6 +90,9 @@ class Store:
                 self.sess_t0, self.sess_lap0 = e["t"], self.n_all
             elif k == "lap":
                 self.n_all += 1
+                if e.get("x") is not None and e.get("end") != "finished":
+                    self.ends.append([e["x"], e["z"], e.get("end", ""), 1 if e.get("mid") else 0])
+                    del self.ends[:-3000]
                 if e.get("mid"):
                     self.n_mid += 1
                 else:
@@ -97,9 +101,22 @@ class Store:
                 self.tests.append(e)
             elif k == "upd":
                 self.upds.append(e)
+            elif k == "rb":
+                self.rbs.append(e.get("r", {}))
+                del self.rbs[:-10]
 
 
 STORE = Store()
+
+
+def track_outline(rd):
+    try:
+        import numpy as np
+        pts = np.load(rd / "centerline.npy")
+        step = max(1, len(pts) // 600)
+        return [[round(float(p[0]), 1), round(float(p[2]), 1)] for p in pts[::step]]
+    except Exception:
+        return []
 
 
 def build_state():
@@ -154,6 +171,9 @@ def build_state():
         "v": downsample([[i + 1, u["v"]] for i, u in enumerate(S.upds)]),
         "vl": downsample([[i + 1, u["vl"]] for i, u in enumerate(S.upds)]),
         "log": log,
+        "rb": {k: sum(r.get(k, 0.0) for r in S.rbs[-5:]) / max(1, len(S.rbs[-5:]))
+               for k in sorted({k for r in S.rbs[-5:] for k in r})},
+        "ends": S.ends[-1500:], "track": track_outline(rd), "lean": cfgmod.LEAN,
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
         "best_run": read_json(rd / "best_run.json") or None,
         "last_play": read_json(rd / "play_result.json") or None,
