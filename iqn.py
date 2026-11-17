@@ -309,6 +309,9 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
         ckpt = run_dir / "latest.pt"
         meta = T.read_json(run_dir / "iqn.json")
         steps0 = 0
+        if cfg["resume"] and ckpt.exists() and meta and (meta.get("n_in"), meta.get("n_act")) != (n_in, n_act):
+            ckpt.replace(run_dir / "latest.old_layout.pt")      # never load under a wrong layout, never lose it
+            T.say("IQN: the input layout changed; old latest.pt moved to latest.old_layout.pt, starting fresh")
         if cfg["resume"] and ckpt.exists() and meta.get("n_in") == n_in and meta.get("n_act") == n_act:
             try:
                 d = torch.load(ckpt, map_location=dev)
@@ -497,10 +500,14 @@ def train(cfg):
     C = {"laps": 0, "since": 0}
     rb, rb_steps = {}, 0
     stuckw = T.StuckWatch()
+    tracker = T.SectionTracker(run_dir, cfg, T.n_sections(run_dir, pool.n_seg))
 
     def collect(i, o, a, nobs, rew, done, info, rows):
         """One step of car i -> n-step samples (rows to add); log a finished lap."""
         nonlocal rb, rb_steps
+        if info.get("end") == "car restarted":              # hung car replaced: drop its unfinished window
+            pend[i] = []
+            return
         pend[i].append((o, int(a), float(rew)))
         if done:
             last = info.get("terminal_observation", nobs)
@@ -521,6 +528,7 @@ def train(cfg):
                 rb[kk] = rb.get(kk, 0.0) + vv
             rb_steps += int(info.get("rsteps", 0))
             stuckw.add(info)
+            tracker.add(info)
         elif len(pend[i]) > N_STEP:
             w = pend[i][:N_STEP]
             rows.append((w[0][0], w[0][1], [x[2] for x in w], N_STEP, pend[i][N_STEP][0], 0, time_cost))
@@ -566,13 +574,14 @@ def train(cfg):
         cur_act[i] = int(a0[i])
         pool.send(i, act_index(cur_act[i]))
     last_log = last_chk = last_prof = time.time()
+    T.freeze_guard(run_dir)
     mt = {"act": 0.0, "collect": 0.0, "wait": 0.0}
     ctr_p, st_p, ts_p = np.array(ctr[:]), np.array(stats[:]), np.array(tstat[:])
     try:
         while True:
             T.watchdog()
             w0 = time.perf_counter()
-            items = pool.poll(0.5)
+            items = pool.poll(0.5) + pool.hung()
             w1 = time.perf_counter()
             rows = []
             for i, nobs, r, done, info in items:
@@ -628,6 +637,10 @@ def train(cfg):
                 ctr_p, st_p, ts_p, last_prof = c, s_, ts, now
             if now - last_chk > 2.0:
                 last_chk = now
+                try:
+                    tracker.update(log)
+                except Exception as e:
+                    T.say(f"Section tracking error: {str(e)[:100]}")
                 if not learner.is_alive():
                     raise RuntimeError("IQN learner stopped: " + (errq.get() if not errq.empty() else "unknown"))
                 if not tester.is_alive():                             # tester died: start a new one

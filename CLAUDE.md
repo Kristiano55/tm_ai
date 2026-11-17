@@ -38,7 +38,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 `events.jsonl` (k = start | lap | test | upd | rb | prof | stop; prof = 5-min "where the time goes"), `status.json` (heartbeat), `train.log`, `best.json`
 (champion_ms, first_test_ms, champion_seed), `champion.zip|.pt`, `champion.txt` (TICK input), `best_run.txt/.json`
 (fastest finished full lap of any kind), `last_test.txt`, `play.txt`, `centerline.npy/.json` (reference line),
-`profile.npy/.json` (ghost: arc length -> race tick), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
+`profile.npy/.json` (ghost: arc length -> race tick), `sections.json` (per-section fail outcomes, rate, target mode),
+`sec_best_<k>.npy` (fastest drive through section k, any lap), `hang.txt` (stack dumps of hangs), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
 `pb_trace.npy/.json` (traced PB), `best_trace.npy`, `latest.zip|.pt`, `vecnorm.pkl` (PPO reward scaling),
 `bench.json` (car-count benchmark), `levels.json` (steering levels + obs layout, for checkpoint conversion), `tester_base.zip` (PPO network layout
   for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
@@ -64,11 +65,21 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
     between the last taken and next checkpoint (`cp_arc`, waypoints mapped onto the line); > `NEAR_LINE` 15 m off,
     the line is re-acquired anywhere in that section. Progress already paid is `_s`: a skipped stretch is paid out at
     <= 10 m per step when the car rejoins further on, a backward jump costs once (-10 m max).
-  - **Stuck rule:** "<2 m along the line in 2 s" only if the car was within 15 m of the line the whole 2 s; otherwise
+  - **Stuck rule:** "<2 m along the line in 2 s" only if the car was within 15 m of the line the whole 2 s, and then
+    only after 4 more seconds (`STALL_TICKS`) if the car still moves (line over a gap/wall it can't take); otherwise
     stuck = < 3 m actually driven in 2 s (sum of movements). Speed < 1.5 m/s for 2 s as before. "far off line" ends a
     lap after 8 s continuously > 40 m off. `StuckWatch` logs a hint when >80% of the last 200 laps end stuck at one spot.
   - Laps are cut only against the AI's **own champion** pace (`champ_trace`), never before a champion exists.
   - A dense positive "while driving" reward is required for PPO; dashboard warns when it goes negative.
+- **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
+  every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
+  failing (>=50 laps) and an AI route exists (`sec_best_<k>` or best lap) -> mode "ai": `build_guide` uses the AI's
+  fastest route there (line + ghost + VCPs). Back to "pb" when 3 laps drive the whole section within 15 m of the PB
+  route (`secs_wr` in lap info), or a periodic "try" (after 10 min, doubling to 1 h; 50 laps, <=50% fail = keep).
+  Every switch is logged (event k=section). `sec_fallback` setting turns it off.
+- **Difficulty input** (last non-lidar input, `N_DIFF`): failure rate of the current section. PPO weights each
+  sample's entropy bonus by `1 + 3 * difficulty` (`focus_entropy`, wraps `policy.evaluate_actions`): more
+  exploration only where laps keep failing. Old PPO checkpoints are widened by `migrate()`.
 - **PB guide:** `pb_file` (TICK input text of Kris's PB) is replayed once to trace *where/when* it drove; it becomes
   the target line + ghost; per checkpoint section the faster of PB vs AI best run is used (`build_guide`). The AI
   never drives the PB inputs (Kris was explicit about this).
@@ -79,6 +90,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible); PPO uses EMA weights and
   `target_kl=0.02`; rollback after `rollback_after` bad tests (IQN only if `iqn_rollback`, default off). Both algos test in a spawn process (busy flag,
   restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
+- **PPO is the main algorithm** (Kris, after IQN stalled on Training - 22). IQN code + settings stay; the dashboard
+  shows IQN settings only when IQN is chosen. Defaults = recommended PPO setup: Lean weights, 8 cars, 50 ms,
+  mid-starts 0.25 (after the first finish), best-of-3 tests.
 - **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best"); cross-map base model (parked
   for later); random switching of steering layouts mid-training.
 
@@ -88,7 +102,14 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - All telemetry groups requested are used by inputs (SHAPE is not requested). `lidar_every` > 1 opens the gym
   without lidar and calls `g.raycast()` every N steps (an extra round trip, so it only pays if the step's own
   scan is expensive: measure with bench, which compares both).
-- PPO keeps SB3's lock-step SubprocVecEnv (its rollout needs it); it has priority + profiling only.
+- PPO uses `make_pool_vecenv` (lock-step VecEnv on `CarPool`, PPO's rollouts need lock-step) instead of SubprocVecEnv.
+
+## Freezes
+- tickgym calls time out (gym 20 s, HTTP 60 s); timeouts end the lap like a `TransportError`.
+- `CarPool`: a car not answering within 120 s (`TMAI_CAR_DEADLINE`) is killed and replaced; its lap ends "car restarted".
+- `watchdog()` re-arms faulthandler (stacks -> `hang.txt`, kept open). `freeze_guard()` thread in the trainer: 180 s
+  without `watchdog()` -> dump all threads, status.json "froze", kill children, exit 3. The dashboard restarts runs
+  marked "froze" or with a stale heartbeat (pid from status.json), also runs it didn't start; max 5 per hour.
 
 ## Testing (no game needed)
 ```
@@ -99,8 +120,11 @@ TMAI_IQN_WARMUP=3000 ...                                   # shorter IQN warm-up
 ```
 The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3 s at 30 ms is optimal.
 `TICKGYM_FAKE_MS=5` makes each fake step take ~5 ms (random, like a busy TICK) for speed tests;
-`TMAI_BENCH_S` / `TMAI_BENCH_CARS` shorten the benchmark. `TICKGYM_FAKE_DETOUR=1` adds a 600 m side loop at z=200 (put a straight `centerline.npy` in the run to test a line
-that cuts the AI's route). Always also:
+`TMAI_BENCH_S` / `TMAI_BENCH_CARS` shorten the benchmark. `TICKGYM_FAKE_DETOUR=1` adds a 620 m side loop at z=200 (just doable inside the 8 s far-off limit at full gas);
+`TICKGYM_FAKE_DETOUR=<file>` only while that file exists. Section fallback test: trace `pb.txt` ("0 accel 1") with
+`prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
+`TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
+`time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.
 

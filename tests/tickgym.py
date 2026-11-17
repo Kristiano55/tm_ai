@@ -1,15 +1,20 @@
 import numpy as np, os
-# TICKGYM_FAKE_DETOUR=1: at z=200 the car leaves the straight and drives a 600 m side loop (out to x=300 and back, almost sideways)
-# before going on, so a straight reference line "cuts the corner" its route takes.
-DETOUR=os.environ.get("TICKGYM_FAKE_DETOUR")=="1"
+# TICKGYM_FAKE_DETOUR=1: at z=200 the car leaves the straight and drives a 620 m side loop (out to x=310 and back,
+# almost sideways) before going on, so a straight reference line "cuts the corner" its route takes. >40 m off a
+# straight line for ~6.8 s at full speed: just inside the 8 s "far off line" limit, any lifting fails.
+# TICKGYM_FAKE_DETOUR=<file path>: the loop exists only while that file exists (checked every step).
+# TICKGYM_FAKE_HANG=<file path>: when that file exists, the next car to step deletes it and hangs forever.
+_DET=os.environ.get("TICKGYM_FAKE_DETOUR","")
+_HANG=os.environ.get("TICKGYM_FAKE_HANG","")
+def _detour(): return _DET=="1" or (_DET not in ("","0") and os.path.exists(_DET))
 # TICKGYM_FAKE_MS=5: each step waits ~5 ms (random, like a busy TICK server); a raycast ~1 ms. Default 0 = instant.
 import time, random
 FAKE_MS=float(os.environ.get("TICKGYM_FAKE_MS","0"))
 def _wait(ms):
     if ms>0: time.sleep(random.expovariate(1.0/ms)/1000.0)
 def _path(d):
-    if not DETOUR or d<200: return [0.,0.,d]
-    a,b,c=np.array([0.,0.,200.]),np.array([300.,0.,202.]),np.array([0.,0.,204.])
+    if not _detour() or d<200: return [0.,0.,d]
+    a,b,c=np.array([0.,0.,200.]),np.array([310.,0.,202.]),np.array([0.,0.,204.])
     l1,l2=np.linalg.norm(b-a),np.linalg.norm(c-b)
     if d<200+l1: return list(a+(b-a)*(d-200)/l1)
     if d<200+l1+l2: return list(b+(c-b)*(d-200-l1)/l2)
@@ -55,6 +60,9 @@ class G:
             if a.kind=='accel': s.acc=bool(a.value)
         if accelerate is not None: s.acc=accelerate
         accelerate=s.acc
+        if _HANG and os.path.exists(_HANG):
+            try: os.remove(_HANG); time.sleep(10**6)
+            except FileNotFoundError: pass
         _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),80); s.v=max(s.v,0); s.z+=s.v*ticks/100; return s.tel()
     def raycast(s,rays):
         _wait(FAKE_MS/5); return NS(hit=[0]*len(rays),distance=[0]*len(rays))
@@ -67,4 +75,5 @@ class G:
     def export(s): return NS(finish_ms=s.tick*10,actions=[])
     def close(s): pass
 class Client:
-    def open_map(s,m): return NS(connect=lambda g,l:G(l),close=lambda:None)
+    def __init__(s,*a,**k): pass
+    def open_map(s,m): return NS(connect=lambda g,l,timeout=None:G(l),close=lambda:None)

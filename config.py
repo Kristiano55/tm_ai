@@ -37,14 +37,15 @@ DEFAULTS = {
     "iqn_rollback": False,          # IQN: roll back to the champion after bad tests (PPO always can)
     "iqn_device": "auto",           # IQN learner: "auto" (GPU if PyTorch sees one), "cpu" or "cuda"; driving stays on CPU
     "lidar_every": 1,               # 1 = lidar scan every step; 2 = every other step (reuses the last scan)
-    "iqn_warm_run": "",             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
+    "iqn_warm_run": "",
+    "sec_fallback": True,           # with a PB/WR target line: sections where most laps fail use the AI's own route             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
     "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
     "horizon_s": 20.0,         # how far ahead (seconds) the AI weighs rewards     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
     "decay_steps": 4000000,    # learning rate + exploration halve every N env steps (0 = off)
     "line_refresh_s": 0.2,
     "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
-    "mid_start_p": 0.6,        # share of training laps that start partway along the champion's lap (0 = off)
+    "mid_start_p": 0.25,       # share of training laps that start partway along the champion's lap (0 = off)
     "mid_start_every_s": 2.0,  # spacing of those start points along the champion lap, seconds     # rebuild the reference line + ghost when the champion beats it by this much (0 = never)
     "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }
@@ -75,12 +76,14 @@ WEIGHTS = {
     "w_air": (0.0, "Airtime penalty", "per step with no wheel on the ground"),
     "w_speed": (0.0, "Speed reward", "per step, proportional to speed (direct speed incentive)"),
 }
-DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 
-# "Lean" preset: only the terms that define the task; everything else off.
+# "Lean" preset: only the terms that define the task; everything else off. This is also the default (recommended
+# for PPO); "Reset weights to defaults" fills it in.
 LEAN = {k: 0.0 for k in WEIGHTS}
 LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
             w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05)
+WEIGHTS = {k: (LEAN[k], label, hint) for k, (_, label, hint) in WEIGHTS.items()}
+DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 
 # "Linesight" preset: exactly two terms. Linesight's 0.01/m vs 0.06 per 50 ms breaks even at 120 m/s (TMNF);
 # for TM2020 progress is 0.03/m, so driving pays from ~40 m/s (0.06 / 0.05 s / 0.03 per m).

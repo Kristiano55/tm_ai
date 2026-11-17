@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import subprocess
+
+import numpy as np
 import sys
 import threading
 import time
@@ -124,6 +126,71 @@ def track_outline(rd):
         return []
 
 
+_SEC = {"key": None, "rows": []}
+
+
+def _cuts(tr):
+    tk = tr[:, 4]
+    c = [0] + [i for i in range(1, len(tk)) if tk[i] > tk[i - 1]]
+    if c[-1] != len(tr) - 1:
+        c.append(len(tr) - 1)
+    return c
+
+
+def section_rows(rd):
+    """Per checkpoint section: your PB/WR split, the AI's best split, failure rate, target in use."""
+    sj = read_json(rd / "sections.json")
+    files = [rd / "pb_trace.npy", rd / "best_trace.npy"] + sorted(rd.glob("sec_best_*.npy"))
+    key = (sj.get("t"), tuple((f.name, f.stat().st_mtime) for f in files if f.exists()))
+    if key == _SEC["key"]:
+        return _SEC["rows"]
+    n = int(sj.get("n") or 0)
+    pb = ai = None
+    try:
+        pb = np.load(rd / "pb_trace.npy")
+    except (OSError, ValueError):
+        pass
+    try:
+        ai = np.load(rd / "best_trace.npy")
+    except (OSError, ValueError):
+        pass
+
+    def splits(tr):
+        if tr is None or tr.ndim != 2 or tr.shape[1] < 5:
+            return []
+        c = _cuts(tr)
+        return [(tr[c[j + 1], 3] - (tr[c[j], 3] if j else 0.0)) / 100.0 for j in range(len(c) - 1)]
+
+    pbs, ais = splits(pb), splits(ai)
+    n = max(n, len(pbs))
+    guide = pb is not None
+    rows = []
+    for k in range(n):
+        best = ais[k] if k < len(ais) and len(ais) == n else None
+        try:
+            seg = np.load(rd / f"sec_best_{k}.npy")
+            d = (seg[-1, 3] - seg[0, 3]) / 100.0
+            best = d if best is None else min(best, d)
+        except (OSError, ValueError, IndexError):
+            pass
+        modes, rates, laps = sj.get("mode") or [], sj.get("rate") or [], sj.get("laps") or []
+        m = modes[k] if k < len(modes) else "pb"
+        rows.append({"k": k + 1, "pb": round(pbs[k], 2) if k < len(pbs) else None,
+                     "ai": round(best, 2) if best is not None else None,
+                     "rate": rates[k] if k < len(rates) else None, "laps": laps[k] if k < len(laps) else 0,
+                     "target": ("AI route (fallback)" if m == "ai" else "PB/WR (retrying)" if m == "try"
+                                else "PB/WR" if guide else "own champion line")})
+    _SEC.update(key=key, rows=rows)
+    return rows
+
+
+def safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return []
+
+
 def build_state():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
@@ -186,6 +253,7 @@ def build_state():
         "best_run": read_json(rd / "best_run.json") or None,
         "last_play": read_json(rd / "play_result.json") or None,
         "prof": S.prof, "bench": read_json(rd / "bench.json") or None,
+        "sections": safe(section_rows, rd),
     }
 
 
@@ -259,28 +327,71 @@ def discord_loop():
             pass
 
 
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(int(pid))
+    except ImportError:
+        pass
+    if sys.platform == "win32":              # (os.kill would terminate the process on Windows)
+        r = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}"], capture_output=True, text=True)
+        return str(int(pid)) in r.stdout
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill_pid(pid):
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))], capture_output=True)
+        else:
+            os.kill(int(pid), 15)
+    except Exception:
+        pass
+
+
 def frozen_guard():
-    """Training that stopped moving (no heartbeat for 150 s) is restarted from its last checkpoint."""
+    """Training that froze is restarted from its last checkpoint: the trainer marks status.json "froze" itself
+    (its freeze guard), or its heartbeat stops for 150 s. Also for runs this dashboard did not start (the pid comes
+    from status.json)."""
     restarts = []
     while True:
         time.sleep(15)
         try:
-            if not (alive() and PROC["kind"] == "train"):
+            if alive() and PROC["kind"] != "train":
                 continue
             cfg = cfgmod.load()
             rd = cfgmod.run_dir(cfg)
             st = read_json(rd / "status.json")
-            if (rd / "STOP").exists() or time.time() - PROC.get("t0", 0) < 180:
+            now = time.time()
+            if (rd / "STOP").exists() or (alive() and now - PROC.get("t0", 0) < 180):
                 continue
-            if st.get("state") == "running" and time.time() - st.get("heartbeat", time.time()) > 150:
-                restarts[:] = [t for t in restarts if time.time() - t < 3600] + [time.time()]
-                with open(rd / "train.log", "a", encoding="utf-8") as f:
-                    f.write(time.strftime("%H:%M:%S ") + "Training froze for 150 s; restarting from the last "
-                            "checkpoint (see the stack dump above for where it hung).\n")
+            hb, pid = st.get("heartbeat", now), st.get("pid")
+            froze = st.get("state") == "froze" and now - hb < 600
+            stale = st.get("state") == "running" and 150 < now - hb < 1800 and (alive() or pid_alive(pid))
+            if not (froze or stale):
+                continue
+            restarts[:] = [t for t in restarts if now - t < 3600] + [now]
+            with open(rd / "train.log", "a", encoding="utf-8") as f:
+                f.write(time.strftime("%H:%M:%S ") + ("Training froze; " if froze else "Training froze for 150 s; ")
+                        + "restarting from the last checkpoint (stacks in hang.txt).\n")
+            if alive():
                 kill_proc()
-                time.sleep(5)
-                if len(restarts) <= 5:
-                    start("train")
+            elif pid_alive(pid) and pid != os.getpid():
+                kill_pid(pid)
+            st["state"] = "stopped"
+            (rd / "status.json").write_text(json.dumps(st), encoding="utf-8")
+            time.sleep(5)
+            if len(restarts) <= 5:
+                start("train")
+            else:
+                with open(rd / "train.log", "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S ") + "Froze more than 5 times in an hour: not restarting.\n")
         except Exception:
             pass
 

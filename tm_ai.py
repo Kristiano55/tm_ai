@@ -48,13 +48,73 @@ STEER_LEVELS = {
 }
 
 
+_HANG = {"file": None, "pet": time.time(), "guard": None}
+
+
+def _hang_file():
+    """runs/<run>/hang.txt, opened once and kept open (faulthandler writes to it from C, even when Python hangs)."""
+    if _HANG["file"] is None:
+        try:
+            import config as _c
+            d = _c.run_dir(_c.load())
+            _HANG["file"] = open(d / "hang.txt", "a", encoding="utf-8")
+        except Exception:
+            _HANG["file"] = sys.stderr
+    return _HANG["file"]
+
+
 def watchdog(seconds=90):
-    """Re-armed while things move; if a process is stuck this long, its stack is written to the log."""
+    """Re-armed while things move. If this process is stuck this long, all its threads' stacks go to hang.txt."""
+    _HANG["pet"] = time.time()
     try:
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(seconds, repeat=False, file=sys.stderr)
+        faulthandler.dump_traceback_later(seconds, repeat=False, file=_hang_file())
     except Exception:
         pass
+
+
+def freeze_guard(run_dir, seconds=180):
+    """Trainer only: a thread that notices when the main loop stops calling watchdog() for `seconds`. It writes all
+    stacks to hang.txt, marks status.json "froze" (the dashboard restarts the run), stops the child processes and
+    exits. Works on Windows (no signals needed)."""
+    if _HANG["guard"] is not None:
+        return
+    import threading
+    run_dir = Path(run_dir)
+    _HANG["pet"] = time.time()
+
+    def loop():
+        while True:
+            time.sleep(5)
+            idle = time.time() - _HANG["pet"]
+            if idle < seconds:
+                continue
+            try:
+                f = _hang_file()
+                f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trainer froze ({idle:.0f} s without progress) ===\n")
+                f.flush()
+                faulthandler.dump_traceback(file=f, all_threads=True)
+                f.flush()
+            except Exception:
+                pass
+            try:
+                st = read_json(run_dir / "status.json")
+                write_json(run_dir / "status.json", {**st, "state": "froze", "heartbeat": time.time(),
+                                                     "reason": f"froze ({idle:.0f} s without progress)",
+                                                     "pid": os.getpid()})
+                say(f"Training froze ({idle:.0f} s without progress); stacks in hang.txt. Exiting so it can restart.")
+            except Exception:
+                pass
+            try:
+                import multiprocessing as mp
+                for c in mp.active_children():
+                    c.terminate()
+            except Exception:
+                pass
+            os._exit(3)
+
+    _HANG["guard"] = threading.Thread(target=loop, daemon=True, name="freeze-guard")
+    _HANG["guard"].start()
 
 
 def say(msg):
@@ -184,7 +244,9 @@ def _cp_cuts(trace):
 
 def build_guide(run_dir):
     """Target line = per checkpoint section, the faster of your PB and the AI's best finished run.
-    So the line starts as your PB and switches section by section wherever the AI finds something faster."""
+    So the line starts as your PB and switches section by section wherever the AI finds something faster.
+    Sections marked "ai" in sections.json (laps keep failing there on the PB/WR route) use the AI's own fastest
+    drive through that section instead (best finished lap or best single section drive, sec_best_<k>.npy)."""
     run_dir = Path(run_dir)
     try:
         pb = np.load(run_dir / "pb_trace.npy")
@@ -200,16 +262,28 @@ def build_guide(run_dir):
     cuts = {k: _cp_cuts(v) for k, v in srcs.items()}
     n = len(cuts["PB"]) - 1
     use = [k for k in srcs if len(cuts[k]) - 1 == n]          # same checkpoint count only
+    modes = read_json(run_dir / "sections.json").get("mode", [])
     rows, t0, chosen = [], 0.0, []
     for j in range(n):
-        dur = {k: srcs[k][cuts[k][j + 1], 3] - (srcs[k][cuts[k][j], 3] if j else 0.0) for k in use}
-        k = min(use, key=lambda kk: dur[kk])
-        tr, a, b = srcs[k], cuts[k][j], cuts[k][j + 1]
-        part = tr[a:b + 1] if j == n - 1 else tr[a:b]
-        base = tr[a, 3] if j else 0.0
+        # candidates: (duration, label, rows of the section, base tick)
+        cand = []
+        for k in use:
+            tr, a, b = srcs[k], cuts[k][j], cuts[k][j + 1]
+            dur = tr[b, 3] - (tr[a, 3] if j else 0.0)
+            cand.append((dur, k, tr[a:b + 1] if j == n - 1 else tr[a:b], tr[a, 3] if j else 0.0))
+        if j < len(modes) and modes[j] == "ai":
+            ai_c = [c for c in cand if c[1] != "PB"]
+            try:
+                seg = np.load(run_dir / f"sec_best_{j}.npy")
+                if seg.ndim == 2 and len(seg) >= 3:
+                    ai_c.append((seg[-1, 3] - seg[0, 3], "AI*", seg if j == n - 1 else seg[:-1], seg[0, 3]))
+            except (OSError, ValueError):
+                pass
+            cand = ai_c or cand                                # no AI route through it yet: keep the PB
+        dur, k, part, base = min(cand, key=lambda c: c[0])
         for r in part:
             rows.append([r[0], r[1], r[2], t0 + r[3] - base])
-        t0 += dur[k]
+        t0 += dur
         chosen.append(k)
     comp = np.array(rows)
     if len(comp) < 10:
@@ -224,6 +298,119 @@ def build_guide(run_dir):
     return ms, chosen
 
 
+FAIL_ENDS = ("stuck", "off-zone", "far off line", "behind ghost", "timeout")
+
+
+class SectionTracker:
+    """Per checkpoint section: how often laps that reach it fail there. With a PB/WR target line, a section where
+    most laps fail switches its target to the AI's own best route through it ("ai"), and back to the PB/WR route
+    when the AI gets through on that route (or on a periodic retry). Writes sections.json (read by the cars:
+    difficulty input + target mode) and rebuilds the guide on every switch."""
+
+    WINDOW, MIN_N, FAIL, RETRY_S, TRY_N = 200, 50, 0.7, 600.0, 50
+
+    def __init__(self, run_dir, cfg, n_sections):
+        self.run_dir, self.cfg = Path(run_dir), cfg
+        self.f = self.run_dir / "sections.json"
+        self.guide = bool(cfg.get("pb_file")) and (self.run_dir / "pb_trace.npy").exists()
+        self.on = self.guide and cfg.get("sec_fallback", True)
+        d = read_json(self.f)
+        n = max(1, int(n_sections))
+        if d.get("n") != n:
+            d = {}
+        self.n = n
+        self.out = [list(x)[-self.WINDOW:] for x in d.get("out", [[] for _ in range(n)])]
+        self.mode = list(d.get("mode", ["pb"] * n)) if self.on else ["pb"] * n
+        self.since = list(d.get("since", [0.0] * n))
+        self.retry = list(d.get("retry", [self.RETRY_S] * n))
+        self.wr = [0] * n
+        self.last_write = 0.0
+        if not self.on and "ai" in d.get("mode", []):          # fallback switched off: back to the PB/WR line
+            self.write()
+            if self.guide:
+                build_guide(self.run_dir)
+        self.write()
+
+    def add(self, info):
+        """One finished training lap (any end)."""
+        if info.get("end") in ("car restarted", "gym lost"):
+            return
+        cp0, j = int(info.get("cp0", 0)), int(info.get("cp", 0))
+        for k in range(max(cp0, 0), min(j, self.n)):
+            self.out[k].append(0)
+        if j < self.n and info.get("end") in FAIL_ENDS:
+            self.out[j].append(1)
+        for k in range(self.n):
+            del self.out[k][:-self.WINDOW]
+        for k in info.get("secs_wr") or []:
+            if 0 <= k < self.n:
+                self.wr[k] += 1
+
+    def rate(self, k):
+        o = self.out[k]
+        return sum(o) / len(o) if len(o) >= 10 else None
+
+    def _ai_route(self, k):
+        return (self.run_dir / f"sec_best_{k}.npy").exists() or (self.run_dir / "best_trace.npy").exists()
+
+    def _set(self, k, mode, why, log):
+        old, self.mode[k] = self.mode[k], mode
+        self.out[k], self.wr[k], self.since[k] = [], 0, time.time()
+        tgt = {"pb": "your PB/WR route", "try": "your PB/WR route (trial)", "ai": "the AI's own best route"}[mode]
+        say(f"Section {k + 1} (checkpoint {k} -> {k + 1}): target is now {tgt} - {why}")
+        if log:
+            log(k="section", sec=k, mode=mode, old=old, why=why)
+
+    def update(self, log=None):
+        """Decide switches; call every few seconds."""
+        changed, now = False, time.time()
+        for k in range(self.n if self.on else 0):
+            r, m, n_out = self.rate(k), self.mode[k], len(self.out[k])
+            if m == "pb" and r is not None and n_out >= self.MIN_N and r > self.FAIL and self._ai_route(k):
+                self._set(k, "ai", f"{r:.0%} of the laps reaching it fail there", log)
+                changed = True
+            elif m == "ai" and self.wr[k] >= 3:
+                self._set(k, "pb", "the AI got through on the PB/WR route", log)
+                self.retry[k] = self.RETRY_S
+                changed = True
+            elif m == "ai" and now - self.since[k] > self.retry[k]:
+                self._set(k, "try", f"periodic retry after {self.retry[k] / 60:.0f} min", log)
+                changed = True
+            elif m == "try" and n_out >= self.TRY_N:
+                if r is not None and r <= 0.5:
+                    self._set(k, "pb", f"retry worked ({r:.0%} fail)", log)
+                    self.retry[k] = self.RETRY_S
+                else:
+                    self.retry[k] = min(self.retry[k] * 2, 3600.0)
+                    self._set(k, "ai", f"retry failed ({r:.0%} fail); next retry in {self.retry[k] / 60:.0f} min", log)
+                changed = True
+        if changed:
+            self.write()
+            try:
+                r = build_guide(self.run_dir)
+                if r:
+                    say(f"Target line sections: {' '.join(r[1])} (target pace {r[0] / 1000:.3f} s)")
+            except Exception as e:
+                say(f"Could not rebuild the target line ({str(e)[:80]})")
+        elif now - self.last_write > 30:
+            self.write()
+
+    def write(self):
+        self.last_write = time.time()
+        rates = [self.rate(k) for k in range(self.n)]
+        write_json(self.f, {"n": self.n, "mode": self.mode, "rate": [round(x, 3) if x is not None else None for x in rates],
+                            "laps": [len(o) for o in self.out], "out": self.out, "since": self.since,
+                            "retry": self.retry, "t": time.time()})
+
+
+def n_sections(run_dir, env_route_len=None):
+    """Number of checkpoint sections (checkpoints + finish): from the PB trace if there is one."""
+    try:
+        return len(_cp_cuts(np.load(Path(run_dir) / "pb_trace.npy"))) - 1
+    except (OSError, ValueError):
+        return env_route_len
+
+
 class TMEnv(gym.Env):
     """One car on one map. Action = (steer level, throttle mode)."""
 
@@ -235,8 +422,10 @@ class TMEnv(gym.Env):
     N_PATH = 3 * PATH3D + 12              # + 3 more previous actions (5 in total)
     NEAR_LINE = 15.0                      # m (horizontal): closer than this the car is "on" the reference line
     FAR_LINE, FAR_TICKS = 40.0, 800       # end a lap after 8 s continuously further than 40 m off the line
+    STALL_TICKS = 400                     # on the line, moving, but no progress along it: 4 s grace
     _ARCS = np.array(LOOK + PREVIEW + tuple(10.0 * k for k in range(1, PATH3D + 1)))
-    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH   # non-lidar features
+    N_DIFF = 1                            # how often laps fail in the current section (0..1): last non-lidar input
+    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH + N_DIFF   # non-lidar features
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
@@ -265,8 +454,10 @@ class TMEnv(gym.Env):
         self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
         self.cprof, self._cprof_key = None, None
         self.cp_arc, self.off_line, self.far, self.pbuf, self.nbuf = None, 0.0, 0, [], []
+        self.stall, self.cp0, self.seg0, self.sec_wr, self._wr_max = 0, 0, None, [], 0.0
+        self.sec_rate, self.sec_mode, self._sec_m, self.pb_dense, self.pb_cut = [], [], None, None, None
 
-        self.session = Client().open_map(cfg["map"])
+        self.session = Client(timeout=60).open_map(cfg["map"])
         # 32-ray level fan, 4 downward rays (drops/gaps), 5 forward-up rays (ceilings, overhangs)
         fan = Lidar.fan(rays=32, fov_degrees=180, range_m=120)
         down = Lidar.directions([0, 0, 0, 0], [-4, -12, -25, -45], range_m=40)
@@ -385,6 +576,68 @@ class TMEnv(gym.Env):
         if self.starts and self.starts[-1].get("pos") is not None and len(self.starts) - n0 > 1:
             self.starts.pop()                    # skip the one right before the finish
 
+    # --- per-section bookkeeping (failure rates, target fallback, best segment per section) ----------------
+    def _read_sections(self):
+        """sections.json (written by the trainer): failure rate and target mode ("pb" / "ai" / "try") per section."""
+        if not self.run_dir:
+            return
+        f = self.run_dir / "sections.json"
+        try:
+            m = os.path.getmtime(f)
+        except OSError:
+            return
+        if m == self._sec_m:
+            return
+        d = read_json(f)
+        self._sec_m = m
+        self.sec_rate = [float(x or 0.0) for x in d.get("rate", [])]
+        self.sec_mode = list(d.get("mode", []))
+        if self.guide and self.pb_dense is None and "ai" in self.sec_mode:
+            try:
+                pb = np.load(self.run_dir / "pb_trace.npy")
+                self.pb_dense, self.pb_cut = pb[:, :3], _cp_cuts(pb)
+            except (OSError, ValueError):
+                pass
+
+    def _difficulty(self):
+        k = int(self.taken)
+        return float(self.sec_rate[k]) if 0 <= k < len(self.sec_rate) else 0.0
+
+    def _pb_off(self, pos, k):
+        """Horizontal distance from the PB/WR route within section k."""
+        c = self.pb_cut
+        if c is None or k + 1 >= len(c):
+            return 0.0
+        seg = self.pb_dense[c[k]:c[k + 1] + 1]
+        return float(np.min(np.hypot(seg[:, 0] - pos[0], seg[:, 2] - pos[2])))
+
+    def _section_done(self, k, tick):
+        """The car just completed section k (checkpoint k -> k+1)."""
+        if (self.seg0 is not None and self.sec_mode and k < len(self.sec_mode) and self.sec_mode[k] == "ai"
+                and self._wr_max < self.NEAR_LINE):           # drove the whole section on the PB/WR route
+            self.sec_wr.append(k)
+        self._wr_max = 0.0
+        if self.seg0 is not None and self.run_dir is not None and self.role == "training":
+            try:
+                self._offer_segment(k, np.asarray(self.hist[self.seg0:], dtype=np.float64))
+            except Exception:                                  # file trouble must never stop training
+                pass
+        self.seg0 = len(self.hist) - 1
+
+    def _offer_segment(self, k, seg):
+        """Keep the fastest drive through each section (any lap, also unfinished ones): fallback target route."""
+        if len(seg) < 3:
+            return
+        f = self.run_dir / f"sec_best_{k}.npy"
+        dur = seg[-1, 3] - seg[0, 3]
+        try:
+            old = np.load(f)
+            if old[-1, 3] - old[0, 3] <= dur:
+                return
+        except (OSError, ValueError, IndexError):
+            pass
+        save_npy(f, seg)
+
     def _pick_start(self):
         """Mostly the sections where laps fail; every section keeps some chance."""
         w = 1.0 + self.fails
@@ -413,7 +666,7 @@ class TMEnv(gym.Env):
                 old.close()
         except Exception:
             pass
-        self.g = self.session.connect(self.groups, self.lidar if self.lidar_every == 1 else None)
+        self.g = self.session.connect(self.groups, self.lidar if self.lidar_every == 1 else None, timeout=20)
         self._scan = None
 
     def _read_lidar(self, t, fresh=False):
@@ -721,6 +974,7 @@ class TMEnv(gym.Env):
         f += [x for row in self.mem for x in row]                    # oldest first
         f += list(np.clip(locs[nl + npv:] / 100.0, -5.0, 5.0).ravel())   # the line ahead in 3D, up to 400 m
         f += list(self.pa_old)
+        f.append(self._difficulty())                                 # section failure rate (exploration focus)
         hit, dist = self._lid
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
         self._last_obs = np.clip(np.nan_to_num(np.asarray(f, dtype=np.float32)), -10, 10)
@@ -748,7 +1002,7 @@ class TMEnv(gym.Env):
         self.pa = np.zeros(8)
         self.mem = [[0.0, 0.0, 0.0]] * self.N_HIST
         self.pa_old = np.zeros(12)
-        self.sbuf, self.pbuf, self.nbuf, self.far = [], [], [], 0
+        self.sbuf, self.pbuf, self.nbuf, self.far, self.stall = [], [], [], 0, 0
         self.limit = self._limit_ticks()
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
@@ -774,6 +1028,9 @@ class TMEnv(gym.Env):
         self.phi = self._phi(self._s, tick)
         self.vcp_i = int(np.searchsorted(self.vcp_s, self._s, side="right"))
         self.hist = [[*pos, tick, self.taken]]
+        self.cp0, self.sec_wr, self._wr_max = self.taken, [], 0.0
+        self.seg0 = 0 if self.start_i is None else None     # section segments only from a checkpoint crossing
+        self._read_sections()
         self._read_lidar(t, fresh=True)
         return self._obs(t, self._s), {}
 
@@ -788,9 +1045,10 @@ class TMEnv(gym.Env):
             self._read_lidar(t)
             c1 = time.perf_counter()
             self.tm["tick"] += c1 - c0                           # TICK round trips (step + any raycast)
-        except TransportError:                  # game hiccup: reopen the gym, end this lap
+        except (TransportError, TimeoutError, ConnectionError):   # game hiccup / no answer in 20 s: new gym, end lap
             self._connect()
-            info = {"finished": False, "race_ms": 0, "cp": self.taken, "tick": 0, "end": "gym lost"}
+            info = {"finished": False, "race_ms": 0, "cp": self.taken, "tick": 0, "end": "gym lost",
+                    "cp0": self.cp0}
             return self._last_obs, 0.0, False, True, info
 
         W, r = self.W, {}
@@ -846,7 +1104,12 @@ class TMEnv(gym.Env):
         self._s = self._s + dp if s >= self._s else s
         self.pa_old = np.concatenate([self.pa[4:8], self.pa_old[:8]])
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
+        prev_taken = self.hist[-1][4] if self.hist else taken
         self.hist.append([*pos, tick, taken])
+        if self.sec_mode and taken < len(self.sec_mode) and self.sec_mode[taken] == "ai" and self.pb_dense is not None:
+            self._wr_max = max(self._wr_max, self._pb_off(pos, taken))   # is it driving the PB/WR route here?
+        if taken > prev_taken:
+            self._section_done(int(prev_taken), tick)
 
         end, terminated, truncated = "", False, False
         length = self.dense[2][-1] if self.dense is not None else self.lap_len
@@ -872,11 +1135,14 @@ class TMEnv(gym.Env):
             self.pbuf = (self.pbuf + [pos])[-nb:]
             self.nbuf = (self.nbuf + [self.off_line < self.NEAR_LINE])[-nb:]
             full = len(self.sbuf) >= nb and tick > 300
-            if all(self.nbuf):                        # on the line the whole 2 s: <2 m along it
-                no_progress = full and self.sbuf[-1] - self.sbuf[0] < 2.0
-            else:                                     # own route away from the line: real movement counts
-                moved = float(np.sum(np.linalg.norm(np.diff(np.asarray(self.pbuf), axis=0), axis=1)))
-                no_progress = full and moved < 3.0           # distance actually driven in 2 s
+            moved = float(np.sum(np.linalg.norm(np.diff(np.asarray(self.pbuf), axis=0), axis=1)))
+            if all(self.nbuf) and full and self.sbuf[-1] - self.sbuf[0] < 2.0:
+                # on the line but not getting along it: if the car still moves (e.g. the line jumps a gap or
+                # goes through a wall it can't take), give it 4 s more before calling it stuck
+                self.stall = self.stall + self.ticks if moved >= 3.0 else self.STALL_TICKS
+            else:
+                self.stall = 0
+            no_progress = full and (moved < 3.0 or self.stall >= self.STALL_TICKS)   # distance actually driven
             self.far = self.far + self.ticks if self.off_line > self.FAR_LINE else 0
             if self.slow >= 200 or no_progress:                                 # stuck
                 terminated, end = True, "stuck"
@@ -896,7 +1162,8 @@ class TMEnv(gym.Env):
         if terminated or truncated:
             self._blame(s, end not in ("finished",))
         info = {"finished": bool(t.finished), "race_ms": int(t.race.race_time_ms),
-                "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None,
+                "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None, "cp0": self.cp0,
+                "secs_wr": list(self.sec_wr),
                 "x": round(float(pos[0]), 1), "z": round(float(pos[2]), 1)}
         c2 = time.perf_counter()
         obs = self._obs(t, s)
@@ -976,7 +1243,8 @@ def car_worker(cfg, run_dir, conn):
     try:
         env = TMEnv(cfg, run_dir)
         obs, _ = env.reset()
-        conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.action_space.nvec]))
+        conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.action_space.nvec],
+                   int(env.n_seg)))
         waited = 0.0
         while True:
             w0 = time.perf_counter()
@@ -1010,33 +1278,69 @@ class CarPool:
     """Cars in their own processes, NOT in lock-step: each car gets its next action as soon as its own step is back,
     so nobody waits for the slowest car. Per-car order is kept (results of a car arrive in its step order)."""
 
+    DEADLINE = float(os.environ.get("TMAI_CAR_DEADLINE", 120))   # a car step taking longer = hung car, replaced
+
     def __init__(self, cfg, run_dir, n):
         import multiprocessing as mp
         from multiprocessing.connection import wait
-        self._wait = wait
-        ctx = mp.get_context("spawn")
-        self.n, self.conns, self.procs = n, [], []
-        for _ in range(n):
-            a, b = ctx.Pipe()
-            p = ctx.Process(target=car_worker, args=(cfg, str(run_dir), b), daemon=True)
-            p.start()
-            b.close()
-            self.conns.append(a)
-            self.procs.append(p)
+        self._wait, self.cfg, self.run_dir = wait, cfg, str(run_dir)
+        self.ctx = mp.get_context("spawn")
+        self.n, self.conns, self.procs = n, [None] * n, [None] * n
+        for i in range(n):
+            self._spawn(i)
         self.first_obs = [None] * n
+        self.sent = [None] * n                       # when each car got its action (None = not stepping)
         self.prof = np.zeros(5)                      # summed seconds: tick, obs, env, waited for action; + steps
-        dims = set()
-        for i, c in enumerate(self.conns):
-            m = c.recv()
-            if m[0] == "error":
-                self.close()
-                raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
-            self.first_obs[i], dim, self.nvec = m[1], m[2], m[3]
-            dims.add(dim)
-        self.dim = dims.pop()
+        self.replaced = 0
+        for i in range(n):
+            self.first_obs[i] = self._ready(i)
         self.idx = {id(c): i for i, c in enumerate(self.conns)}
 
+    def _spawn(self, i):
+        a, b = self.ctx.Pipe()
+        p = self.ctx.Process(target=car_worker, args=(self.cfg, self.run_dir, b), daemon=True)
+        p.start()
+        b.close()
+        self.conns[i], self.procs[i] = a, p
+
+    def _ready(self, i, timeout=600):
+        c = self.conns[i]
+        if not c.poll(timeout):
+            raise RuntimeError(f"car {i + 1} did not start within {timeout} s")
+        m = c.recv()
+        if m[0] == "error":
+            self.close()
+            raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
+        self.dim, self.nvec, self.n_seg = m[2], m[3], m[4]
+        return m[1]
+
+    def replace(self, i):
+        """Kill a hung car and start a fresh one in its place; returns the new car's first observation."""
+        say(f"Car {i + 1} did not answer for {self.DEADLINE:.0f} s: replacing it with a fresh one.")
+        try:
+            self.procs[i].terminate()
+            self.procs[i].join(timeout=10)
+        except Exception:
+            pass
+        self._spawn(i)
+        obs = self._ready(i)
+        self.idx = {id(c): j for j, c in enumerate(self.conns)}
+        self.sent[i] = None
+        self.replaced += 1
+        return obs
+
+    def hung(self):
+        """Results for cars stuck past the deadline: (car, fresh obs, 0 reward, done, info) after replacing them."""
+        now, out = time.time(), []
+        for i, t in enumerate(self.sent):
+            if t is not None and now - t > self.DEADLINE:
+                obs = self.replace(i)
+                out.append((i, obs, 0.0, True, {"end": "car restarted", "finished": False, "race_ms": 0, "cp": 0,
+                                                "cp0": 0, "TimeLimit.truncated": True}))
+        return out
+
     def send(self, i, action):
+        self.sent[i] = time.time()
         self.conns[i].send(np.asarray(action))
 
     def poll(self, timeout=1.0):
@@ -1051,6 +1355,7 @@ class CarPool:
             if m[0] == "error":
                 raise RuntimeError(f"car {i + 1}: {m[1]}")
             _, obs, r, done, info, tm = m
+            self.sent[i] = None
             self.prof[:4] += tm
             self.prof[4] += 1
             out.append((i, obs, r, done, info))
@@ -1070,6 +1375,63 @@ class CarPool:
             p.join(timeout=10)
             if p.is_alive():
                 p.terminate()
+
+
+def make_pool_vecenv(cfg, run_dir):
+    """PPO's cars: lock-step like SubprocVecEnv (PPO's rollouts need it) but a hung car is replaced instead of
+    freezing the whole training."""
+    from stable_baselines3.common.vec_env.base_vec_env import VecEnv
+
+    class PoolVecEnv(VecEnv):
+        def __init__(self):
+            self.pool = CarPool(cfg, run_dir, cfg["envs"])
+            self.cur = list(self.pool.first_obs)
+            self.n_seg = self.pool.n_seg
+            self.render_mode = None
+            obs_space = spaces.Box(-10.0, 10.0, (self.pool.dim,), np.float32)
+            VecEnv.__init__(self, cfg["envs"], obs_space, spaces.MultiDiscrete(self.pool.nvec))
+
+        def reset(self):
+            return np.stack(self.cur)
+
+        def step_async(self, actions):
+            for i, a in enumerate(actions):
+                self.pool.send(i, a)
+
+        def step_wait(self):
+            n = self.num_envs
+            res = [None] * n
+            while any(r is None for r in res):
+                watchdog()
+                for i, obs, r, done, info in self.pool.poll(1.0) + self.pool.hung():
+                    if done and "terminal_observation" not in info:          # replaced car: last known state
+                        info["terminal_observation"] = self.cur[i]
+                    res[i] = (obs, r, done, info)
+            self.cur = [r[0] for r in res]
+            return (np.stack(self.cur), np.array([r[1] for r in res], np.float32), np.array([r[2] for r in res]),
+                    [r[3] for r in res])
+
+        def close(self):
+            self.pool.close()
+
+        def get_attr(self, attr_name, indices=None):
+            if attr_name == "render_mode":
+                return [None] * self.num_envs
+            raise AttributeError(attr_name)
+
+        def set_attr(self, attr_name, value, indices=None):
+            pass
+
+        def env_method(self, method_name, *a, indices=None, **k):
+            return [None] * self.num_envs
+
+        def env_is_wrapped(self, wrapper_class, indices=None):
+            return [False] * self.num_envs
+
+        def seed(self, seed=None):
+            return [None] * self.num_envs
+
+    return PoolVecEnv()
 
 
 def prof_summary(car, wall, main=None, learner=None, tester=None, ticks=5):
@@ -1186,6 +1548,26 @@ def make_model(env):
                n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
                learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
+
+
+ENT_BOOST = 3.0          # entropy weight in a section where every lap fails: 1 + 3 = 4x the normal exploration
+
+
+def focus_entropy(model):
+    """More exploration where laps keep failing: each sample's entropy bonus is weighted by
+    1 + ENT_BOOST * (failure rate of its section), read from the observation's last non-lidar input."""
+    pol = model.policy
+    if getattr(pol, "_focus", False):
+        return
+    orig, col = pol.evaluate_actions, TMEnv.N_BASE - 1
+
+    def evaluate_actions(obs, actions):
+        values, log_prob, entropy = orig(obs, actions)
+        if entropy is not None:
+            entropy = entropy * (1.0 + ENT_BOOST * obs[:, col].clamp(0.0, 1.0))
+        return values, log_prob, entropy
+
+    pol.evaluate_actions, pol._focus = evaluate_actions, True
 
 
 def interp_rows(old_levels, rows, new_levels):
@@ -1363,7 +1745,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
         env.close()
 
 
-def _make_callback(cfg, run_dir):
+def _make_callback(cfg, run_dir, tracker=None):
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.utils import get_schedule_fn
 
@@ -1385,6 +1767,7 @@ def _make_callback(cfg, run_dir):
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
+            freeze_guard(run_dir)
             self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
             log(k="start", cfg=cfg)
             self.status("running")
@@ -1446,6 +1829,8 @@ def _make_callback(cfg, run_dir):
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                         end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
                     self.stuckw.add(info)
+                    if tracker is not None:
+                        tracker.add(info)
                     tm = info.get("tm")
                     if tm:
                         self.ptm += [tm["tick"], tm["obs"], tm["env"], 0.0, tm["n"]]
@@ -1472,6 +1857,11 @@ def _make_callback(cfg, run_dir):
                     self.reason = "time limit reached"
                     return False
                 self.check_rollback()
+                if tracker is not None:
+                    try:
+                        tracker.update(log)
+                    except Exception as e:                      # never stop training over this
+                        say(f"Section tracking error: {str(e)[:100]}")
                 champ, pb = read_json(best_file).get("champion_ms"), cfg["pb_seconds"]
                 if cfg["stop_at_pb"] and pb and champ and champ <= pb * 1000:
                     self.reason = "reached your PB"
@@ -1576,7 +1966,7 @@ def prepare_guide(cfg, run_dir):
 def train(cfg):
     import torch
     from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+    from stable_baselines3.common.vec_env import VecNormalize
 
     run_dir = cfgmod.run_dir(cfg)
     (run_dir / "STOP").unlink(missing_ok=True)
@@ -1584,7 +1974,8 @@ def train(cfg):
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     raise_priority(tick_too=True)
     prepare_guide(cfg, run_dir)
-    venv = SubprocVecEnv([partial(_make_env, cfg, str(run_dir)) for _ in range(cfg["envs"])])
+    venv = make_pool_vecenv(cfg, str(run_dir))              # a hung car is replaced, not the whole training frozen
+    tracker = SectionTracker(run_dir, cfg, n_sections(run_dir, venv.n_seg))
     set_gamma(cfg)
     vn_file = run_dir / "vecnorm.pkl"
     env = None
@@ -1620,7 +2011,8 @@ def train(cfg):
             say(f"Cannot resume ({str(e)[:80]}), starting fresh")
     if model is None:
         model = make_model(env)
-    cb = _make_callback(cfg, run_dir)
+    focus_entropy(model)
+    cb = _make_callback(cfg, run_dir, tracker)
     try:
         model.learn(total_timesteps=10 ** 12, callback=cb, reset_num_timesteps=False)
     except KeyboardInterrupt:
