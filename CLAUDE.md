@@ -57,16 +57,24 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   - LINESIGHT preset is progress 0.03/m, time 0.06 per 50 ms (driving pays from ~40 m/s; Linesight's TMNF ratio
     0.01/m broke even at 120 m/s, so IQN on TM2020 got stuck at ~17 m/s).
   - Ghost reward only within `ghost_window_s` behind the ghost, otherwise slow laps learned to quit.
+  - **Progress off the target line** (the WR line can take a cut the AI doesn't): the matched arc length is clamped
+    between the last taken and next checkpoint (`cp_arc`, waypoints mapped onto the line); > `NEAR_LINE` 15 m off,
+    the line is re-acquired anywhere in that section. Progress already paid is `_s`: a skipped stretch is paid out at
+    <= 10 m per step when the car rejoins further on, a backward jump costs once (-10 m max).
+  - **Stuck rule:** "<2 m along the line in 2 s" only if the car was within 15 m of the line the whole 2 s; otherwise
+    stuck = < 3 m actually driven in 2 s (sum of movements). Speed < 1.5 m/s for 2 s as before. "far off line" ends a
+    lap after 8 s continuously > 40 m off. `StuckWatch` logs a hint when >80% of the last 200 laps end stuck at one spot.
   - Laps are cut only against the AI's **own champion** pace (`champ_trace`), never before a champion exists.
   - A dense positive "while driving" reward is required for PPO; dashboard warns when it goes negative.
 - **PB guide:** `pb_file` (TICK input text of Kris's PB) is replayed once to trace *where/when* it drove; it becomes
   the target line + ghost; per checkpoint section the faster of PB vs AI best run is used (`build_guide`). The AI
   never drives the PB inputs (Kris was explicit about this).
 - **Virtual checkpoints** every `vcp_every_s` of ghost pace: flat bonus + split vs ghost.
-- **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; built BEFORE
+- **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; IQN uses
+  `iqn_mid_start_p` (0.2) and, with a `pb_file`, starts only along the PB/WR states (to learn the WR route's cut); built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
 - **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible); PPO uses EMA weights and
-  `target_kl=0.02`; rollback after `rollback_after` bad tests. Both algos test in a spawn process (busy flag,
+  `target_kl=0.02`; rollback after `rollback_after` bad tests (IQN only if `iqn_rollback`, default off). Both algos test in a spawn process (busy flag,
   restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
 - **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best"); cross-map base model (parked
   for later); random switching of steering layouts mid-training.
@@ -78,7 +86,9 @@ echo '{"map":"x","run":"t","envs":2,"test_every_laps":3,"time_limit_min":1}' > c
 PYTHONPATH=<repo>/tests python3 -u tm_ai.py train          # PPO; add "algo":"iqn" for IQN
 TMAI_IQN_WARMUP=3000 ...                                   # shorter IQN warm-up for tests
 ```
-The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3 s at 30 ms is optimal. Always also:
+The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3 s at 30 ms is optimal.
+`TICKGYM_FAKE_DETOUR=1` adds a 600 m side loop at z=200 (put a straight `centerline.npy` in the run to test a line
+that cuts the AI's route). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.
 

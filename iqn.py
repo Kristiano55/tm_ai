@@ -168,7 +168,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy):
                 T.save_npy(run_dir / "champ_trace.npy", np.asarray(tr["hist"], dtype=np.float64))
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
                 bad += 1
-                if bad >= cfg["rollback_after"] and (run_dir / "champion.pt").exists():
+                if cfg["iqn_rollback"] and bad >= cfg["rollback_after"] and (run_dir / "champion.pt").exists():
                     (run_dir / "ROLLBACK").write_text("1")
                     rolled, bad = True, 0
             else:
@@ -381,6 +381,7 @@ def train(cfg):
                 for kk, vv in (info.get("rb") or {}).items():
                     rb[kk] = rb.get(kk, 0.0) + vv
                 rb_steps += int(info.get("rsteps", 0))
+                stuckw.add(info)
 
     def check_rollback():
         if not (run_dir / "ROLLBACK").exists():
@@ -397,6 +398,8 @@ def train(cfg):
         (run_dir / "ROLLBACK").unlink(missing_ok=True)
 
     obs = envs.reset()
+    steps0 = S["steps"]                    # dashboard speed: steps driven in this session only
+    stuckw = T.StuckWatch()
     reason = "stopped"
     log(k="start", cfg=cfg)
     status("running")
@@ -464,7 +467,7 @@ def train(cfg):
                 losses, qs = stats["losses"], stats["qs"]
                 stats["losses"], stats["qs"] = [], []
                 log(k="upd", u=S["upd"], steps=S["steps"], v=float(np.mean(qs)), vl=float(np.mean(losses)), ent=eps,
-                    ev=0.0, speed=S["steps"] * cfg["ticks_per_step"] / 100.0 / max(now - t0, 1e-6))
+                    ev=0.0, speed=(S["steps"] - steps0) * cfg["ticks_per_step"] / 100.0 / max(now - t0, 1e-6))
                 if rb_steps:
                     log(k="rb", r={kk: round(vv / rb_steps, 5) for kk, vv in rb.items()})
                 rb, rb_steps, last_log = {}, 0, now

@@ -1,4 +1,14 @@
-import numpy as np
+import numpy as np, os
+# TICKGYM_FAKE_DETOUR=1: at z=200 the car leaves the straight and drives a 600 m side loop (out to x=300 and back, almost sideways)
+# before going on, so a straight reference line "cuts the corner" its route takes.
+DETOUR=os.environ.get("TICKGYM_FAKE_DETOUR")=="1"
+def _path(d):
+    if not DETOUR or d<200: return [0.,0.,d]
+    a,b,c=np.array([0.,0.,200.]),np.array([300.,0.,202.]),np.array([0.,0.,204.])
+    l1,l2=np.linalg.norm(b-a),np.linalg.norm(c-b)
+    if d<200+l1: return list(a+(b-a)*(d-200)/l1)
+    if d<200+l1+l2: return list(b+(c-b)*(d-200-l1)/l2)
+    return [0.,0.,204.+d-200-l1-l2]
 from types import SimpleNamespace as NS
 class TransportError(Exception): pass
 class TelemetryGroup:
@@ -25,11 +35,12 @@ class G:
         s.map=NS(waypoints=[NS(group_id=1,vertices=[[0,0,500]]),NS(group_id=2,vertices=[[0,0,1000]])],start_position=[0,0,0],lap_count=1)
     def tel(s):
         sp=s.v
-        return NS(vehicle=NS(speed=sp,linear_velocity=[0,0,sp],angular_velocity=[0,0,0],rotation=[0,0,0,1],position=[0,0,s.z],in_water=0),
+        p=_path(s.z); z=p[2]
+        return NS(vehicle=NS(speed=sp,linear_velocity=[0,0,sp],angular_velocity=[0,0,0],rotation=[0,0,0,1],position=p,in_water=0),
           wheels=NS(contact=[1]*4,slipping=[0]*4,angular_velocity=[10]*4,icing_percent=[0]*4),
-          drivetrain=NS(steer=0,gear=3),race=NS(checkpoints_taken=int(s.z//500),race_tick=s.tick,race_time_ms=s.tick*10,entered_off_zone=False),
+          drivetrain=NS(steer=0,gear=3),race=NS(checkpoints_taken=int(z//500),race_tick=s.tick,race_time_ms=s.tick*10,entered_off_zone=False),
           runtime=NS(wall_hit_this_step=0,wetness=0),effects=NS(turbo=0),
-          lidar=NS(hit=[0]*s.n,distance=[0]*s.n),finished=s.z>=1000)
+          lidar=NS(hit=[0]*s.n,distance=[0]*s.n),finished=z>=1000)
     acc=True
     @property
     def next_tick(s): return s.tick

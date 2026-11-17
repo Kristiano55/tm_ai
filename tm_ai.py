@@ -233,6 +233,8 @@ class TMEnv(gym.Env):
     N_MEM = 2 * len(PREVIEW) + 3 * N_HIST
     PATH3D = 40                           # Linesight-style: 40 line points, every 10 m, x/y/z in the car frame
     N_PATH = 3 * PATH3D + 12              # + 3 more previous actions (5 in total)
+    NEAR_LINE = 15.0                      # m (horizontal): closer than this the car is "on" the reference line
+    FAR_LINE, FAR_TICKS = 40.0, 800       # end a lap after 8 s continuously further than 40 m off the line
     _ARCS = np.array(LOOK + PREVIEW + tuple(10.0 * k for k in range(1, PATH3D + 1)))
     N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH   # non-lidar features
     LOOK_OFF = 28                         # where the lookahead features start
@@ -253,12 +255,13 @@ class TMEnv(gym.Env):
         self.extra = bool(cfg["extra_obs"])
         self.groups = GROUPS_EXTRA if self.extra else GROUPS
         self.gspd = None
-        self.mid_p = float(cfg["mid_start_p"]) if role == "training" else 0.0
+        self.mid_p = float(cfg["iqn_mid_start_p" if self.iqn else "mid_start_p"]) if role == "training" else 0.0
         self.mid_every = max(20, int(cfg["mid_start_every_s"] * 100 / cfg["ticks_per_step"]))
         self.starts, self.fails, self._ca_m, self.start_i, self.acts = [], np.zeros(0), "unset", None, []
         self._starts_line = "unset"
         self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
         self.cprof, self._cprof_key = None, None
+        self.cp_arc, self.off_line, self.far, self.pbuf, self.nbuf = None, 0.0, 0, [], []
 
         self.session = Client().open_map(cfg["map"])
         # 32-ray level fan, 4 downward rays (drops/gaps), 5 forward-up rays (ceilings, overhangs)
@@ -331,7 +334,11 @@ class TMEnv(gym.Env):
                 acts = []
             self.g.reset(seed=0)
             pa = np.zeros(8)
-            limit //= (2 if self.guide else 1)
+            pb_only = self.iqn and self.guide       # IQN: start on the WR/PB route (where it cuts), not the AI's own
+            if pb_only:
+                acts = []
+            else:
+                limit //= (2 if self.guide else 1)
             for i, (steer, mode) in enumerate(acts[:-self.mid_every // 2]):
                 t = self.g.step(self.ticks, steer=int(steer), accelerate=(mode == 0), brake=(mode == 2))
                 pa = np.concatenate([[steer / 127.0], np.eye(3)[int(mode)], pa[:4]])
@@ -349,7 +356,8 @@ class TMEnv(gym.Env):
             self.fails = np.zeros(len(self.starts))
             self._starts_line = "unset"
             if self.starts:
-                say(f"[{self.role}] {len(self.starts)} mid-track start points built (champion lap + your PB)")
+                say(f"[{self.role}] {len(self.starts)} mid-track start points built "
+                    + ("(along your PB/WR)" if pb_only else "(champion lap + your PB)"))
         except Exception:                       # snapshots unsupported / limit reached: train without
             self.starts, self.fails = self.starts[:len(self.fails)] if len(self.fails) else [], self.fails
 
@@ -436,6 +444,22 @@ class TMEnv(gym.Env):
             return
         seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         self.dense, self._line_m = (pts, seg, np.concatenate([[0.0], np.cumsum(seg)])), m
+        self.cp_arc = self._map_checkpoints()
+
+    def _map_checkpoints(self):
+        """Arc length of every checkpoint (and the finish) on the reference line, in driving order.
+        Used as anchors: progress stays between the last taken and the next checkpoint. None = unreliable."""
+        if self.dense is None or self.multilap:
+            return None
+        pts, _, cum = self.dense
+        arcs = []
+        for c in self.route[1:]:
+            d = np.linalg.norm(pts - c, axis=1)
+            j = int(np.argmin(d))
+            if d[j] > 60.0:                      # line misses a checkpoint: no anchors
+                return None
+            arcs.append(float(cum[j]))
+        return np.sort(np.array(arcs))
 
     def _load_profile(self):
         """The ghost: when the fastest run so far was at each point of the reference line."""
@@ -544,8 +568,28 @@ class TMEnv(gym.Env):
     def _progress(self, pos, taken):
         """Metres driven along the route (reference line if there is one)."""
         if self.dense is not None:
-            s, self.di = line_progress(*self.dense, pos, self.di)
+            pts, seg, cum = self.dense
+            s, j = line_progress(pts, seg, cum, pos, self.di)
+            lo, hi = 0.0, float(cum[-1])
+            if self.cp_arc is not None:           # stay inside the current checkpoint section
+                n = len(self.cp_arc)
+                lo = float(self.cp_arc[taken - 1]) - 20.0 if 0 < taken <= n else (0.0 if taken <= 0 else hi)
+                hi = float(self.cp_arc[taken]) + 5.0 if taken < n else hi
+            off = float(np.hypot(*(pos - pts[j])[[0, 2]]))
+            if off > self.NEAR_LINE:              # off the line: re-acquire it anywhere in this section
+                i0 = int(np.searchsorted(cum, max(lo, 0.0)))
+                i1 = int(np.searchsorted(cum, hi, side="right"))
+                if i1 > i0:
+                    dd = np.hypot(pts[i0:i1, 0] - pos[0], pts[i0:i1, 2] - pos[2])
+                    k = int(np.argmin(dd))
+                    if dd[k] < self.NEAR_LINE:
+                        s, j = line_progress(pts, seg, cum, pos, i0 + k + 10)
+                        off = float(dd[k])
+            s = float(np.clip(s, max(lo, 0.0), hi))
+            self.di = min(j, int(np.searchsorted(cum, s)) + 1)
+            self.off_line = off
             return s
+        self.off_line = 0.0
         if self.multilap:
             laps, i = divmod(taken, self.n_seg)
         else:
@@ -688,7 +732,7 @@ class TMEnv(gym.Env):
         self.pa = np.zeros(8)
         self.mem = [[0.0, 0.0, 0.0]] * self.N_HIST
         self.pa_old = np.zeros(12)
-        self.sbuf = []
+        self.sbuf, self.pbuf, self.nbuf, self.far = [], [], [], 0
         self.limit = self._limit_ticks()
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
@@ -733,7 +777,9 @@ class TMEnv(gym.Env):
         taken, tick = int(t.race.checkpoints_taken), int(t.race.race_tick)
         s = self._progress(pos, taken)
         speed = float(t.vehicle.speed)
-        r["progress"] = W["w_progress"] * float(np.clip(s - self._s, -10.0, 10.0))
+        dp = s - self._s                      # _s = progress already paid; a skipped stretch is paid at
+        dp = min(dp, 10.0) if dp >= 0 else max(dp, -10.0)   # <= 10 m per step, a backward jump costs once
+        r["progress"] = W["w_progress"] * dp
         tf = self.tf
         r["time"] = -W["w_time"] * tf
         r["steer"] = -W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
@@ -776,7 +822,8 @@ class TMEnv(gym.Env):
             dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
             r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
-        self.prev_speed, self._s = speed, s
+        self.prev_speed = speed
+        self._s = self._s + dp if s >= self._s else s
         self.pa_old = np.concatenate([self.pa[4:8], self.pa_old[:8]])
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
         self.hist.append([*pos, tick, taken])
@@ -800,10 +847,22 @@ class TMEnv(gym.Env):
             r["end"] = -(W["w_offzone"] + give_up)
         else:
             self.slow = self.slow + self.ticks if (speed < 1.5 and tick > 300) else 0
-            self.sbuf = (self.sbuf + [s])[-max(2, 200 // self.ticks):]
-            no_progress = len(self.sbuf) >= 200 // self.ticks and self.sbuf[-1] - self.sbuf[0] < 2.0 and tick > 300
-            if self.slow >= 200 or no_progress:                                 # stuck: <2 m along the line in 2 s
+            nb = max(2, 200 // self.ticks)
+            self.sbuf = (self.sbuf + [s])[-nb:]
+            self.pbuf = (self.pbuf + [pos])[-nb:]
+            self.nbuf = (self.nbuf + [self.off_line < self.NEAR_LINE])[-nb:]
+            full = len(self.sbuf) >= nb and tick > 300
+            if all(self.nbuf):                        # on the line the whole 2 s: <2 m along it
+                no_progress = full and self.sbuf[-1] - self.sbuf[0] < 2.0
+            else:                                     # own route away from the line: real movement counts
+                moved = float(np.sum(np.linalg.norm(np.diff(np.asarray(self.pbuf), axis=0), axis=1)))
+                no_progress = full and moved < 3.0           # distance actually driven in 2 s
+            self.far = self.far + self.ticks if self.off_line > self.FAR_LINE else 0
+            if self.slow >= 200 or no_progress:                                 # stuck
                 terminated, end = True, "stuck"
+                r["end"] = -(W["w_stuck"] + give_up)
+            elif self.far >= self.FAR_TICKS:                                    # lost, far off the line
+                terminated, end = True, "far off line"
                 r["end"] = -(W["w_stuck"] + give_up)
             elif (self.role == "training" and self.cut_behind and tick > 500
                   and self._behind_champ(s, tick, phi) < -self.cut_behind):      # tests always drive the full lap
@@ -828,6 +887,33 @@ class TMEnv(gym.Env):
             self.session.close()
         except Exception:
             pass
+
+
+class StuckWatch:
+    """Notices when most laps end "stuck" at the same spot and says where (once every 10 minutes at most)."""
+
+    def __init__(self, n=200):
+        self.n, self.ends, self.last = n, [], 0.0
+
+    def add(self, info):
+        if info.get("x") is None:
+            return
+        self.ends = (self.ends + [(info.get("end", ""), float(info["x"]), float(info["z"]), int(info.get("cp", 0)))])[-self.n:]
+        if len(self.ends) < self.n or time.time() - self.last < 600:
+            return
+        st = [e for e in self.ends if e[0] == "stuck"]
+        if len(st) < 0.8 * self.n:
+            return
+        xz = np.array([[e[1], e[2]] for e in st])
+        mid = np.median(xz, axis=0)
+        near = np.linalg.norm(xz - mid, axis=1) < 30.0
+        if near.sum() < 0.8 * self.n:
+            return
+        cps = [e[3] for e, k in zip(st, near) if k]
+        self.last = time.time()
+        say(f"Hint: {int(near.sum()) * 100 // self.n}% of the last {self.n} laps ended 'stuck' within 30 m of "
+            f"x={mid[0]:.0f} z={mid[1]:.0f} (after checkpoint {max(set(cps), key=cps.count)}). Something there "
+            "blocks progress (e.g. the AI's route leaves the target line).")
 
 
 def _make_env(cfg, run_dir):
@@ -1063,6 +1149,7 @@ def _make_callback(cfg, run_dir):
             self.reason, self.last_v, self.tests_off = "step budget reached", 0.0, False
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
+            self.stuckw = StuckWatch()
             log(k="start", cfg=cfg)
             self.status("running")
             say("Training started: %d cars, %s steering, CPU." % (cfg["envs"], cfg["steer_mode"]))
@@ -1122,6 +1209,7 @@ def _make_callback(cfg, run_dir):
                     fin = bool(info.get("finished"))
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                         end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
+                    self.stuckw.add(info)
                     for kk, vv in (info.get("rb") or {}).items():
                         self.rb[kk] = self.rb.get(kk, 0.0) + vv
                     self.rb_steps += int(info.get("rsteps", 0))
