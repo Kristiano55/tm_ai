@@ -12,7 +12,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 
 ## Files
 - `tm_ai.py` — environment (`TMEnv`, gymnasium), observations, rewards, reference line / ghost / PB guide,
-  mid-track starts, PPO training (SB3) with champion tests (callback), `selftest`, `drive`. CLI:
+  mid-track starts, PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
+  EMA weights by the callback; rollback via `ROLLBACK` file), `selftest`, `drive`. CLI:
   `python tm_ai.py selftest|train|drive` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
@@ -32,7 +33,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 (fastest finished full lap of any kind), `last_test.txt`, `play.txt`, `centerline.npy/.json` (reference line),
 `profile.npy/.json` (ghost: arc length -> race tick), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
 `pb_trace.npy/.json` (traced PB), `best_trace.npy`, `latest.zip|.pt`, `vecnorm.pkl` (PPO reward scaling),
-`levels.json` (steering levels + obs layout, for checkpoint conversion), `STOP` / `ROLLBACK` flag files.
+`levels.json` (steering levels + obs layout, for checkpoint conversion), `tester_base.zip` (PPO network layout
+  for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
 
 ## Key design decisions (and why)
 - **Actions:** 21 progressive steering levels (fine near centre) x {gas, coast, brake}; `ticks_per_step` 5 (50 ms)
@@ -57,7 +59,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
 - **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible); PPO uses EMA weights and
-  `target_kl=0.02`; rollback after `rollback_after` bad tests.
+  `target_kl=0.02`; rollback after `rollback_after` bad tests. Both algos test in a spawn process (busy flag,
+  restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
 - **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best"); cross-map base model (parked
   for later); random switching of steering layouts mid-training.
 
@@ -82,7 +85,6 @@ Test checkpoint conversion by training with the previous git version first, then
 
 ## Open ideas / backlog
 - Wheel contact material input (check tickgym telemetry fields via selftest).
-- Async champion tests for PPO (IQN already has them).
 - Learning-rate warm restart when layout/timing changes (PPO).
 - Cross-map base driver with map pool (parked by Kris).
 - Run comparison view in the dashboard.

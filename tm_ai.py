@@ -918,6 +918,109 @@ def migrate(run_dir, cfg, env):
 
 
 # --- champion tests, dashboard events, stop conditions ----------------------------------------
+def ppo_test_worker(cfg, run_dir, inbox, busy):
+    """Champion tests for PPO in their own process (spawn): best of N laps with the EMA weights it is sent.
+    Writes champion.zip/.txt, champ_trace, champion_actions, the reference line; asks for a rollback via ROLLBACK."""
+    import torch
+    from stable_baselines3 import PPO
+    torch.set_num_threads(1)
+    run_dir = Path(run_dir)
+    events, best_file = run_dir / "events.jsonl", run_dir / "best.json"
+    line_file, line_meta = run_dir / "centerline.npy", run_dir / "centerline.json"
+
+    def log(**kw):
+        kw["t"] = round(time.time(), 2)
+        with open(events, "a", encoding="utf-8") as f:
+            f.write(json.dumps(kw) + "\n")
+
+    env, model, bad, tests = None, None, 0, 0
+    while True:
+        msg = inbox.get()
+        if msg is None:
+            break
+        try:
+            if env is None:
+                try:                           # needs one extra gym slot besides the training cars
+                    env = TMEnv(cfg, run_dir, shorten=False, role="champion test")
+                except Exception as e:
+                    say(f"Champion tests disabled: {e}. Lower 'envs' by one to enable them.")
+                    busy.value = -1
+                    continue
+            if model is None:
+                model = PPO.load(str(run_dir / "tester_base.zip"), device="cpu")
+            model.policy.load_state_dict(msg["sd"])
+            best_try = None                    # best of N: argmax lap + seeded laps, keep the fastest
+            for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
+                inf = run_episode(env, model, sd)
+                tr = {"info": inf, "seed": sd, "hist": list(env.hist), "acts": list(env.acts), "rec": env.g.export()}
+                key = (0, inf["race_ms"]) if inf["finished"] else (1, -inf.get("cp", 0))
+                if best_try is None or key < best_try[0]:
+                    best_try = (key, tr)
+            tr = best_try[1]
+            info, env.hist, env.acts = tr["info"], tr["hist"], tr["acts"]
+            fin, rec = bool(info["finished"]), tr["rec"]
+            tests += 1
+            try:                               # watch any test in TICK, also failed ones
+                InputText.write(str(run_dir / "last_test.txt"), rec.actions)
+            except Exception:
+                pass
+            ms = int(rec.finish_ms) if fin else None
+            best = read_json(best_file)
+            champ = best.get("champion_ms")
+            promoted = rolled = False
+            if fin:
+                best.setdefault("first_test_ms", ms)
+            if fin and (champ is None or ms < champ):
+                promoted, bad = True, 0
+                model.save(run_dir / "champion_tmp.zip")         # champion = the smoothed weights
+                os.replace(run_dir / "champion_tmp.zip", run_dir / "champion.zip")
+                best["champion_ms"] = champ = ms
+                best["champion_seed"] = tr["seed"]
+                save_npy(run_dir / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
+                InputText.write(str(run_dir / "champion.txt"), rec.actions)
+            elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
+                bad += 1
+                if bad >= cfg["rollback_after"]:
+                    if (run_dir / "champion.zip").exists():
+                        (run_dir / "ROLLBACK").write_text("1")
+                        rolled = True
+                    bad = 0
+            else:
+                bad = 0
+            ca = run_dir / "champion_actions.json"
+            if fin and (promoted or not ca.exists()):          # route for the mid-track starts
+                write_json(ca, {"ms": ms, "acts": env.acts})
+            if fin and not (run_dir / "champ_trace.npy").exists():
+                save_npy(run_dir / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
+            line_ms = read_json(line_meta).get("ms") or best.get("first_test_ms")   # old runs: line from the first test
+            refresh = cfg["line_refresh_s"] and promoted and line_ms and ms <= line_ms - cfg["line_refresh_s"] * 1000
+            if env.guide:
+                refresh = False                                  # guide mode: the line is PB/best sections
+            if fin and (not line_file.exists() or refresh):     # reference line follows the champion
+                what = "rebuilt from the new champion" if line_file.exists() else "created"
+                save_npy(line_file, make_line(np.asarray(env.hist)[:, :3]))
+                env._load_line()
+                for f in ("profile.json", "profile.npy"):
+                    (run_dir / f).unlink(missing_ok=True)
+                env._offer_profile(ms)
+                write_json(line_meta, {"ms": ms, "t": time.time()})
+                say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
+            write_json(best_file, best)
+            log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled)
+            say(f"Champion test {tests}: " + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
+                + (" -> NEW CHAMPION" if promoted else "") + (" -> rolling back to champion" if rolled else ""))
+        except Exception as e:
+            say(f"Champion test failed: {str(e)[:120]}")
+            if env is not None:
+                env.close()
+            env = None
+        finally:
+            if busy.value != -1:
+                busy.value = 0
+    if env is not None:
+        env.close()
+
+
 def _make_callback(cfg, run_dir):
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.utils import get_schedule_fn
@@ -936,8 +1039,7 @@ def _make_callback(cfg, run_dir):
             self.t0, self.last_chk = time.time(), 0.0
             self.steps0 = self.model.num_timesteps
             self.laps = self.since = self.bad = self.tests = 0
-            self.reason, self.last_v, self.test_env, self.tests_off = "step budget reached", 0.0, None, False
-            self.best = read_json(best_file)
+            self.reason, self.last_v, self.tests_off = "step budget reached", 0.0, False
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             log(k="start", cfg=cfg)
@@ -1012,100 +1114,53 @@ def _make_callback(cfg, run_dir):
                 if cfg["time_limit_min"] and now - self.t0 > cfg["time_limit_min"] * 60:
                     self.reason = "time limit reached"
                     return False
-                self.status("running")
-            if self.since >= cfg["test_every_laps"] and not self.tests_off:
-                self.champion_test()
-                champ, pb = self.best.get("champion_ms"), cfg["pb_seconds"]
+                self.check_rollback()
+                champ, pb = read_json(best_file).get("champion_ms"), cfg["pb_seconds"]
                 if cfg["stop_at_pb"] and pb and champ and champ <= pb * 1000:
                     self.reason = "reached your PB"
                     return False
+                self.status("running")
+            if self.since >= cfg["test_every_laps"] and not self.tests_off:
+                self.champion_test()
             return True
 
+        def tester_start(self):
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            self.inbox, self.busy = ctx.Queue(), ctx.Value("i", 0)
+            self.tester = ctx.Process(target=ppo_test_worker, args=(cfg, str(run_dir), self.inbox, self.busy),
+                                      daemon=True)
+            self.tester.start()
+
         def champion_test(self):
-            self.since = 0
-            try:
-                if self.test_env is None:      # needs one extra gym slot besides the training cars
-                    self.test_env = TMEnv(cfg, run_dir, shorten=False, role="champion test")
-                cur = {k: v.detach().clone() for k, v in self.model.policy.state_dict().items()}
-                if getattr(self, "ema", None) is not None:
-                    self.model.policy.load_state_dict(self.ema)
-                try:
-                    best_try = None                      # best of N: argmax lap + seeded laps, keep the fastest
-                    for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
-                        inf = run_episode(self.test_env, self.model, sd)
-                        tr = {"info": inf, "seed": sd, "hist": list(self.test_env.hist), "acts": list(self.test_env.acts),
-                              "rec": self.test_env.g.export()}
-                        key = (0, inf["race_ms"]) if inf["finished"] else (1, -inf.get("cp", 0))
-                        if best_try is None or key < best_try[0]:
-                            best_try = (key, tr)
-                    tr = best_try[1]
-                    info, self.test_env.hist, self.test_env.acts = tr["info"], tr["hist"], tr["acts"]
-                    fin = bool(info["finished"])
-                    rec = tr["rec"] if fin else None
-                    self.test_seed = tr["seed"]
-                    if fin and (self.best.get("champion_ms") is None or int(rec.finish_ms) < self.best["champion_ms"]):
-                        self.model.save(run_dir / "champion")        # champion = the smoothed weights
-                finally:
-                    self.model.policy.load_state_dict(cur)
-            except Exception as e:             # e.g. no free gym slot: keep training, skip tests
+            """Hand the smoothed (EMA) weights to the tester process; training keeps driving meanwhile."""
+            if getattr(self, "tester", None) is None:
+                self.model.save(run_dir / "tester_base")         # network layout for the tester (weights replaced)
+                self.tester_start()
+            elif not self.tester.is_alive():
+                say("Champion tester stopped unexpectedly, restarting it")
+                self.tester_start()
+            if self.busy.value == -1:                            # tester could not open a gym
                 self.tests_off = True
-                say(f"Champion tests disabled: {e}. Lower 'envs' by one to enable them.")
                 return
-            self.tests += 1
-            try:                                                # watch any test in TICK, also failed ones
-                InputText.write(str(run_dir / "last_test.txt"), (rec or tr["rec"]).actions)
-            except Exception:
-                pass
-            ms = int(rec.finish_ms) if fin else None
-            champ = self.best.get("champion_ms")
-            promoted = rolled = False
-            if fin:
-                self.best.setdefault("first_test_ms", ms)
-            if fin and (champ is None or ms < champ):
-                promoted, self.bad = True, 0
-                self.best["champion_ms"] = champ = ms
-                self.best["champion_seed"] = self.test_seed
-                save_npy(run_dir / "champ_trace.npy", np.asarray(self.test_env.hist, dtype=np.float64))
+            if self.busy.value:
+                return
+            self.check_rollback()                                # never send a test before a pending rollback
+            self.since = 0
+            sd = self.ema if getattr(self, "ema", None) is not None else self.model.policy.state_dict()
+            self.busy.value = 1
+            self.inbox.put({"sd": {k: v.detach().clone() for k, v in sd.items()}, "lap_n": self.laps})
 
-                InputText.write(str(run_dir / "champion.txt"), rec.actions)
-            elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
-                self.bad += 1
-                if self.bad >= cfg["rollback_after"]:
-                    try:
-                        self.model.set_parameters(str(run_dir / "champion.zip"), exact_match=True, device="cpu")
-                        self.ema_update(reset=True)
-                        rolled = True
-                    except Exception as e:
-                        say(f"Rollback failed ({str(e)[:60]})")
-                    self.bad = 0
-            else:
-                self.bad = 0
-            ca = run_dir / "champion_actions.json"
-            if fin and (promoted or not ca.exists()):          # route for the mid-track starts
-                write_json(ca, {"ms": ms, "acts": self.test_env.acts})
-            if fin and not (run_dir / "champ_trace.npy").exists():
-                save_npy(run_dir / "champ_trace.npy", np.asarray(self.test_env.hist, dtype=np.float64))
-            line_ms = read_json(line_meta).get("ms") or self.best.get("first_test_ms")   # old runs: line came from the first test
-            refresh = cfg["line_refresh_s"] and promoted and line_ms and ms <= line_ms - cfg["line_refresh_s"] * 1000
-            if self.test_env.guide:
-                refresh = False                                  # guide mode: the line is PB/best sections
-            if fin and (not line_file.exists() or refresh):     # reference line follows the champion
-                self.rebuild_line(ms, "rebuilt from the new champion" if line_file.exists() else "created")
-            write_json(best_file, self.best)
-            log(k="test", lap_n=self.laps, ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled)
-            say(f"Champion test {self.tests}: " + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
-                + (" -> NEW CHAMPION" if promoted else "") + (" -> rolled back to champion" if rolled else ""))
-
-        def rebuild_line(self, ms, what):
-            """New reference line from the test lap just driven, and a fresh ghost on it (= that lap)."""
-            env = self.test_env
-            save_npy(line_file, make_line(np.asarray(env.hist)[:, :3]))
-            env._load_line()
-            for f in ("profile.json", "profile.npy"):
-                (run_dir / f).unlink(missing_ok=True)
-            env._offer_profile(ms)
-            write_json(line_meta, {"ms": ms, "t": time.time()})
-            say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
+        def check_rollback(self):
+            flag = run_dir / "ROLLBACK"
+            if not flag.exists():
+                return
+            try:
+                self.model.set_parameters(str(run_dir / "champion.zip"), exact_match=True, device="cpu")
+                self.ema_update(reset=True)
+            except Exception as e:
+                say(f"Rollback failed ({str(e)[:60]})")
+            flag.unlink(missing_ok=True)
 
         def save_all(self):
             self.model.save(run_dir / "latest")
@@ -1118,8 +1173,12 @@ def _make_callback(cfg, run_dir):
             log(k="stop", reason=self.reason)
             self.status("stopped", self.reason)
             say("Stopped: " + self.reason)
-            if self.test_env is not None:
-                self.test_env.close()
+            if getattr(self, "tester", None) is not None:
+                try:
+                    self.inbox.put(None)
+                    self.tester.join(timeout=60)
+                except Exception:
+                    pass
 
     return Champion()
 
@@ -1164,6 +1223,7 @@ def train(cfg):
 
     run_dir = cfgmod.run_dir(cfg)
     (run_dir / "STOP").unlink(missing_ok=True)
+    (run_dir / "ROLLBACK").unlink(missing_ok=True)
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     prepare_guide(cfg, run_dir)
     venv = SubprocVecEnv([partial(_make_env, cfg, str(run_dir)) for _ in range(cfg["envs"])])
