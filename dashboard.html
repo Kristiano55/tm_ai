@@ -80,6 +80,7 @@ const FIELDS=[['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['e
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
  ['decay_steps','Learning rate / exploration halve every N env steps (0 = off)','number'],
+ ['pb_file','Your PB as a TICK input file (.txt) - target line (empty = off)','text'],
  ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
  ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
  ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];

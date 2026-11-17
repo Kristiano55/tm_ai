@@ -23,6 +23,8 @@ Optional check: `python tm_ai.py selftest --map "C:\path\to\map.Map.Gbx"` prints
 - **Champion tests:** every 50 laps the AI drives one lap without exploration. If it's faster, it becomes the new champion (`champion.zip` + `champion.txt`); if training gets worse, it rolls back to the champion.
 - **Ghost and racing line:** reward for time gained on the fastest run so far. The racing line is rebuilt from each new champion.
 - **Mid-track starts:** most training laps start from snapshots along the champion's lap, with more weight on the sections where laps fail.
+- **Target line from your PB:** set *Your PB as a TICK input file* in Settings. The run is played once in the simulation to trace where it drove and when; that becomes the target line and pace. The AI is pulled toward it only where it is slower, and any checkpoint section the AI drives faster replaces yours, so it can find its own lines and strats.
+- **Stable training:** limited policy step size (target_kl) and champion tests on smoothed weights; slow laps are cut against the champion's pace.
 - **Pointless release penalty:** releasing the throttle on a clear straight is penalised; in corners it's free.
 - **Reward weights** can be changed live from the dashboard.
 

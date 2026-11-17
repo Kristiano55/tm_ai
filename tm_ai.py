@@ -17,7 +17,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from tickgym import Client, InputText, Lidar, TelemetryGroup, TransportError
+from tickgym import Action, Client, InputText, Lidar, TelemetryGroup, TransportError
 
 import config as cfgmod
 
@@ -117,6 +117,93 @@ def line_progress(pts, seg, cum, pos, di):
     return float(cum[j] + a * seg[j]), j
 
 
+def dense_line(pts):
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    return pts, seg, np.concatenate([[0.0], np.cumsum(seg)])
+
+
+def trace_to_profile(dense, trace):
+    """Where a driven lap was on the line at each tick: rows (metres along line, race tick)."""
+    pts, seg, cum = dense
+    di, ss = 0, []
+    for p in np.asarray(trace)[:, :3]:
+        s, di = line_progress(pts, seg, cum, p, di)
+        ss.append(s)
+    ss = np.maximum.accumulate(np.array(ss))
+    keep = np.concatenate([[True], np.diff(ss) > 0.05])
+    return np.stack([ss[keep], np.asarray(trace)[keep, 3]], axis=1)
+
+
+def trace_record(g, actions, ticks=5, max_ticks=60000):
+    """Play a recorded race (e.g. your PB) and log where the car was every `ticks` ticks.
+    Rows: x, y, z, race tick, checkpoints taken. The inputs are only used to know where the run drove."""
+    acts = sorted((Action(max(0, int(a.tick)), a.kind, a.value) for a in actions), key=lambda a: a.tick)
+    t = g.reset(seed=0)
+    hist, i = [], 0
+    while True:
+        hi = g.next_tick + ticks
+        win = []
+        while i < len(acts) and acts[i].tick < hi:
+            win.append(acts[i])
+            i += 1
+        t = g.step(ticks, win)
+        hist.append([*np.asarray(t.vehicle.position, dtype=np.float64), int(t.race.race_tick),
+                     int(t.race.checkpoints_taken)])
+        if t.finished or t.race.race_tick > max_ticks:
+            break
+    return np.array(hist), (int(t.race.race_time_ms) if t.finished else None)
+
+
+def _cp_cuts(trace):
+    tk = trace[:, 4]
+    cuts = [0] + [i for i in range(1, len(tk)) if tk[i] > tk[i - 1]]
+    if cuts[-1] != len(trace) - 1:
+        cuts.append(len(trace) - 1)
+    return cuts
+
+
+def build_guide(run_dir):
+    """Target line = per checkpoint section, the faster of your PB and the AI's best finished run.
+    So the line starts as your PB and switches section by section wherever the AI finds something faster."""
+    run_dir = Path(run_dir)
+    try:
+        pb = np.load(run_dir / "pb_trace.npy")
+    except (OSError, ValueError):
+        return None
+    srcs = {"PB": pb}
+    try:
+        ai = np.load(run_dir / "best_trace.npy")
+        if ai.ndim == 2 and ai.shape[1] >= 5:
+            srcs["AI"] = ai
+    except (OSError, ValueError):
+        pass
+    cuts = {k: _cp_cuts(v) for k, v in srcs.items()}
+    n = len(cuts["PB"]) - 1
+    use = [k for k in srcs if len(cuts[k]) - 1 == n]          # same checkpoint count only
+    rows, t0, chosen = [], 0.0, []
+    for j in range(n):
+        dur = {k: srcs[k][cuts[k][j + 1], 3] - (srcs[k][cuts[k][j], 3] if j else 0.0) for k in use}
+        k = min(use, key=lambda kk: dur[kk])
+        tr, a, b = srcs[k], cuts[k][j], cuts[k][j + 1]
+        part = tr[a:b + 1] if j == n - 1 else tr[a:b]
+        base = tr[a, 3] if j else 0.0
+        for r in part:
+            rows.append([r[0], r[1], r[2], t0 + r[3] - base])
+        t0 += dur[k]
+        chosen.append(k)
+    comp = np.array(rows)
+    if len(comp) < 10:
+        return None
+    line = make_line(comp[:, :3])
+    prof = trace_to_profile(dense_line(line), comp)
+    ms = int(round(t0 * 10))
+    save_npy(run_dir / "profile.npy", prof)
+    save_npy(run_dir / "centerline.npy", line)
+    write_json(run_dir / "centerline.json", {"ms": ms, "guide": chosen, "t": time.time()})
+    write_json(run_dir / "profile.json", {"ms": ms})
+    return ms, chosen
+
+
 class TMEnv(gym.Env):
     """One car on one map. Action = (steer level, throttle mode)."""
 
@@ -137,8 +224,10 @@ class TMEnv(gym.Env):
         self.gspd = None
         self.mid_p = float(cfg["mid_start_p"]) if role == "training" else 0.0
         self.mid_every = max(20, int(cfg["mid_start_every_s"] * 100 / cfg["ticks_per_step"]))
-        self.starts, self.fails, self._ca_m, self.start_i, self.acts = [], np.zeros(0), None, None, []
+        self.starts, self.fails, self._ca_m, self.start_i, self.acts = [], np.zeros(0), "unset", None, []
         self._starts_line = "unset"
+        self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
+        self.cprof, self._cprof_key = None, None
 
         self.session = Client().open_map(cfg["map"])
         # 32-ray level fan, 4 downward rays (drops/gaps), 5 forward-up rays (ceilings, overhangs)
@@ -190,11 +279,11 @@ class TMEnv(gym.Env):
         try:
             m = os.path.getmtime(f)
         except OSError:
-            return
+            m = None
         if m == self._ca_m:
             return
         self._ca_m = m
-        acts = read_json(f).get("acts") or []
+        acts = read_json(f).get("acts") or [] if m else []
         old = [st["snap"] for st in self.starts]
         self.starts, self.fails = [], np.zeros(0)
         try:
@@ -202,12 +291,13 @@ class TMEnv(gym.Env):
                 self.g.discard(*old)
         except Exception:
             pass
-        if len(acts) < 2 * self.mid_every:
-            return
         try:
+            limit = max(4, getattr(self.g.info, "max_snapshots_per_session", 64) - 2)
+            if len(acts) < 2 * self.mid_every:
+                acts = []
             self.g.reset(seed=0)
             pa = np.zeros(8)
-            limit = max(4, getattr(self.g.info, "max_snapshots_per_session", 64) - 2)
+            limit //= (2 if self.guide else 1)
             for i, (steer, mode) in enumerate(acts[:-self.mid_every // 2]):
                 t = self.g.step(self.ticks, steer=int(steer), accelerate=(mode == 0), brake=(mode == 2))
                 pa = np.concatenate([[steer / 127.0], np.eye(3)[int(mode)], pa[:4]])
@@ -217,12 +307,38 @@ class TMEnv(gym.Env):
                     self.starts.append({"snap": self.g.snapshot(), "taken": int(t.race.checkpoints_taken),
                                         "speed": float(t.vehicle.speed), "pa": pa.copy(),
                                         "pos": np.asarray(t.vehicle.position, dtype=np.float64)})
+            if self.guide:                      # plus start points along your PB (its states, not its inputs)
+                pb = self.run_dir / "pb_trace.json"
+                rec = InputText.read(read_json(pb).get("file", "")) if pb.exists() else None
+                if rec:
+                    self._starts_from_record(rec, limit)
             self.fails = np.zeros(len(self.starts))
             self._starts_line = "unset"
             if self.starts:
-                say(f"[{self.role}] {len(self.starts)} mid-track start points built from the champion lap")
+                say(f"[{self.role}] {len(self.starts)} mid-track start points built (champion lap + your PB)")
         except Exception:                       # snapshots unsupported / limit reached: train without
             self.starts, self.fails = self.starts[:len(self.fails)] if len(self.fails) else [], self.fails
+
+    def _starts_from_record(self, rec, limit):
+        acts = sorted((Action(max(0, int(a.tick)), a.kind, a.value) for a in rec), key=lambda a: a.tick)
+        self.g.reset(seed=0)
+        i, k, n0 = 0, 0, len(self.starts)
+        while len(self.starts) - n0 < limit:
+            hi = self.g.next_tick + self.ticks
+            win = []
+            while i < len(acts) and acts[i].tick < hi:
+                win.append(acts[i])
+                i += 1
+            t = self.g.step(self.ticks, win)
+            k += 1
+            if t.finished or t.race.race_tick > 60000:
+                break
+            if k % self.mid_every == 0:
+                self.starts.append({"snap": self.g.snapshot(), "taken": int(t.race.checkpoints_taken),
+                                    "speed": float(t.vehicle.speed), "pa": np.zeros(8),
+                                    "pos": np.asarray(t.vehicle.position, dtype=np.float64)})
+        if self.starts and self.starts[-1].get("pos") is not None and len(self.starts) - n0 > 1:
+            self.starts.pop()                    # skip the one right before the finish
 
     def _pick_start(self):
         """Mostly the sections where laps fail; every section keeps some chance."""
@@ -304,6 +420,23 @@ class TMEnv(gym.Env):
             gs = np.convolve(np.pad(gs, 4, mode="edge"), np.ones(9) / 9, mode="valid")
             self.prof, self.gspd, self._prof_m = (ps, pt), np.clip(gs, 0.0, 200.0), m
 
+    def _load_champ(self):
+        """The champion's pace on the current line: laps are cut when far behind it (not the fastest ghost)."""
+        if not self.run_dir or self.dense is None:
+            return
+        f = self.run_dir / "champ_trace.npy"
+        try:
+            key = (os.path.getmtime(f), self._line_m)
+        except OSError:
+            return
+        if key == self._cprof_key:
+            return
+        try:
+            pr = trace_to_profile(self.dense, np.load(f))
+            self.cprof, self._cprof_key = (pr[:, 0], pr[:, 1]), key
+        except (OSError, ValueError, IndexError):
+            pass
+
     def _phi(self, s, tick):
         """Seconds ahead of the ghost (negative = behind)."""
         if self.prof is None:
@@ -333,6 +466,12 @@ class TMEnv(gym.Env):
         InputText.write(str(tmp), rec.actions)
         os.replace(tmp, self.run_dir / "best_run.txt")
         write_json(f, {"ms": ms, "source": self.role, "t": time.time()})
+        save_npy(self.run_dir / "best_trace.npy", np.asarray(self.hist, dtype=np.float64))
+        if self.guide:
+            r = build_guide(self.run_dir)
+            if r:
+                say(f"[{self.role}] New best run {ms / 1000:.3f} s -> target line sections: {' '.join(r[1])} "
+                    f"(theoretical {r[0] / 1000:.3f} s)")
 
     def _offer_profile(self, ms):
         if self.run_dir is None or self.dense is None:
@@ -341,14 +480,9 @@ class TMEnv(gym.Env):
         cur = read_json(f).get("ms")
         if cur is not None and ms >= cur:
             return
-        h, (pts, seg, cum) = np.asarray(self.hist, dtype=np.float64), self.dense
-        di, ss = 0, []
-        for p in h[:, :3]:
-            s, di = line_progress(pts, seg, cum, p, di)
-            ss.append(s)
-        ss = np.maximum.accumulate(np.array(ss))
-        keep = np.concatenate([[True], np.diff(ss) > 0.05])
-        prof = np.stack([ss[keep], h[keep, 3]], axis=1)
+        if self.guide:                            # the guide builds the ghost (PB / best sections)
+            return
+        prof = trace_to_profile(self.dense, np.asarray(self.hist, dtype=np.float64))
         if len(prof) < 5:
             return
         save_npy(self.run_dir / "profile.npy", prof)
@@ -379,6 +513,11 @@ class TMEnv(gym.Env):
             return np.array([np.interp(arc, cum, pts[:, k]) for k in range(3)])
         arc = arc % self.lap_len if self.multilap else min(arc, self.lap_len)
         return np.array([np.interp(arc, self.cum, self.route[:, k]) for k in range(3)])
+
+    def _behind_champ(self, s, tick, phi):
+        if self.cprof is not None:
+            return float((np.interp(s, self.cprof[0], self.cprof[1]) - tick) / 100.0)
+        return phi if self.prof is not None else 0.0
 
     def _pointless_release(self, t, pos, s, speed):
         """0..1: how clearly releasing is pointless here. 1 = straight road ahead and nothing in front;
@@ -472,6 +611,7 @@ class TMEnv(gym.Env):
         self._read_best()
         self._load_line()
         self._load_profile()
+        self._load_champ()
         self._build_starts()
         self.taken, self.slow, self.prev_speed, self.di = 0, 0, 0.0, 0
         self._prev_lv, self.since_hit, self.air = None, 20, 0
@@ -496,7 +636,7 @@ class TMEnv(gym.Env):
         self.di = 0
         self._s = self._global_progress(pos, self.taken) if self.start_i is not None else self._progress(pos, 0)
         self.phi = self._phi(self._s, tick)
-        self.hist = [[*pos, tick]]
+        self.hist = [[*pos, tick, self.taken]]
         return self._obs(t, self._s), {}
 
     def step(self, action):
@@ -524,6 +664,11 @@ class TMEnv(gym.Env):
         if self.prof is not None and W["ghost_weight"]:
             reward += float(np.clip(W["ghost_weight"] * (phi - self.phi), -5.0, 5.0))   # = time gained this step
         self.phi = phi
+        if self.guide and W["w_guide"] and self.dense is not None:            # pulled toward the target line,
+            off = pos - self._route_point(s)                                     # but only while slower than it
+            d = float(np.hypot(off[0], off[2]))
+            behind = float(np.clip(-phi / 0.3, 0.0, 1.0))
+            reward -= W["w_guide"] * min(d / 8.0, 1.0) * behind
         reward -= W["w_crash"] * max(0.0, self.prev_speed - speed - 3.0)         # sudden speed loss = wall hit
         if mode == 2:
             reward -= W["w_brake"]
@@ -546,7 +691,7 @@ class TMEnv(gym.Env):
             reward -= W["w_wall"] * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed, self._s = speed, s
         self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
-        self.hist.append([*pos, tick])
+        self.hist.append([*pos, tick, taken])
 
         end, terminated, truncated = "", False, False
         if t.finished:
@@ -562,8 +707,8 @@ class TMEnv(gym.Env):
             self.slow = self.slow + self.ticks if (speed < 1.5 and tick > 300) else 0
             if self.slow >= 200:                                                # stuck for 2 s
                 terminated, end, reward = True, "stuck", reward - W["w_stuck"]
-            elif (self.role == "training" and self.prof is not None and self.cut_behind and tick > 500
-                  and phi < -self.cut_behind):                                   # tests always drive the full lap
+            elif (self.role == "training" and self.cut_behind and tick > 500
+                  and self._behind_champ(s, tick, phi) < -self.cut_behind):      # tests always drive the full lap
                 truncated, end = True, "behind ghost"                            # hopeless lap: save the time
             elif tick >= self.limit:
                 truncated, end = True, "timeout"
@@ -600,7 +745,7 @@ def make_model(env):
     from stable_baselines3 import PPO
     return PPO("MlpPolicy", env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
                n_steps=512, batch_size=512, n_epochs=10, gamma=0.995, gae_lambda=0.95,
-               learning_rate=3e-4, ent_coef=0.005,
+               learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
 
 
@@ -695,6 +840,7 @@ def _make_callback(cfg, run_dir):
             self.laps = self.since = self.bad = self.tests = 0
             self.reason, self.last_v, self.test_env, self.tests_off = "step budget reached", 0.0, None, False
             self.best = read_json(best_file)
+            self.ema_update(reset=True)
             log(k="start", cfg=cfg)
             self.status("running")
             say("Training started: %d cars, %s steering, CPU." % (cfg["envs"], cfg["steer_mode"]))
@@ -705,6 +851,19 @@ def _make_callback(cfg, run_dir):
 
         def _on_rollout_end(self):
             self.last_v = float(self.model.rollout_buffer.values.mean())
+            self.ema_update()
+
+        def ema_update(self, reset=False):
+            """Smoothed copy of the weights. Champion tests drive with it: steadier than the latest update."""
+            sd = self.model.policy.state_dict()
+            if reset or getattr(self, "ema", None) is None:
+                self.ema = {k: v.detach().clone() for k, v in sd.items()}
+                return
+            for k, v in sd.items():
+                if v.dtype.is_floating_point:
+                    self.ema[k].mul_(0.7).add_(v.detach(), alpha=0.3)
+                else:
+                    self.ema[k] = v.detach().clone()
 
         def _on_rollout_start(self):
             ds = cfg["decay_steps"]
@@ -752,9 +911,17 @@ def _make_callback(cfg, run_dir):
             try:
                 if self.test_env is None:      # needs one extra gym slot besides the training cars
                     self.test_env = TMEnv(cfg, run_dir, shorten=False, role="champion test")
-                info = run_episode(self.test_env, self.model)
-                fin = bool(info["finished"])
-                rec = self.test_env.g.export() if fin else None
+                cur = {k: v.detach().clone() for k, v in self.model.policy.state_dict().items()}
+                if getattr(self, "ema", None) is not None:
+                    self.model.policy.load_state_dict(self.ema)
+                try:
+                    info = run_episode(self.test_env, self.model)
+                    fin = bool(info["finished"])
+                    rec = self.test_env.g.export() if fin else None
+                    if fin and (self.best.get("champion_ms") is None or int(rec.finish_ms) < self.best["champion_ms"]):
+                        self.model.save(run_dir / "champion")        # champion = the smoothed weights
+                finally:
+                    self.model.policy.load_state_dict(cur)
             except Exception as e:             # e.g. no free gym slot: keep training, skip tests
                 self.tests_off = True
                 say(f"Champion tests disabled: {e}. Lower 'envs' by one to enable them.")
@@ -768,7 +935,7 @@ def _make_callback(cfg, run_dir):
             if fin and (champ is None or ms < champ):
                 promoted, self.bad = True, 0
                 self.best["champion_ms"] = champ = ms
-                self.model.save(run_dir / "champion")
+                save_npy(run_dir / "champ_trace.npy", np.asarray(self.test_env.hist, dtype=np.float64))
 
                 InputText.write(str(run_dir / "champion.txt"), rec.actions)
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
@@ -776,6 +943,7 @@ def _make_callback(cfg, run_dir):
                 if self.bad >= cfg["rollback_after"]:
                     try:
                         self.model.set_parameters(str(run_dir / "champion.zip"), exact_match=True, device="cpu")
+                        self.ema_update(reset=True)
                         rolled = True
                     except Exception as e:
                         say(f"Rollback failed ({str(e)[:60]})")
@@ -785,8 +953,12 @@ def _make_callback(cfg, run_dir):
             ca = run_dir / "champion_actions.json"
             if fin and (promoted or not ca.exists()):          # route for the mid-track starts
                 write_json(ca, {"ms": ms, "acts": self.test_env.acts})
+            if fin and not (run_dir / "champ_trace.npy").exists():
+                save_npy(run_dir / "champ_trace.npy", np.asarray(self.test_env.hist, dtype=np.float64))
             line_ms = read_json(line_meta).get("ms") or self.best.get("first_test_ms")   # old runs: line came from the first test
             refresh = cfg["line_refresh_s"] and promoted and line_ms and ms <= line_ms - cfg["line_refresh_s"] * 1000
+            if self.test_env.guide:
+                refresh = False                                  # guide mode: the line is PB/best sections
             if fin and (not line_file.exists() or refresh):     # reference line follows the champion
                 self.rebuild_line(ms, "rebuilt from the new champion" if line_file.exists() else "created")
             write_json(best_file, self.best)
@@ -822,6 +994,39 @@ def _make_callback(cfg, run_dir):
     return Champion()
 
 
+def prepare_guide(cfg, run_dir):
+    """Trace your PB once (replaying its input file in the simulation) into pb_trace.npy, then build the target line."""
+    f = cfg.get("pb_file", "").strip().strip('"')
+    if not f:
+        return
+    src, out = Path(f), run_dir / "pb_trace.npy"
+    if not src.exists():
+        say(f"PB file not found: {src} (target line off)")
+        return
+    meta = read_json(run_dir / "pb_trace.json")
+    if not (out.exists() and meta.get("file") == str(src) and meta.get("mtime") == src.stat().st_mtime):
+        env = None
+        try:
+            env = TMEnv(dict(cfg, pb_file=""), None, shorten=False, role="pb trace")
+            hist, ms = trace_record(env.g, InputText.read(str(src)), ticks=cfg["ticks_per_step"])
+        except Exception as e:
+            say(f"Could not trace the PB file ({str(e)[:100]}); target line off")
+            return
+        finally:
+            if env is not None:
+                env.close()
+        if ms is None:
+            say("The PB file did not finish the map in the simulation (wrong map or file?); target line off")
+            return
+        save_npy(out, hist)
+        write_json(run_dir / "pb_trace.json", {"file": str(src), "mtime": src.stat().st_mtime, "ms": ms})
+        say(f"Traced your PB: {ms / 1000:.3f} s, {int(hist[-1, 4])} checkpoints")
+    r = build_guide(run_dir)
+    if r:
+        say(f"Target line: sections {' '.join(r[1])}, pace {r[0] / 1000:.3f} s. The AI is pulled toward it only "
+            "where it is slower, and any section it drives faster replaces yours.")
+
+
 def train(cfg):
     import torch
     from stable_baselines3 import PPO
@@ -830,6 +1035,7 @@ def train(cfg):
     run_dir = cfgmod.run_dir(cfg)
     (run_dir / "STOP").unlink(missing_ok=True)
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
+    prepare_guide(cfg, run_dir)
     venv = SubprocVecEnv([partial(_make_env, cfg, str(run_dir)) for _ in range(cfg["envs"])])
     vn_file = run_dir / "vecnorm.pkl"
     env = None
@@ -848,6 +1054,7 @@ def train(cfg):
     if cfg["resume"] and latest.exists():
         try:
             model = PPO.load(str(latest), env=env, device="cpu")
+            model.target_kl = 0.02
             say("Resumed from latest.zip")
         except Exception as e:
             say(f"Cannot resume ({str(e)[:80]}), starting fresh")

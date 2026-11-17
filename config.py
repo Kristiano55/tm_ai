@@ -23,6 +23,7 @@ DEFAULTS = {
     "cut_behind_s": 5.0,       # end a lap that falls this far behind the ghost (0 = off)
     "decay_steps": 4000000,    # learning rate + exploration halve every N env steps (0 = off)
     "line_refresh_s": 0.2,
+    "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
     "mid_start_p": 0.6,        # share of training laps that start partway along the champion's lap (0 = off)
     "mid_start_every_s": 2.0,  # spacing of those start points along the champion lap, seconds     # rebuild the reference line + ghost when the champion beats it by this much (0 = never)
     "reward_v": 2,             # reward layout version (old configs are upgraded once)
@@ -34,6 +35,7 @@ DEFAULTS = {
 WEIGHTS = {
     "w_progress": (0.02, "Progress", "reward per metre driven along the route (keep small: it pays the same for slow and fast laps)"),
     "w_time": (0.02, "Time penalty", "cost per 50 ms step; this is what makes going fast pay"),
+    "w_guide": (0.05, "Pull toward the target line", "per step, by distance from the PB/best line; only while behind its pace"),
     "ghost_weight": (10.0, "Ghost", "reward per second gained on the fastest run so far (0 = off)"),
     "w_checkpoint": (3.0, "Checkpoint bonus", "flat reward per checkpoint"),
     "w_finish": (50.0, "Finish bonus", "flat reward for finishing"),
