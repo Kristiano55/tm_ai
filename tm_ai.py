@@ -253,6 +253,9 @@ class TMEnv(gym.Env):
         self.phi, self._prev_lv, self.since_hit, self.air = 0.0, None, 20, 0
         self.hist = []
         self.extra = bool(cfg["extra_obs"])
+        self.lidar_every = max(1, int(cfg.get("lidar_every", 1)))    # >1: scan every N steps, reuse it in between
+        self._scan, self._scan_n = None, 0
+        self.tm = {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}        # time spent per part, this lap (profiling)
         self.groups = GROUPS_EXTRA if self.extra else GROUPS
         self.gspd = None
         self.mid_p = float(cfg["iqn_mid_start_p" if self.iqn else "mid_start_p"]) if role == "training" else 0.0
@@ -410,7 +413,22 @@ class TMEnv(gym.Env):
                 old.close()
         except Exception:
             pass
-        self.g = self.session.connect(self.groups, self.lidar)
+        self.g = self.session.connect(self.groups, self.lidar if self.lidar_every == 1 else None)
+        self._scan = None
+
+    def _read_lidar(self, t, fresh=False):
+        """(hit, distance) of the lidar rays: from the step's own scan, or with lidar_every > 1 from a separate
+        raycast every N steps (reused in between)."""
+        if self.lidar_every == 1:
+            sc = t.lidar
+        else:
+            if fresh or self._scan is None or self._scan_n % self.lidar_every == 0:
+                self._scan = self.g.raycast(self.lidar.rays)
+            self._scan_n += 1
+            sc = self._scan
+        hit = np.asarray(sc.hit, dtype=bool)
+        self._lid = (hit, np.where(hit, np.asarray(sc.distance, dtype=np.float32), self.ray_range))
+        return self._lid
 
     def _read_weights(self):
         """Pick up weights saved from the dashboard (applies from the next lap on)."""
@@ -631,8 +649,7 @@ class TMEnv(gym.Env):
         loc = to_car_frame_many(q, self._route_points(s + ds) - pos)
         ang = max(ang, float(np.max(np.abs(np.arctan2(loc[:, 0], loc[:, 2])))))
         straight = float(np.clip(1.0 - ang / 0.12, 0.0, 1.0))   # fades out from ~0 to ~7 degrees of bend
-        hit = np.asarray(t.lidar.hit, dtype=bool)
-        dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
+        hit, dist = self._lid
         fwd = float(np.min(dist[13:19]))                         # centre of the 32-ray fan
         clear = float(np.clip((fwd - speed * 1.2) / (speed * 0.8 + 1.0), 0.0, 1.0))
         return straight * clear
@@ -704,8 +721,7 @@ class TMEnv(gym.Env):
         f += [x for row in self.mem for x in row]                    # oldest first
         f += list(np.clip(locs[nl + npv:] / 100.0, -5.0, 5.0).ravel())   # the line ahead in 3D, up to 400 m
         f += list(self.pa_old)
-        hit = np.asarray(t.lidar.hit, dtype=bool)
-        dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
+        hit, dist = self._lid
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
         self._last_obs = np.clip(np.nan_to_num(np.asarray(f, dtype=np.float32)), -10, 10)
         return self._last_obs
@@ -758,6 +774,7 @@ class TMEnv(gym.Env):
         self.phi = self._phi(self._s, tick)
         self.vcp_i = int(np.searchsorted(self.vcp_s, self._s, side="right"))
         self.hist = [[*pos, tick, self.taken]]
+        self._read_lidar(t, fresh=True)
         return self._obs(t, self._s), {}
 
     def step(self, action):
@@ -765,8 +782,12 @@ class TMEnv(gym.Env):
         si, mode = int(action[0]), int(action[1])
         steer = int(self.STEER[si])
         self.acts.append((steer, mode))
+        c0 = time.perf_counter()
         try:
             t = self.g.step(self.ticks, steer=steer, accelerate=(mode == 0), brake=(mode == 2))
+            self._read_lidar(t)
+            c1 = time.perf_counter()
+            self.tm["tick"] += c1 - c0                           # TICK round trips (step + any raycast)
         except TransportError:                  # game hiccup: reopen the gym, end this lap
             self._connect()
             info = {"finished": False, "race_ms": 0, "cp": self.taken, "tick": 0, "end": "gym lost"}
@@ -818,8 +839,7 @@ class TMEnv(gym.Env):
         if W["w_hit"] and self.extra:
             r["hit"] = -W["w_hit"] * tf * _f(t.runtime, "wall_hit_this_step")
         if W["w_wall"]:                                                          # side rays of the fan
-            hit = np.asarray(t.lidar.hit, dtype=bool)
-            dist = np.where(hit, np.asarray(t.lidar.distance, dtype=np.float32), self.ray_range)
+            hit, dist = self._lid
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
             r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed = speed
@@ -878,9 +898,16 @@ class TMEnv(gym.Env):
         info = {"finished": bool(t.finished), "race_ms": int(t.race.race_time_ms),
                 "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None,
                 "x": round(float(pos[0]), 1), "z": round(float(pos[2]), 1)}
+        c2 = time.perf_counter()
+        obs = self._obs(t, s)
+        c3 = time.perf_counter()
+        self.tm["obs"] += c3 - c2
+        self.tm["env"] += c2 - c1                                # rewards, progress, stuck rules
+        self.tm["n"] += 1
         if terminated or truncated:
             info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
-        return self._obs(t, s), float(reward), terminated, truncated, info
+            info["tm"], self.tm = self.tm, {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}
+        return obs, float(reward), terminated, truncated, info
 
     def close(self):
         try:
@@ -918,7 +945,214 @@ class StuckWatch:
 
 def _make_env(cfg, run_dir):
     from stable_baselines3.common.monitor import Monitor
+    raise_priority()                                  # runs inside the car's own process
     return Monitor(TMEnv(cfg, run_dir))
+
+
+# --- speed: process priority, asynchronous cars, benchmark ------------------------------------------
+def raise_priority(tick_too=False):
+    """Windows: "above normal" priority for this process (and TICK's, if found). Needs psutil; skipped quietly."""
+    if os.name != "nt":
+        return
+    try:
+        import psutil
+        psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+        if tick_too:
+            for p in psutil.process_iter(["name"]):
+                n = (p.info.get("name") or "").lower()
+                if "tick" in n or "trackmania" in n:
+                    try:
+                        p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def car_worker(cfg, run_dir, conn):
+    """One car in its own process. Steps as soon as it gets an action; resets by itself when a lap ends.
+    Replies (obs, reward, done, info, timing) where timing = (TICK, observation, rest of env, waited for action)."""
+    raise_priority()
+    try:
+        env = TMEnv(cfg, run_dir)
+        obs, _ = env.reset()
+        conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.action_space.nvec]))
+        waited = 0.0
+        while True:
+            w0 = time.perf_counter()
+            msg = conn.recv()
+            waited = time.perf_counter() - w0
+            if msg is None:
+                break
+            tm0 = dict(env.tm)
+            obs, r, term, trunc, info = env.step(msg)
+            done = term or trunc
+            tm1 = info.get("tm", env.tm)
+            tm = tuple(tm1[k] - tm0[k] for k in ("tick", "obs", "env")) + (waited,)
+            if done:
+                info["terminal_observation"] = obs
+                info["TimeLimit.truncated"] = bool(trunc and not term)
+                r0 = time.perf_counter()
+                obs, _ = env.reset()
+                tm = (tm[0] + time.perf_counter() - r0,) + tm[1:]     # reset = TICK work
+            conn.send(("step", obs, r, done, info, tm))
+        env.close()
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
+        pass
+    except Exception as e:
+        try:
+            conn.send(("error", f"{type(e).__name__}: {str(e)[:200]}"))
+        except Exception:
+            pass
+
+
+class CarPool:
+    """Cars in their own processes, NOT in lock-step: each car gets its next action as soon as its own step is back,
+    so nobody waits for the slowest car. Per-car order is kept (results of a car arrive in its step order)."""
+
+    def __init__(self, cfg, run_dir, n):
+        import multiprocessing as mp
+        from multiprocessing.connection import wait
+        self._wait = wait
+        ctx = mp.get_context("spawn")
+        self.n, self.conns, self.procs = n, [], []
+        for _ in range(n):
+            a, b = ctx.Pipe()
+            p = ctx.Process(target=car_worker, args=(cfg, str(run_dir), b), daemon=True)
+            p.start()
+            b.close()
+            self.conns.append(a)
+            self.procs.append(p)
+        self.first_obs = [None] * n
+        self.prof = np.zeros(5)                      # summed seconds: tick, obs, env, waited for action; + steps
+        dims = set()
+        for i, c in enumerate(self.conns):
+            m = c.recv()
+            if m[0] == "error":
+                self.close()
+                raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
+            self.first_obs[i], dim, self.nvec = m[1], m[2], m[3]
+            dims.add(dim)
+        self.dim = dims.pop()
+        self.idx = {id(c): i for i, c in enumerate(self.conns)}
+
+    def send(self, i, action):
+        self.conns[i].send(np.asarray(action))
+
+    def poll(self, timeout=1.0):
+        """Results that are back: list of (car, obs, reward, done, info)."""
+        out = []
+        for c in self._wait(self.conns, timeout):
+            i = self.idx[id(c)]
+            try:
+                m = c.recv()
+            except EOFError:
+                raise RuntimeError(f"car {i + 1} stopped unexpectedly")
+            if m[0] == "error":
+                raise RuntimeError(f"car {i + 1}: {m[1]}")
+            _, obs, r, done, info, tm = m
+            self.prof[:4] += tm
+            self.prof[4] += 1
+            out.append((i, obs, r, done, info))
+        return out
+
+    def take_prof(self):
+        p, self.prof = self.prof, np.zeros(5)
+        return p
+
+    def close(self):
+        for c in self.conns:
+            try:
+                c.send(None)
+            except Exception:
+                pass
+        for p in self.procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+
+
+def prof_summary(car, wall, main=None, learner=None, tester=None, ticks=5):
+    """One profiling record: where a car-step's time goes (ms per step) plus main / learner / tester numbers."""
+    n = max(car[4], 1)
+    rec = {"k": "prof", "steps_s": round(car[4] / max(wall, 1e-6), 1),
+           "x": round(car[4] * ticks / 100.0 / max(wall, 1e-6), 1),
+           "car_ms": {"tick": round(1000 * car[0] / n, 2), "obs": round(1000 * car[1] / n, 2),
+                      "env": round(1000 * car[2] / n, 2), "wait": round(1000 * car[3] / n, 2)}}
+    if main:
+        rec["main_ms"] = {k: round(1000 * v / n, 3) for k, v in main.items()}
+    if learner:
+        rec["learner"] = learner
+    if tester:
+        rec["tester"] = tester
+    return rec
+
+
+def prof_line(rec):
+    c = rec["car_ms"]
+    s = (f"Speed {rec['x']:.1f}x real time ({rec['steps_s']:.0f} steps/s). Per car step: TICK {c['tick']:.1f} ms, "
+         f"inputs {c['obs']:.1f} ms, rewards {c['env']:.1f} ms, waiting for an action {c['wait']:.1f} ms.")
+    if rec.get("learner"):
+        L = rec["learner"]
+        s += f" Learner: {L['ups']:.1f} updates/s ({L['device']}, busy {L['busy']:.0f}%, reuse x{L['reuse']:.1f})."
+    if rec.get("tester"):
+        T_ = rec["tester"]
+        s += f" Tests: {T_['n']} in this period, {T_['avg_s']:.1f} s each."
+    return s
+
+
+def bench(cfg):
+    """Drive 6/8/10/12 cars (gas + random steering, no learning) ~30 s each; print the speed; suggest a car count."""
+    run_dir = cfgmod.run_dir(cfg)
+    secs = float(os.environ.get("TMAI_BENCH_S", 30))
+    counts = [int(x) for x in os.environ.get("TMAI_BENCH_CARS", "6,8,10,12").split(",")]
+    raise_priority(tick_too=True)
+    results, rng = [], np.random.default_rng(0)
+
+    def run(n, lidar_every):
+        pool = CarPool(dict(cfg, mid_start_p=0.0, iqn_mid_start_p=0.0, lidar_every=lidar_every), run_dir, n)
+        try:
+            for i in range(n):
+                pool.send(i, [rng.integers(8, 13), 0])
+            t0, warm = time.time(), True
+            while True:
+                for i, *_ in pool.poll(1.0):
+                    pool.send(i, [rng.integers(8, 13), 0])
+                now = time.time()
+                if warm and now - t0 > min(5.0, secs / 5):           # skip the start-up seconds
+                    pool.take_prof()
+                    t0, warm = now, False
+                if not warm and now - t0 >= secs:
+                    return prof_summary(pool.take_prof(), now - t0, ticks=cfg["ticks_per_step"])
+        finally:
+            pool.close()
+
+    say(f"Benchmark: {', '.join(map(str, counts))} cars, {secs:.0f} s each (no learning) ...")
+    for n in counts:
+        try:
+            rec = run(n, cfg["lidar_every"])
+        except Exception as e:
+            say(f"  {n} cars: failed ({str(e)[:100]})")
+            continue
+        results.append({"cars": n, **rec})
+        say(f"  {n:2d} cars: {rec['steps_s']:7.0f} steps/s = {rec['x']:5.1f}x real time "
+            f"(TICK {rec['car_ms']['tick']:.1f} ms per step)")
+    best = max(results, key=lambda r: r["x"]) if results else None
+    other = None
+    if best:
+        le = 2 if cfg["lidar_every"] == 1 else 1
+        try:
+            other = run(best["cars"], le)
+            say(f"  {best['cars']} cars with lidar every {le} step(s): {other['x']:.1f}x real time "
+                f"(vs {best['x']:.1f}x with lidar every {cfg['lidar_every']})")
+            other = {"lidar_every": le, **other}
+        except Exception as e:
+            say(f"  lidar comparison failed ({str(e)[:100]})")
+        say(f"Suggestion: {best['cars']} cars ({best['x']:.1f}x real time). Leave ~3 CPU threads for the learner, "
+            "the tester and Windows.")
+    write_json(run_dir / "bench.json", {"t": time.time(), "results": results, "best": best and best["cars"],
+                                        "lidar_every": cfg["lidar_every"], "lidar_other": other})
+    return best
 
 
 def run_episode(env, model, seed=None):
@@ -1031,6 +1265,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
     import torch
     from stable_baselines3 import PPO
     torch.set_num_threads(1)
+    raise_priority()
     run_dir = Path(run_dir)
     events, best_file = run_dir / "events.jsonl", run_dir / "best.json"
     line_file, line_meta = run_dir / "centerline.npy", run_dir / "centerline.json"
@@ -1150,6 +1385,7 @@ def _make_callback(cfg, run_dir):
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
+            self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
             log(k="start", cfg=cfg)
             self.status("running")
             say("Training started: %d cars, %s steering, CPU." % (cfg["envs"], cfg["steer_mode"]))
@@ -1210,11 +1446,23 @@ def _make_callback(cfg, run_dir):
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                         end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
                     self.stuckw.add(info)
+                    tm = info.get("tm")
+                    if tm:
+                        self.ptm += [tm["tick"], tm["obs"], tm["env"], 0.0, tm["n"]]
                     for kk, vv in (info.get("rb") or {}).items():
                         self.rb[kk] = self.rb.get(kk, 0.0) + vv
                     self.rb_steps += int(info.get("rsteps", 0))
             now = time.time()
             watchdog()
+            if now - self.last_prof > float(os.environ.get("TMAI_PROF_S", 300)) and self.ptm[4]:
+                wall, steps = now - self.last_prof, self.model.num_timesteps - self.prof_steps
+                car = self.ptm.copy()                       # car-side times come from finished laps
+                car[3] = max(0.0, wall * cfg["envs"] / max(steps, 1) * car[4] - car[:3].sum())   # idle: learning, lock-step
+                rec = prof_summary(car, wall * car[4] / max(steps, 1), ticks=cfg["ticks_per_step"])
+                rec["cars"] = cfg["envs"]
+                log(**rec)
+                say(prof_line(rec).replace("waiting for an action", "waiting (PPO learning + slowest car)"))
+                self.ptm, self.last_prof, self.prof_steps = np.zeros(5), now, self.model.num_timesteps
             if now - self.last_chk > 2.0:
                 self.last_chk = now
                 if (run_dir / "STOP").exists():
@@ -1334,6 +1582,7 @@ def train(cfg):
     (run_dir / "STOP").unlink(missing_ok=True)
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
+    raise_priority(tick_too=True)
     prepare_guide(cfg, run_dir)
     venv = SubprocVecEnv([partial(_make_env, cfg, str(run_dir)) for _ in range(cfg["envs"])])
     set_gamma(cfg)
@@ -1451,7 +1700,7 @@ def selftest(cfg):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["selftest", "train", "drive"])
+    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench"])
     ap.add_argument("--map")
     ap.add_argument("--run")
     ap.add_argument("--envs", type=int)
@@ -1471,4 +1720,4 @@ if __name__ == "__main__":
         import iqn
         {"train": iqn.train, "drive": iqn.drive}[a.cmd](cfg)
     else:
-        {"selftest": selftest, "train": train, "drive": lambda c: drive(c, a.model)}[a.cmd](cfg)
+        {"selftest": selftest, "train": train, "drive": lambda c: drive(c, a.model), "bench": bench}[a.cmd](cfg)

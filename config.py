@@ -35,6 +35,8 @@ DEFAULTS = {
     "iqn_eps_end_steps": 1000000,
     "iqn_mid_start_p": 0.2,         # IQN: share of laps that start along your PB/WR (after the first finish)
     "iqn_rollback": False,          # IQN: roll back to the champion after bad tests (PPO always can)
+    "iqn_device": "auto",           # IQN learner: "auto" (GPU if PyTorch sees one), "cpu" or "cuda"; driving stays on CPU
+    "lidar_every": 1,               # 1 = lidar scan every step; 2 = every other step (reuses the last scan)
     "iqn_warm_run": "",             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
     "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
@@ -123,6 +125,9 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    out["lidar_every"] = min(max(1, out["lidar_every"]), 5)
+    if out["iqn_device"] not in ("auto", "cpu", "cuda"):
+        out["iqn_device"] = "auto"
     if out["algo"] not in ("ppo", "iqn"):
         out["algo"] = "ppo"
     if out["steer_mode"] not in ("progressive", "uniform"):

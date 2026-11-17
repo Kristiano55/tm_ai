@@ -61,6 +61,7 @@ class Store:
         self.n_all, self.n_mid = 0, 0
         self.rbs, self.ends = [], []
         self.sess_t0, self.sess_lap0, self.last_t = None, 0, None
+        self.prof = None
 
     def refresh(self, path):
         if path != self.path:
@@ -102,6 +103,8 @@ class Store:
                 self.tests.append(e)
             elif k == "upd":
                 self.upds.append(e)
+            elif k == "prof":
+                self.prof = e
             elif k == "rb":
                 self.rbs.append(e.get("r", {}))
                 del self.rbs[:-10]
@@ -131,10 +134,13 @@ def build_state():
     fresh = status.get("state") == "running" and now - status.get("heartbeat", 0) < 150
     running = train_alive or fresh
     playing = alive() and PROC["kind"] == "play"
+    benching = alive() and PROC["kind"] == "bench"
     if running:
         state, reason = "running", ""
     elif playing:
         state, reason = "playing", "champion is driving"
+    elif benching:
+        state, reason = "benchmarking", "testing car counts (see the log)"
     elif status.get("state") == "running":
         state, reason = "stopped", "stopped unexpectedly"
     else:
@@ -178,6 +184,7 @@ def build_state():
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
         "best_run": read_json(rd / "best_run.json") or None,
         "last_play": read_json(rd / "play_result.json") or None,
+        "prof": S.prof, "bench": read_json(rd / "bench.json") or None,
     }
 
 
@@ -287,7 +294,7 @@ def start(kind):
         return 400, "No champion yet."
     rd = cfgmod.run_dir(cfg)
     logf = open(rd / "train.log", "a", encoding="utf-8")
-    PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", "train" if kind == "train" else "drive"],
+    PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", {"train": "train", "bench": "bench"}.get(kind, "drive")],
                                  cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
     PROC["kind"], PROC["t0"] = kind, time.time()
     return 200, "ok"
@@ -296,7 +303,7 @@ def start(kind):
 def stop():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
-    if PROC["kind"] == "play" or not (alive() or read_json(rd / "status.json").get("state") == "running"):
+    if PROC["kind"] in ("play", "bench") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
         kill_proc()
         return
     (rd / "STOP").write_text("stop")                       # graceful: saves the model first
@@ -345,6 +352,8 @@ class Handler(BaseHTTPRequestHandler):
             cfgmod.save(body)
         elif self.path == "/api/start":
             code, msg = start("train")
+        elif self.path == "/api/bench":
+            code, msg = start("bench")
         elif self.path == "/api/play":
             code, msg = start("play")
         elif self.path == "/api/stop":

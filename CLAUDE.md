@@ -12,14 +12,17 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 
 ## Files
 - `tm_ai.py` — environment (`TMEnv`, gymnasium), observations, rewards, reference line / ghost / PB guide,
-  mid-track starts, PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
+  mid-track starts, `CarPool` (asynchronous cars: each car process steps as soon as its own action arrives, pipes +
+  `connection.wait`), `bench`, profiling (`prof_summary`), `raise_priority` (psutil, Windows only), PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
   EMA weights by the callback; rollback via `ROLLBACK` file), `selftest`, `drive`. CLI:
-  `python tm_ai.py selftest|train|drive` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
+  `python tm_ai.py selftest|train|drive|bench` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
   epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
-  **learner in a background thread** (2 torch threads; cars keep driving with an acting copy of the net refreshed
-  every 20 updates; replay shared under a lock; `iqn_reuse` is a target, cars never wait), **champion tests in a
+  **learner in its own process** (`learner_proc`; 2 torch threads, CUDA if `iqn_device` allows; owns net/tgt/opt,
+  saves `latest.pt`, handles `ROLLBACK`), **replay in shared memory** (`SharedReplay`, written by the driving loop
+  under a lock), weights published to the driving copy every 20 updates via a shared float array; cars driven
+  asynchronously through `T.CarPool`; `iqn_reuse` is a target, cars never wait; **champion tests in a
   separate spawn process** (sends `ROLLBACK` file to the learner), optional **warm start** (`iqn_warm_run`: ~50k
   steps of a PPO run's `champion.zip`, eps 0.1, into the replay memory; fresh runs only).
   Saves `latest.pt`, `champion.pt`, `iqn.json`.
@@ -32,12 +35,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - `tests/tickgym.py` — **fake tickgym** for testing without Windows/TICK/the game (see Testing).
 
 ## Run folder `runs/<run>/`
-`events.jsonl` (k = start | lap | test | upd | rb | stop), `status.json` (heartbeat), `train.log`, `best.json`
+`events.jsonl` (k = start | lap | test | upd | rb | prof | stop; prof = 5-min "where the time goes"), `status.json` (heartbeat), `train.log`, `best.json`
 (champion_ms, first_test_ms, champion_seed), `champion.zip|.pt`, `champion.txt` (TICK input), `best_run.txt/.json`
 (fastest finished full lap of any kind), `last_test.txt`, `play.txt`, `centerline.npy/.json` (reference line),
 `profile.npy/.json` (ghost: arc length -> race tick), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
 `pb_trace.npy/.json` (traced PB), `best_trace.npy`, `latest.zip|.pt`, `vecnorm.pkl` (PPO reward scaling),
-`levels.json` (steering levels + obs layout, for checkpoint conversion), `tester_base.zip` (PPO network layout
+`bench.json` (car-count benchmark), `levels.json` (steering levels + obs layout, for checkpoint conversion), `tester_base.zip` (PPO network layout
   for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
 
 ## Key design decisions (and why)
@@ -79,6 +82,14 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best"); cross-map base model (parked
   for later); random switching of steering layouts mid-training.
 
+## Speed
+- Profiling every 5 min (`TMAI_PROF_S`): per car step TICK / inputs / rewards / waiting-for-action ms, learner
+  updates/s, busy %, achieved reuse, tester seconds per test; dashboard card "Where the time goes".
+- All telemetry groups requested are used by inputs (SHAPE is not requested). `lidar_every` > 1 opens the gym
+  without lidar and calls `g.raycast()` every N steps (an extra round trip, so it only pays if the step's own
+  scan is expensive: measure with bench, which compares both).
+- PPO keeps SB3's lock-step SubprocVecEnv (its rollout needs it); it has priority + profiling only.
+
 ## Testing (no game needed)
 ```
 mkdir /tmp/t && cp tm_ai.py iqn.py config.py /tmp/t && cd /tmp/t
@@ -87,7 +98,8 @@ PYTHONPATH=<repo>/tests python3 -u tm_ai.py train          # PPO; add "algo":"iq
 TMAI_IQN_WARMUP=3000 ...                                   # shorter IQN warm-up for tests
 ```
 The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3 s at 30 ms is optimal.
-`TICKGYM_FAKE_DETOUR=1` adds a 600 m side loop at z=200 (put a straight `centerline.npy` in the run to test a line
+`TICKGYM_FAKE_MS=5` makes each fake step take ~5 ms (random, like a busy TICK) for speed tests;
+`TMAI_BENCH_S` / `TMAI_BENCH_CARS` shorten the benchmark. `TICKGYM_FAKE_DETOUR=1` adds a 600 m side loop at z=200 (put a straight `centerline.npy` in the run to test a line
 that cuts the AI's route). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.

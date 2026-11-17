@@ -2,6 +2,11 @@ import numpy as np, os
 # TICKGYM_FAKE_DETOUR=1: at z=200 the car leaves the straight and drives a 600 m side loop (out to x=300 and back, almost sideways)
 # before going on, so a straight reference line "cuts the corner" its route takes.
 DETOUR=os.environ.get("TICKGYM_FAKE_DETOUR")=="1"
+# TICKGYM_FAKE_MS=5: each step waits ~5 ms (random, like a busy TICK server); a raycast ~1 ms. Default 0 = instant.
+import time, random
+FAKE_MS=float(os.environ.get("TICKGYM_FAKE_MS","0"))
+def _wait(ms):
+    if ms>0: time.sleep(random.expovariate(1.0/ms)/1000.0)
 def _path(d):
     if not DETOUR or d<200: return [0.,0.,d]
     a,b,c=np.array([0.,0.,200.]),np.array([300.,0.,202.]),np.array([0.,0.,204.])
@@ -31,7 +36,7 @@ class InputText:
         return [Action(int(l.split()[0])//10,l.split()[1],int(l.split()[2])) for l in open(p) if l.strip()]
 class G:
     def __init__(s,lid):
-        s.n=len(lid.rays)
+        s.n=len(lid.rays) if lid else 0
         s.map=NS(waypoints=[NS(group_id=1,vertices=[[0,0,500]]),NS(group_id=2,vertices=[[0,0,1000]])],start_position=[0,0,0],lap_count=1)
     def tel(s):
         sp=s.v
@@ -40,7 +45,7 @@ class G:
           wheels=NS(contact=[1]*4,slipping=[0]*4,angular_velocity=[10]*4,icing_percent=[0]*4),
           drivetrain=NS(steer=0,gear=3),race=NS(checkpoints_taken=int(z//500),race_tick=s.tick,race_time_ms=s.tick*10,entered_off_zone=False),
           runtime=NS(wall_hit_this_step=0,wetness=0),effects=NS(turbo=0),
-          lidar=NS(hit=[0]*s.n,distance=[0]*s.n),finished=z>=1000)
+          lidar=NS(hit=[0]*s.n,distance=[0]*s.n) if s.n else None,finished=z>=1000)
     acc=True
     @property
     def next_tick(s): return s.tick
@@ -50,7 +55,9 @@ class G:
             if a.kind=='accel': s.acc=bool(a.value)
         if accelerate is not None: s.acc=accelerate
         accelerate=s.acc
-        s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),80); s.v=max(s.v,0); s.z+=s.v*ticks/100; return s.tel()
+        _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),80); s.v=max(s.v,0); s.z+=s.v*ticks/100; return s.tel()
+    def raycast(s,rays):
+        _wait(FAKE_MS/5); return NS(hit=[0]*len(rays),distance=[0]*len(rays))
     info=NS(max_snapshots_per_session=64)
     def snapshot(s):
         G.snaps=getattr(G,'snaps',{}); i=len(G.snaps)+1; G.snaps[i]=(s.z,s.v,s.tick); return NS(id=i,tick=s.tick)

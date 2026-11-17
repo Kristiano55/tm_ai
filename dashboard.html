@@ -29,6 +29,7 @@ pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap
 label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
 input[type=text],input[type=number],select{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
 .hide{display:none}
+.tbar{display:flex;height:16px;border-radius:6px;overflow:hidden;background:#22262c;margin:8px 0}.tbar i{display:block;height:100%}
 </style></head><body>
 <header>
   <div class="logo">&raquo;</div>
@@ -73,6 +74,11 @@ input[type=text],input[type=number],select{background:#101317;border:1px solid v
     <div class="card"><div class="lg"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span></div>
       <h3>Where laps end <small>full laps bright, mid-track faint</small></h3><canvas id="cMap" style="height:300px"></canvas></div>
   </div>
+  <div class="card"><h3>Where the time goes <small>one car step, last 5-minute summary</small></h3>
+    <div class="tbar" id="tBar"></div><div class="lg" style="float:none;flex-wrap:wrap" id="tLeg"></div>
+    <div class="mut" id="tTxt" style="margin-top:6px">no summary yet (first one after 5 minutes of training)</div>
+    <div class="flex" style="margin-top:10px;align-items:center"><span class="mut" id="bTxt">Benchmark: drives 6/8/10/12 cars for ~30 s each (no learning) and suggests the fastest car count.</span>
+    <button id="bBench">Benchmark cars</button></div></div>
   <div class="card"><pre id="log"></pre></div>
 </main>
 <main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
@@ -91,11 +97,11 @@ const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; em
  ['vcp_every_s','Virtual checkpoints every N s of the PB/ghost pace (0 = off)','number'],['test_tries','Champion test = best of N laps','number'],
  ['horizon_s','Planning horizon (s)','number'],
  ['minirace_s','IQN: mini-race length (s)','number'],['iqn_reuse','IQN: learn from each experience x times','number'],['iqn_buffer','IQN: replay memory size','number'],
- ['iqn_eps_full_steps','IQN: fully random steps at the start','number'],['iqn_eps_mid','IQN: random-action share (middle)','number'],['iqn_eps_mid_steps','IQN: ... reached at step','number'],['iqn_eps_end','IQN: random-action share (final)','number'],['iqn_eps_end_steps','IQN: ... reached at step','number'],['iqn_warm_run','IQN: warm start from PPO run (run name, empty = off)','text'],['iqn_mid_start_p','IQN: share of laps starting along your PB/WR','number'],['iqn_rollback','IQN: roll back to the champion after bad tests','checkbox'],
+ ['iqn_eps_full_steps','IQN: fully random steps at the start','number'],['iqn_eps_mid','IQN: random-action share (middle)','number'],['iqn_eps_mid_steps','IQN: ... reached at step','number'],['iqn_eps_end','IQN: random-action share (final)','number'],['iqn_eps_end_steps','IQN: ... reached at step','number'],['iqn_warm_run','IQN: warm start from PPO run (run name, empty = off)','text'],['iqn_mid_start_p','IQN: share of laps starting along your PB/WR','number'],['iqn_device','IQN: learner runs on','select'],['lidar_every','Lidar scan every N steps (1 = every step; 2 = reuse every other step)','number'],['iqn_rollback','IQN: roll back to the champion after bad tests','checkbox'],
  ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
  ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
  ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];
-const OPTS={algo:[['ppo','PPO (original)'],['iqn','IQN - Linesight-style (replay memory, mini-races; new model)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
+const OPTS={algo:[['ppo','PPO (original)'],['iqn','IQN - Linesight-style (replay memory, mini-races; new model)']],iqn_device:[['auto','Auto (GPU if PyTorch has CUDA, else CPU)'],['cpu','CPU'],['cuda','GPU (CUDA)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
 let cfgLoaded=false;
 let WMETA=[], LEAN={}, LINES={};
 function fillForm(c,w){ WMETA=w||WMETA;
@@ -110,7 +116,7 @@ function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); 
   for(const m of WMETA) o[m.k]=$('f_'+m.k).value; return o }
 async function post(p,b){ const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}); const j=await r.json(); if(r.status>=400) alert(j.message); setTimeout(tick,300) }
 $('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
-$('bStart').onclick=()=>post('/api/start'); $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
+$('bStart').onclick=()=>post('/api/start'); $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
 $('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
 $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
 $('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
@@ -118,6 +124,21 @@ $('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST
 $('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
 $('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
 
+const TCOL={tick:['#3b8bea','TICK (game physics)'],obs:['#39c46a','building inputs'],env:['#e8a33a','rewards / rules'],wait:['#8b93a0','waiting for an action']};
+function drawTime(s){
+  const p=s.prof, running=s.state=='running'||s.state=='benchmarking'; $('bBench').disabled=running;
+  if(p&&p.car_ms){ const c=p.car_ms, tot=Object.values(c).reduce((a,b)=>a+b,0)||1;
+    $('tBar').innerHTML=Object.keys(TCOL).map(k=>`<i title="${TCOL[k][1]}: ${c[k]} ms" style="width:${100*c[k]/tot}%;background:${TCOL[k][0]}"></i>`).join('');
+    $('tLeg').innerHTML=Object.keys(TCOL).map(k=>`<span><b style="background:${TCOL[k][0]}"></b>${TCOL[k][1]} ${c[k].toFixed(1)} ms</span>`).join('');
+    let t=`${p.x}x real time with ${p.cars||'?'} cars (${Math.round(p.steps_s)} steps/s).`;
+    if(p.learner) t+=` Learner: ${p.learner.ups} updates/s on ${p.learner.device.toUpperCase()}, busy ${p.learner.busy}%, learns each experience x${p.learner.reuse}.`;
+    if(p.tester&&p.tester.n) t+=` Champion tests: ${p.tester.avg_s} s each.`;
+    $('tTxt').textContent=t }
+  const b=s.bench; if(b&&b.results&&b.results.length){
+    let t='Benchmark: '+b.results.map(r=>`${r.cars} cars ${r.x}x`).join(' · ')+` → best ${b.best} cars.`;
+    if(b.lidar_other) t+=` Lidar every ${b.lidar_other.lidar_every} step(s): ${b.lidar_other.x}x (setting now ${b.lidar_every}).`;
+    $('bTxt').textContent=t }
+}
 function draw(cv,layers,fmt){
   const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight; cv.width=w*d; cv.height=h*d;
   const g=cv.getContext('2d'); g.scale(d,d); g.font='11px Segoe UI,sans-serif';
@@ -187,6 +208,7 @@ function render(s){
   $('kLaps').textContent=n0(s.laps_total); $('kFin').textContent=(s.finished_pct==null?'':`${s.finished_pct}% of full laps finished`)+(s.mid_laps?` · ${n0(s.mid_laps)} mid-track`:'');
   $('kAvg').textContent=sec(s.recent_avg); $('kBest').textContent=sec(s.best_lap);
   $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'')}${(s.best_lap-pb/1000).toFixed(2)} s vs PB`:'';
+  drawTime(s);
   $('kSpeed').textContent=s.speed?Math.round(s.speed)+'x':'–'; $('kCars').textContent=`vs real time · league of ${c.envs} cars`;
   $('kTests').textContent=n0(s.tests_total); $('kProm').textContent=`${s.promotions} faster champions found`;
   $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;
