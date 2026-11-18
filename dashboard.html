@@ -2,163 +2,378 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trackmania AI</title>
 <style>
-:root{--bg:#0e1013;--card:#171a1f;--line:#262b32;--tx:#e8eaed;--mut:#8b93a0;--blue:#3b8bea;--org:#e8622a;--grn:#39c46a;--red:#e5484d}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 "Segoe UI",system-ui,sans-serif}
-header{display:flex;align-items:center;gap:28px;padding:12px 18px}
-.logo{width:40px;height:40px;border-radius:8px;background:var(--blue);display:grid;place-items:center;font-weight:700;font-size:18px}
-h1{margin:0;font-size:20px;font-weight:600}.sub{color:var(--mut);font-size:12px}
-nav{display:flex;gap:6px}nav a{padding:8px 12px;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent}
-nav a.on{color:var(--tx);border-color:var(--blue)}
-.sp{flex:1}.pill{display:flex;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:9px 14px}
-.dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}.dot.run{background:var(--grn)}.dot.err{background:var(--red)}
-button{font:inherit;border:0;border-radius:6px;padding:10px 18px;color:var(--tx);background:#2a2f37;cursor:pointer}
-button.p{background:var(--blue);color:#fff}button:disabled{opacity:.4;cursor:default}
-main{padding:0 18px 24px;display:grid;gap:14px}.row{display:grid;gap:14px}
-.r2{grid-template-columns:2fr 1.2fr}.r6{grid-template-columns:repeat(6,1fr)}.r3{grid-template-columns:1.3fr 1fr 1fr}
-@media(max-width:1000px){.r2,.r6,.r3{grid-template-columns:1fr 1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:16px 18px;min-width:0}
-.lab{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut)}
-.big{font-size:38px;font-weight:600;margin:4px 0}.mid{font-size:24px;font-weight:600;margin:6px 0 2px}.mut{color:var(--mut);font-size:12px}
-.bar{height:12px;background:#22262c;border-radius:6px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--org);width:0;transition:width .5s}
-.flex{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
-h3{margin:0 0 8px;font-size:15px}h3 small{font-weight:400;color:var(--mut);margin-left:8px;font-size:12px}
-canvas{width:100%;height:210px;display:block}canvas.t{height:240px}
-.lg{display:flex;gap:14px;font-size:12px;color:var(--mut);float:right}.lg b{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
-pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;min-height:90px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:26px}h3.sec{margin:6px 0 12px;font-size:16px}label small{color:var(--mut);font-size:11px}
-label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
-input[type=text],input[type=number],input[type=password],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
-.hide{display:none}
-.modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center;z-index:9}.modal.hide{display:none}
-table.sec{width:100%;border-collapse:collapse;font-size:13px}table.sec th{text-align:left;color:var(--mut);font-weight:400;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--line)}
-table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--red)}td.ok{color:var(--grn)}td.fb{color:var(--org)}
-.tbar{display:flex;height:16px;border-radius:6px;overflow:hidden;background:#22262c;margin:8px 0}.tbar i{display:block;height:100%}
+:root{--bg:#0e1013;--card:#171a1f;--card2:#1c2026;--line:#2a2f37;--tx:#e8eaed;--mut:#9aa3af;--blue:#3b8bea;--org:#e8622a;--grn:#39c46a;--red:#ef5b60;--yel:#e8a33a;
+  --r:6px;--gap:12px;--f-s:12px;--f-m:14px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:var(--f-m)/1.45 "Segoe UI",system-ui,sans-serif}
+a{color:#6fb1ff}:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+header{display:flex;align-items:center;flex-wrap:wrap;gap:10px 22px;padding:10px 18px;border-bottom:1px solid var(--line)}
+.logo{width:36px;height:36px;border-radius:8px;background:var(--blue);display:grid;place-items:center;font-weight:700;font-size:17px}
+h1{margin:0;font-size:18px;font-weight:600}.sub{color:var(--mut);font-size:var(--f-s);max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+nav button:hover:not(.on){background:none;color:var(--tx)}
+nav{display:flex;gap:4px}nav button{background:none;padding:8px 12px;color:var(--mut);border-radius:0;border-bottom:2px solid transparent}
+nav button.on{color:var(--tx);border-color:var(--blue)}
+.sp{flex:1}.pill{display:flex;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:7px 12px;max-width:420px}
+.pill .mut{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mut);flex:none}.dot.run{background:var(--grn)}.dot.err{background:var(--red)}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+button{font:inherit;border:0;border-radius:var(--r);padding:8px 14px;color:var(--tx);background:#2a2f37;cursor:pointer}
+button:hover:not(:disabled){background:#343a44}button.p{background:var(--blue);color:#fff}button.p:hover:not(:disabled){background:#4a97f0}
+button.sm{padding:4px 10px;font-size:var(--f-s)}button.link{background:none;color:#6fb1ff;padding:0;font-size:var(--f-s)}button:disabled{opacity:.4;cursor:default}
+main{padding:14px 18px 24px;display:grid;gap:var(--gap)}
+.grp{display:grid;gap:var(--gap)}.gh{margin:6px 0 -4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:600}
+.row{display:grid;gap:var(--gap)}.r2{grid-template-columns:2fr 1.2fr}.r3{grid-template-columns:1.3fr 1fr 1fr}.r11{grid-template-columns:1fr 1fr}
+.kpi{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+@media(max-width:1000px){.r2,.r3,.r11{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;min-width:0}
+.card>.ch{display:flex;align-items:baseline;gap:8px;margin:0 0 8px}.card>.ch h3{flex:1}
+.card.closed>:not(.ch){display:none}.card.closed>.ch{margin:0}
+.tog{background:none;padding:0 4px;color:var(--mut);font-size:12px;line-height:1}
+.lab{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+.big{font-size:34px;font-weight:600;margin:2px 0}.mid{font-size:22px;font-weight:600;margin:4px 0 2px}.mut{color:var(--mut);font-size:var(--f-s)}
+.bar{height:10px;background:#22262c;border-radius:5px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--org);width:0;transition:width .5s}
+.flex{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center}
+h3{margin:0;font-size:15px;font-weight:600}h3 small{font-weight:400;color:var(--mut);margin-left:6px;font-size:var(--f-s)}
+canvas{width:100%;height:200px;display:block}canvas.t{height:230px}
+.lg{display:flex;gap:12px;flex-wrap:wrap;font-size:var(--f-s);color:var(--mut)}.lg b{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;word-break:break-word;min-height:90px}
+input[type=text],input[type=number],input[type=password],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:7px 9px;font:inherit;width:100%;min-width:0}
+input.bad{border-color:var(--red)}
+.hide{display:none!important}
+.modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center;z-index:9}
+.tw{overflow-x:auto}
+table.sec{width:100%;border-collapse:collapse;font-size:13px}table.sec th{text-align:left;color:var(--mut);font-weight:400;font-size:var(--f-s);padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+table.sec td{padding:6px 8px;border-bottom:1px solid #1f2329;vertical-align:top}td.bad{color:var(--red)}td.ok{color:var(--grn)}td.fb{color:var(--org)}
+.tbar{display:flex;height:14px;border-radius:5px;overflow:hidden;background:#22262c;margin:8px 0}.tbar i{display:block;height:100%}
+.fbar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:10px 0}.fbar input[type=text]{width:200px}.fbar input[type=number]{width:110px}.fbar select{width:auto}
+.fbar label{display:flex;gap:6px;align-items:center;font-size:var(--f-s);color:var(--mut)}
+/* --- settings --- */
+#set{grid-template-columns:210px minmax(0,1fr);align-items:start;padding-bottom:80px}
+.snav{position:sticky;top:10px;display:grid;gap:2px}.snav button{text-align:left;background:none;color:var(--mut);padding:7px 10px;display:flex;justify-content:space-between}
+.snav button.on,.snav button:hover{background:var(--card);color:var(--tx)}.snav button .n{font-size:11px;color:var(--yel)}
+#secSel{display:none}
+.stop{display:flex;gap:10px;align-items:center;margin-bottom:var(--gap)}.stop input{max-width:420px}
+.sc{scroll-margin-top:12px}.sc>.ch{margin-bottom:10px}
+.fg{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px 16px}
+.sub2{margin:14px 0 6px;font-size:var(--f-s);color:var(--mut);font-weight:600;letter-spacing:.03em;text-transform:uppercase}
+.fld{display:grid;gap:3px;min-width:0;align-content:start}.fld.wide{grid-column:1/-1}
+.fl{display:flex;align-items:center;gap:5px;font-size:13px;color:#cfd4db;min-height:20px}
+.fl label{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fld.ck .fr{display:flex;align-items:center;gap:8px}.fld.ck input{width:18px;height:18px;margin:0}
+.chg{width:7px;height:7px;border-radius:50%;background:var(--yel);flex:none;visibility:hidden}.chg.on{visibility:visible}
+.tag{font-size:10px;padding:0 5px;border-radius:8px;border:1px solid var(--line);color:var(--mut);flex:none}.tag.live{color:var(--grn);border-color:#2b5a3a}
+.q{position:relative;background:#262b32;color:var(--mut);width:17px;height:17px;padding:0;border-radius:50%;font-size:11px;line-height:17px;flex:none}
+.q .tip{display:none;position:absolute;left:50%;bottom:calc(100% + 6px);transform:translateX(-50%);width:max-content;max-width:280px;background:#0b0d10;border:1px solid var(--line);
+  color:var(--tx);padding:7px 9px;border-radius:6px;font-size:12px;line-height:1.4;text-align:left;z-index:5;white-space:normal;box-shadow:0 4px 14px #0008}
+.q:hover .tip,.q:focus .tip{display:block}
+.err{color:var(--red);font-size:11px;min-height:0}
+.more{margin-top:10px}.more>summary{cursor:pointer;color:var(--mut);font-size:var(--f-s);padding:4px 0}.more[open]>summary{margin-bottom:8px}
+mark{background:#e8a33a55;color:inherit;border-radius:2px}
+.sc.nomatch{display:none}
+.pool td{padding:4px 6px}.pool input{padding:5px 7px}
+.savebar{position:fixed;left:0;right:0;bottom:0;background:#12151a;border-top:1px solid var(--line);padding:10px 18px;display:flex;gap:12px;align-items:center;z-index:8}
+.savebar .msg{flex:1;color:var(--mut);font-size:13px}.savebar.dirty .msg{color:var(--yel)}
+.leave{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:10;background:#1d1a14;border:1px solid var(--yel);border-radius:var(--r);padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:calc(100% - 24px)}
+@media(max-width:800px){.q .tip{position:fixed;left:12px;right:12px;bottom:64px;transform:none;width:auto;max-width:none}#set{grid-template-columns:1fr}.snav{display:none}#secSel{display:block;width:100%}.stop{flex-wrap:wrap}header{padding:10px 12px}main{padding:12px}.pill{max-width:100%}}
 </style></head><body>
 <header>
-  <div class="logo">&raquo;</div>
+  <div class="logo" aria-hidden="true">&raquo;</div>
   <div><h1>Trackmania AI</h1><div class="sub" id="sub">&nbsp;</div></div>
-  <nav><a id="n1" class="on">Dashboard</a><a id="n3">Hub</a><a id="n2">Settings</a></nav>
+  <nav aria-label="Pages"><button id="n1" class="on">Dashboard</button><button id="n3">Hub</button><button id="n2">Settings</button></nav>
   <div class="sp"></div>
-  <div class="pill"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
-  <button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button>
+  <div class="pill" role="status"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
+  <div class="acts"><button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button></div>
 </header>
 <datalist id="runList"></datalist>
-<div id="modal" class="modal hide"><div class="card" style="max-width:560px;margin:16px" id="modalBox"></div></div>
+<div id="modal" class="modal hide" role="dialog" aria-modal="true"><div class="card" style="max-width:560px;margin:16px" id="modalBox"></div></div>
+<div id="leave" class="leave hide" role="alertdialog" aria-label="Unsaved settings"><span>You have unsaved settings changes.</span>
+  <button class="p sm" id="lvSave">Save &amp; leave</button><button class="sm" id="lvDrop">Discard &amp; leave</button><button class="sm" id="lvStay">Stay</button></div>
+
 <main id="dash">
   <div class="card hide" id="banner" style="border-color:var(--org)"></div>
+  <section class="grp" aria-label="Progress"><div class="gh">Progress</div>
   <div class="row r2">
-    <div class="card"><div class="lab">Road to your PB</div>
+    <div class="card" data-c="pb"><div class="ch"><h3 class="lab">Road to your PB</h3></div>
       <div><span class="big" id="champ">–</span> <span id="vsPb" style="margin-left:10px"></span></div>
       <div class="bar"><i id="pbBar"></i></div>
       <div class="flex mut"><span id="first"></span><span id="pbTxt"></span></div>
-      <div class="flex mut" style="margin-top:10px"><span id="bestRun"></span><a href="#" id="bOpen" style="color:var(--blue)">Open run folder</a></div></div>
-    <div class="card"><div class="lab">This session</div>
+      <div class="flex mut" style="margin-top:8px"><span id="bestRun"></span><button class="link" id="bOpen">Open run folder</button></div></div>
+    <div class="card" data-c="sess"><div class="ch"><h3 class="lab">This session</h3></div>
       <div><span class="big" id="sMin">0 min</span> <span class="mut" id="sLaps"></span></div>
       <div class="mut" id="mode"></div><div class="bar"><i id="stopBar" style="background:#3a4048"></i></div>
       <div class="mut" id="nextTest"></div></div>
   </div>
   <div class="card hide" id="playCard"><div class="lab">Champion play</div><div id="playTxt" style="margin-top:4px"></div></div>
-  <div class="row r6">
+  <div class="row kpi">
     <div class="card"><div class="lab">Training laps</div><div class="mid" id="kLaps">0</div><div class="mut" id="kFin"></div></div>
-    <div class="card"><div class="lab">Recent average</div><div class="mid" id="kAvg">–</div><div class="mut">last 20 finished laps, with exploration</div></div>
+    <div class="card"><div class="lab">Recent average</div><div class="mid" id="kAvg">–</div><div class="mut">last 20 finished laps</div></div>
     <div class="card"><div class="lab">Best training lap</div><div class="mid" id="kBest">–</div><div class="mut" id="kBestPb"></div></div>
     <div class="card"><div class="lab">Training speed</div><div class="mid" id="kSpeed">–</div><div class="mut" id="kCars"></div></div>
     <div class="card"><div class="lab">Champion tests</div><div class="mid" id="kTests">0</div><div class="mut" id="kProm"></div></div>
     <div class="card"><div class="lab">Learning updates</div><div class="mid" id="kUpd">0</div><div class="mut" id="kSteps"></div></div>
-  </div>
-  <div class="card"><div class="lg"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span></div>
-    <h3>Lap times <small>every finished training lap, lower is faster</small></h3><canvas id="c1" class="t"></canvas></div>
+  </div></section>
+
+  <section class="grp" aria-label="Laps and tests"><div class="gh">Laps &amp; tests</div>
+  <div class="card" data-c="laps"><div class="ch"><h3>Lap times <small>every finished training lap, lower is faster</small></h3></div>
+    <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span></div>
+    <canvas id="c1" class="t"></canvas></div>
   <div class="row r3">
-    <div class="card"><div class="lg"><span><b style="background:var(--blue)"></b>Current driver</span><span><b style="background:var(--org)"></b>Champion</span></div>
-      <h3>Champion tests <small>↑ promoted &nbsp; ↺ rolled back</small></h3><canvas id="c2"></canvas></div>
-    <div class="card"><h3>Value estimate <small>average V</small></h3><canvas id="c3"></canvas></div>
-    <div class="card"><h3>Value loss <small>critic loss</small></h3><canvas id="c4"></canvas></div>
-  </div>
-  <div class="row" style="grid-template-columns:1fr 1fr">
-    <div class="card"><h3>Reward breakdown <small>average per step, recent updates; red = costs, green = pays</small></h3>
+    <div class="card" data-c="tests"><div class="ch"><h3>Champion tests <small>↑ promoted · ↺ rolled back</small></h3></div>
+      <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Current driver</span><span><b style="background:var(--org)"></b>Champion</span></div><canvas id="c2"></canvas></div>
+    <div class="card" data-c="v"><div class="ch"><h3>Value estimate <small>average V</small></h3></div><canvas id="c3"></canvas></div>
+    <div class="card" data-c="vl"><div class="ch"><h3>Value loss</h3></div><canvas id="c4"></canvas></div>
+  </div></section>
+
+  <section class="grp" aria-label="Rewards and where laps end"><div class="gh">Rewards &amp; where laps end</div>
+  <div class="row r11">
+    <div class="card" data-c="rb"><div class="ch"><h3>Reward breakdown <small>per step, recent updates · red costs, green pays</small></h3></div>
       <div id="rbBars" class="mut">no data yet</div><div class="mut" id="rbSum" style="margin-top:8px"></div></div>
-    <div class="card"><div class="lg"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span></div>
-      <h3>Where laps end <small>full laps bright, mid-track faint</small></h3><canvas id="cMap" style="height:300px"></canvas></div>
-  </div>
-  <div class="card hide" id="baseCard"><h3>Base maps <small id="baseSub">one shared driver, each map with its own champion, line and ghost</small></h3>
-    <table class="sec" id="mapT"></table>
-    <div class="flex" style="margin-top:10px;align-items:center"><span class="mut" id="trTxt">Transfer test: drive the base on a map it never trained on (best of 3, no learning).</span>
+    <div class="card" data-c="ends"><div class="ch"><h3>Where laps end <small>full laps bright, mid-track faint</small></h3></div>
+      <div class="lg" style="margin-bottom:6px"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span></div>
+      <canvas id="cMap" style="height:280px"></canvas></div>
+  </div></section>
+
+  <section class="grp" aria-label="Sections and base maps"><div class="gh">Sections &amp; base maps</div>
+  <div class="card hide" id="baseCard" data-c="base"><div class="ch"><h3>Base maps <small id="baseSub">one shared driver, each map with its own champion, line and ghost</small></h3></div>
+    <div class="tw"><table class="sec" id="mapT"></table></div>
+    <div class="flex" style="margin-top:10px"><span class="mut" id="trTxt">Transfer test: the base on a map it never trained on (best of 3, no learning).</span>
     <button id="bTr">Transfer test</button></div></div>
-  <div class="card"><h3>Sections <small>checkpoint to checkpoint: your PB/WR split, the AI's best split, how often laps fail there, which target the AI chases</small></h3>
-    <table class="sec" id="secT"><tr><td class="mut">no data yet</td></tr></table></div>
-  <div class="card"><h3>Where the time goes <small>one car step, last 5-minute summary</small></h3>
-    <div class="tbar" id="tBar"></div><div class="lg" style="float:none;flex-wrap:wrap" id="tLeg"></div>
+  <div class="card" data-c="secs"><div class="ch"><h3>Sections <small>CP to CP: PB/WR split, AI best, failures, target in use</small></h3></div>
+    <div class="tw"><table class="sec" id="secT"><tr><td class="mut">no data yet</td></tr></table></div></div>
+  </section>
+
+  <section class="grp" aria-label="Speed"><div class="gh">Speed</div>
+  <div class="card" data-c="time"><div class="ch"><h3>Where the time goes <small>one car step, last 5-minute summary</small></h3></div>
+    <div class="tbar" id="tBar"></div><div class="lg" id="tLeg"></div>
     <div class="mut" id="tTxt" style="margin-top:6px">no summary yet (first one after 5 minutes of training)</div>
-    <div class="flex" style="margin-top:10px;align-items:center"><span class="mut" id="bTxt">Benchmark: drives 6/8/10/12 cars for ~30 s each (no learning) and suggests the fastest car count.</span>
+    <div class="flex" style="margin-top:10px"><span class="mut" id="bTxt">Benchmark: 6/8/10/12 cars for ~30 s each (no learning), suggests the fastest car count.</span>
     <button id="bBench">Benchmark cars</button></div></div>
-  <div class="card"><pre id="log"></pre></div>
+  </section>
+
+  <section class="grp" aria-label="Log"><div class="gh">Log</div>
+  <div class="card" data-c="log"><div class="ch"><h3>Training log</h3></div><pre id="log"></pre></div></section>
 </main>
+
 <main id="hubv" class="hide"><div class="card">
-  <div class="flex" style="align-items:center"><h3 style="margin:0">Brain hub <small id="hubSub">shared AI drivers - data only (JSON + weights), never code</small></h3>
-    <span><button id="hRef">Refresh</button> <button id="hVer" class="hide">Verify pending packs</button></span></div>
-  <div class="grid" style="margin:12px 0 10px;grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
-    <label>Map (name or UID)<input type="text" id="hMap"></label>
-    <label>Min. benchmark score<input type="number" id="hBench" step="any"></label>
-    <label>Sort by<select id="hSort"><option value="ver">Verified first</option><option value="wr">Time vs WR</option><option value="bench">Benchmark score</option><option value="votes">Votes</option></select></label>
-    <label class="ck"><input type="checkbox" id="hOnlyV"> Verified only</label>
-    <label class="ck"><input type="checkbox" id="hLin"> Same lineage as my bases</label>
+  <div class="flex"><h3>Brain hub <small id="hubSub">shared AI drivers - data only (JSON + weights), never code</small></h3>
+    <span class="acts"><button id="hRef">Refresh</button><button id="hVer" class="hide">Verify pending packs</button></span></div>
+  <div class="fbar" role="search">
+    <label for="hMap">Map</label><input type="text" id="hMap" placeholder="name or UID">
+    <label for="hBench">Min. score</label><input type="number" id="hBench" step="any" min="0">
+    <label for="hSort">Sort</label><select id="hSort"><option value="ver">Verified first</option><option value="wr">Time vs WR</option><option value="bench">Benchmark score</option><option value="votes">Votes</option></select>
+    <label><input type="checkbox" id="hOnlyV"> Verified only</label>
+    <label><input type="checkbox" id="hLin"> Same lineage as my bases</label>
   </div>
-  <table class="sec" id="hubT"><tr><td class="mut">loading ...</td></tr></table>
+  <div class="tw"><table class="sec" id="hubT"><tr><td class="mut">loading ...</td></tr></table></div>
   <pre id="hubLog" style="margin-top:10px;min-height:0"></pre></div></main>
-<main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
-  <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <button id="bLs">Linesight preset</button> <button id="bDc">Send Discord test</button> <span class="mut" id="saved"></span></p>
-  <p class="mut">Training settings apply the next time you press Start training. Reward weights (and "end a lap when behind the ghost") are picked up live by running cars at the start of their next lap.</p></div></main>
+
+<main id="set" class="hide">
+  <nav class="snav" id="snav" aria-label="Settings sections"></nav>
+  <div>
+    <div class="stop"><label for="sSearch" class="mut">Search</label><input type="text" id="sSearch" placeholder="find a setting by name, key or help text" autocomplete="off">
+      <select id="secSel" aria-label="Jump to section"></select></div>
+    <form id="form" onsubmit="return false" novalidate></form>
+  </div>
+</main>
+<div class="savebar hide" id="saveBar"><span class="msg" id="saved" role="status">No unsaved changes</span>
+  <button id="bDiscard">Discard</button><button class="p" id="bSave">Save</button></div>
 <script>
 const $=id=>document.getElementById(id);
 const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
-const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; empty = off)','text'],['discord_every_min','Discord summary every N minutes','number'],['algo','Learning algorithm','select'],['run_type','Run type','select'],['base_name','Base name (base runs: runs/_base/<name>)','text'],
- ['map_pool','Map pool - one map per line: map path | PB file (optional) | PB seconds (optional)','pool'],
- ['pool_rotate_laps','Base: a car changes pool map every N laps (when there are more maps than cars)','number'],
- ['progress_norm_m','Base: progress pays as if every lap were this long (m)','number'],
- ['base_from','Map run: start from this base model (base name; empty = off)','text'],
- ['pool_cars','Map run: cars that keep driving the pool maps (no forgetting; 0 = off)','number'],
- ['github_user','Hub: your GitHub user name (pack author / verifier)','text'],['github_token','Hub: GitHub token for direct uploads (optional; empty = the browser does it, nothing stored)','password'],
- ['hub_index_url','Hub: index URL','text'],['hub_repo','Hub: repository','text'],['maps_folder','Hub: your maps folder (verify / benchmark find maps there)','text'],['hub_benchmark_url','Hub: benchmark.json URL (empty = next to the index)','text'],['map','Map path (.Map.Gbx)','text'],['run','Run name (pick an existing run or type a new name; spaces, - and _ do not matter)','run'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
- ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
- ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
- ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
- ['decay_steps','Learning rate / exploration halve every N env steps (0 = off)','number'],
- ['pb_file','Your PB as a TICK input file (.txt) - target line (empty = off)','text'],
- ['ghost_window_s','Ghost reward counts within this far behind the ghost (s)','number'],
- ['vcp_every_s','Virtual checkpoints every N s of the PB/ghost pace (0 = off)','number'],['test_tries','Champion test = best of N laps','number'],['test_tries_close','... best of N once the champion is within the margin below of your PB','number'],['test_close_s','Close-to-PB margin (s)','number'],
- ['horizon_s','Planning horizon (s)','number'],
- ['minirace_s','IQN: mini-race length (s)','number'],['iqn_reuse','IQN: learn from each experience x times','number'],['iqn_buffer','IQN: replay memory size','number'],
- ['iqn_eps_full_steps','IQN: fully random steps at the start','number'],['iqn_eps_mid','IQN: random-action share (middle)','number'],['iqn_eps_mid_steps','IQN: ... reached at step','number'],['iqn_eps_end','IQN: random-action share (final)','number'],['iqn_eps_end_steps','IQN: ... reached at step','number'],['iqn_warm_run','IQN: warm start from PPO run (run name, empty = off)','text'],['iqn_mid_start_p','IQN: share of laps starting along your PB/WR','number'],['iqn_device','IQN: learner runs on','select'],['lidar_every','Lidar scan every N steps (1 = every step; 2 = reuse every other step)','number'],['iqn_rollback','IQN: roll back to the champion after bad tests','checkbox'],['sec_fallback','Section fallback: where most laps fail on the PB/WR route, chase the AI\'s own route there','checkbox'],
- ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
- ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
- ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];
-const OPTS={run_type:[['map','One map'],['base','Base driver (all maps in the pool, one shared model)']],algo:[['ppo','PPO (recommended)'],['iqn','IQN - experimental (Linesight-style; more settings appear)']],iqn_device:[['auto','Auto (GPU if PyTorch has CUDA, else CPU)'],['cpu','CPU'],['cuda','GPU (CUDA)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
-let cfgLoaded=false;
-let WMETA=[], LEAN={}, LINES={};
-function fillForm(c,w){ WMETA=w||WMETA;
-  const poolTxt=v=>(v||[]).map(e=>[e.map,e.pb_file||'',e.pb_seconds||''].join(' | ').replace(/( \| )+$/,'')).join('\n');
-  const fld=([k,l,t])=>t=='run'?`<label>${l}<input type="text" list="runList" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}" autocomplete="off"><small id="runInfo"></small></label>`:t=='pool'?`<label style="grid-column:1/-1">${l}<textarea id="f_${k}" rows="4">${poolTxt(c[k])}</textarea></label>`:t=='checkbox'?
-    `<label class="ck"><input type="checkbox" id="f_${k}" ${c[k]?'checked':''}> ${l}</label>`:t=='select'?
-    `<label>${l}<select id="f_${k}">${OPTS[k].map(([v,n])=>`<option value="${v}" ${c[k]==v?'selected':''}>${n}</option>`).join('')}</select></label>`:
-    `<label>${l}<input type="${t}" step="any" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}"></label>`;
-  const wt=m=>`<label>${m.label}<input type="number" step="any" id="f_${m.k}" value="${c[m.k]}"><small>${m.hint} · default ${m.default}</small></label>`;
-  $('form').innerHTML=`<h3 class="sec">Training settings</h3><div class="grid">${FIELDS.map(fld).join('')}</div>
-    <h3 class="sec">Reward weights</h3><div class="grid">${WMETA.map(wt).join('')}</div>`;
-  const iqnUi=()=>{const on=$('f_algo').value=='iqn'; for(const [k] of FIELDS) if(k.startsWith('iqn_')||k=='minirace_s') $('f_'+k).closest('label').classList.toggle('hide',!on)};
-  $('f_algo').onchange=iqnUi; iqnUi();
-  $('f_map').onchange=()=>{const m=$('f_map').value.trim().toLowerCase(), r=RUNS.find(x=>(x.map||'').toLowerCase()==m);   // newest first
-    if(r){$('f_run').value=r.name; runInfo()}};
-  $('f_run').oninput=runInfo; runInfo() }
+const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const store={get(k,d){try{const v=localStorage.getItem('tmai.'+k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem('tmai.'+k,JSON.stringify(v))}catch(e){}}};
+
+// ---------------- settings: one table drives everything ----------------
+// key: [short label, help, type, {min,max,step,opts,more,live,wide,group}]
+const I={step:1}, F={
+ run:['Run name','Pick an existing run or type a new name. Spaces, - and _ do not matter.','run'],
+ run_type:['Run type','One map, or a base driver that learns all maps in the pool with one shared model.','select',{opts:[['map','One map'],['base','Base driver (map pool)']]}],
+ map:['Map file','Full path to the .Map.Gbx.','text',{wide:1}],
+ pb_seconds:['Your PB (s)','Your personal best. 0 = unset. Used for best-of-8 tests and "stop at PB".','number',{min:0,max:3600,step:'any'}],
+ pb_file:['PB input file','Your PB as a TICK input file (.txt): traced once into the target line + ghost. Empty = off.','text',{wide:1}],
+ base_from:['Start from base','Map run: start from this base model (base name). Empty = off.','text',{more:1}],
+ resume:['Resume','Continue from the run\'s latest checkpoint. Off = start from scratch.','checkbox'],
+ envs:['Cars','Parallel gyms. One more is used for champion tests.','number',{min:1,max:64,...I}],
+ ticks_per_step:['Ticks / decision','5 = 50 ms per decision, 3 = 30 ms.','number',{min:1,max:20,...I}],
+ lidar_every:['Lidar every N steps','1 = scan every step; 2 = reuse every other scan (measure with the benchmark).','number',{min:1,max:5,...I,more:1}],
+ time_limit_min:['Time limit (min)','Stop after N minutes. 0 = until stopped.','number',{min:0,max:100000,...I}],
+ max_lap_seconds:['Max lap (s)','Hard time limit per training lap.','number',{min:5,max:3600,...I}],
+ w_progress:['Progress','','w',{group:'Core'}], w_time:['Time','','w',{group:'Core'}], w_finish:['Finish','','w',{group:'Core'}],
+ w_finish_time:['Finish speed','','w',{group:'Core'}], w_checkpoint:['Checkpoint','','w',{group:'Core'}],
+ ghost_weight:['Ghost','','w',{group:'Ghost & target line'}],
+ ghost_window_s:['Ghost window (s)','Ghost reward counts only within this far behind the ghost.','number',{min:0,max:60,step:'any',live:1,group:'Ghost & target line'}],
+ w_guide:['Pull to line','','w',{group:'Ghost & target line'}],
+ vcp_every_s:['Virtual CP every (s)','Virtual checkpoints every N s of the PB / ghost pace. 0 = off.','number',{min:0,max:120,step:'any',group:'Ghost & target line'}],
+ w_vcp:['Virtual CP bonus','','w',{group:'Ghost & target line'}], w_vsplit:['Virtual CP split','','w',{group:'Ghost & target line'}],
+ w_crash:['Crash','','w',{group:'Penalties'}], w_hit:['Wall hit','','w',{group:'Penalties'}],
+ w_hit_ramp:['Wall-hit ramp-in','Wall-hit penalty at 25 % while under 30 % of laps finish, 100 % from 60 % (then for good).','checkbox',{group:'Penalties'}],
+ w_stuck:['Stuck','','w',{group:'Penalties'}], w_offzone:['Off-zone','','w',{group:'Penalties'}],
+ w_release:['Pointless release','','w',{group:'Driving style',more:1}], w_coast:['Coast','','w',{group:'Driving style',more:1}],
+ w_brake:['Brake','','w',{group:'Driving style',more:1}], w_steer_smooth:['Smooth steering','','w',{group:'Driving style',more:1}],
+ w_slip:['Slip','','w',{group:'Driving style',more:1}], w_air:['Airtime','','w',{group:'Driving style',more:1}],
+ w_speed:['Speed','','w',{group:'Driving style',more:1}], w_wall:['Wall scrape','','w',{group:'Driving style',more:1}],
+ test_every_laps:['Test every N laps','Champion test after this many training laps (only after the first finished lap).','number',{min:1,max:100000,...I}],
+ test_tries:['Tries','Champion test = best of N laps (most likely actions + seeded ones).','number',{min:1,max:20,...I}],
+ test_tries_close:['Tries near PB','Best of N once the champion is within the margin below of your PB.','number',{min:1,max:50,...I}],
+ test_close_s:['Near-PB margin (s)','"Near the PB" = champion within this many seconds of it.','number',{min:0,max:60,step:'any',more:1}],
+ rollback_after:['Rollback after','Roll back to the champion after N bad tests in a row.','number',{min:1,max:100,...I,more:1}],
+ rollback_margin_s:['Bad test margin (s)','A test counts as bad if slower than the champion by this much.','number',{min:0,max:60,step:'any',more:1}],
+ stop_at_pb:['Stop at PB','Stop training when the champion beats your PB.','checkbox'],
+ line_refresh_s:['Line refresh (s)','Rebuild the reference line + ghost when the champion beats it by this much. 0 = never.','number',{min:0,max:60,step:'any'}],
+ mid_start_p:['Mid-track starts','Share of laps that start partway along the champion lap (after the first finish). 0 = off.','number',{min:0,max:1,step:0.05}],
+ mid_start_every_s:['Start spacing (s)','Mid-track start points every N s of the champion lap.','number',{min:0.5,max:60,step:'any'}],
+ sec_fallback:['Section fallback','With a PB/WR line: where most laps fail, chase the AI\'s own route in that section.','checkbox'],
+ cut_behind_s:['Cut when behind (s)','End a training lap this far behind the champion\'s pace. 0 = off.','number',{min:0,max:120,step:'any',live:1,more:1}],
+ horizon_s:['Horizon (s)','How far ahead the AI weighs rewards (sets gamma).','number',{min:1,max:600,step:'any'}],
+ decay_steps:['Decay every N steps','Learning rate + exploration halve every N env steps. 0 = off.','number',{min:0,max:1e10,...I}],
+ base_name:['Base name','Base runs live in runs/_base/<name>.','text'],
+ map_pool:['Map pool','Maps of the base driver (and the pool cars of a map run).','pool',{wide:1}],
+ pool_rotate_laps:['Rotate every N laps','A car moves to another pool map every N laps (when there are more maps than cars).','number',{min:1,max:10000,...I}],
+ pool_cars:['Pool cars','Map run with a pool: cars that keep driving pool maps (no forgetting). 0 = off.','number',{min:0,max:64,...I}],
+ progress_norm_m:['Common lap length (m)','Base: progress pays as if every lap were this long.','number',{min:0,max:100000,step:'any',more:1}],
+ github_user:['GitHub user','Your GitHub name: pack author and verifier.','text'],
+ github_token:['GitHub token','Optional, for direct release uploads. Empty = the browser does it; nothing stored.','password'],
+ hub_repo:['Hub repository','owner/name of the brain hub.','text',{more:1}],
+ hub_index_url:['Index URL','Where the hub index (index.json) is read from.','text',{wide:1,more:1}],
+ maps_folder:['Maps folder','Your maps folder: verify / benchmark find maps there by file name.','text',{wide:1}],
+ hub_benchmark_url:['Benchmark URL','benchmark.json. Empty = next to the index.','text',{wide:1,more:1}],
+ discord_webhook:['Discord webhook','Updates on your phone. Empty = off.','text',{wide:1}],
+ discord_every_min:['Summary every (min)','Discord summary every N minutes.','number',{min:1,max:1440,...I}],
+ algo:['Algorithm','PPO is recommended. IQN is experimental (its settings appear below).','select',{opts:[['ppo','PPO (recommended)'],['iqn','IQN (experimental)']]}],
+ extra_obs:['Extra inputs','Turbo, grip, wall hits, ghost speed, line offset, surfaces, ice.','checkbox'],
+ steer_mode:['Steering levels','Progressive = fine near the centre, coarse at the edges.','select',{opts:[['progressive','Progressive'],['uniform','Uniform (10 % steps)']]}],
+ minirace_s:['Mini-race (s)','IQN maximises progress over the next N seconds.','number',{min:1,max:60,step:'any',iqn:1}],
+ iqn_reuse:['Reuse','IQN learns from each experience about this often.','number',{min:1,max:256,...I,iqn:1}],
+ iqn_buffer:['Replay size','IQN replay memory (experiences).','number',{min:1000,max:10000000,...I,iqn:1}],
+ iqn_eps_full_steps:['Random steps','Fully random driving for the first N steps.','number',{min:0,max:1e10,...I,iqn:1}],
+ iqn_eps_mid:['Random share (mid)','Random-action share reached at the next step count.','number',{min:0,max:1,step:'any',iqn:1}],
+ iqn_eps_mid_steps:['... at step','Step count of the middle random share.','number',{min:0,max:1e10,...I,iqn:1}],
+ iqn_eps_end:['Random share (end)','Final random-action share.','number',{min:0,max:1,step:'any',iqn:1}],
+ iqn_eps_end_steps:['... at step','Step count of the final random share.','number',{min:0,max:1e10,...I,iqn:1}],
+ iqn_warm_run:['Warm start run','Fill the replay memory from this PPO run\'s champion first. Empty = off.','text',{iqn:1}],
+ iqn_mid_start_p:['PB/WR starts','Share of IQN laps that start along your PB/WR.','number',{min:0,max:1,step:'any',iqn:1}],
+ iqn_rollback:['Rollback','IQN: roll back to the champion after bad tests.','checkbox',{iqn:1}],
+ iqn_device:['Learner device','Auto = GPU if PyTorch has CUDA, else CPU.','select',{iqn:1,opts:[['auto','Auto'],['cpu','CPU'],['cuda','GPU (CUDA)']]}],
+ reward_v:['Reward layout version','Internal (config migration); not editable.','hidden'],
+};
+const SECTIONS=[
+ ['run','Run & map',['run','run_type','map','pb_seconds','pb_file','resume','base_from']],
+ ['cars','Cars & speed',['envs','ticks_per_step','time_limit_min','max_lap_seconds','lidar_every']],
+ ['rew','Rewards',['w_progress','w_time','w_finish','w_finish_time','w_checkpoint','ghost_weight','ghost_window_s','w_guide','vcp_every_s','w_vcp','w_vsplit',
+   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall']],
+ ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
+ ['line','Track & line',['line_refresh_s','mid_start_p','mid_start_every_s','sec_fallback','cut_behind_s']],
+ ['learn','Learning (PPO)',['horizon_s','decay_steps']],
+ ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
+ ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
+ ['note','Notifications',['discord_webhook','discord_every_min']],
+ ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_rollback','iqn_device','reward_v']],
+];
+let DEF={}, BASE={}, WMETA=[], LEAN={}, LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
+const meta=k=>{const f=F[k]||[k,'','text'];return {k,label:f[0],hint:f[1],type:f[2],o:f[3]||{}}};
+const isLive=m=>m.type=='w'||m.o.live;
+function hintOf(m){ let h=m.hint; if(m.type=='w'){const w=WMETA.find(x=>x.k==m.k); h=w?w.hint:''} return h }
+function defTxt(k){ const d=DEF[k]; return d===true?'on':d===false?'off':Array.isArray(d)?(d.length?d.length+' maps':'empty'):(d===''?'empty':String(d)) }
+function fieldHtml(m,c){
+  const id='f_'+m.k, v=c[m.k], o=m.o, h=hintOf(m);
+  if(m.type=='hidden') return `<input type="hidden" id="${id}" value="${esc(v)}">`;
+  const q=`<button type="button" class="q" aria-label="Help for ${esc(m.label)}" aria-describedby="t_${m.k}">?<span class="tip" role="tooltip" id="t_${m.k}">${esc(h)}${h?'<br>':''}<span class="mut">Default: ${esc(defTxt(m.k))} · ${isLive(m)?'applies live (next lap)':'applies at the next Start'} · key ${m.k}</span></span></button>`;
+  const tag=isLive(m)?`<span class="tag live" title="Running cars pick this up at their next lap - no restart needed">live</span>`:'';
+  const head=`<div class="fl"><span class="chg" id="d_${m.k}" title="differs from the default"></span><label for="${id}" data-t="${esc(m.label)}">${esc(m.label)}</label>${q}${tag}</div>`;
+  let ctl;
+  if(m.type=='checkbox') return `<div class="fld ck" data-k="${m.k}"><div class="fr"><input type="checkbox" id="${id}" ${v?'checked':''}>${head}</div></div>`;
+  if(m.type=='select') ctl=`<select id="${id}">${o.opts.map(([a,b])=>`<option value="${a}" ${v==a?'selected':''}>${esc(b)}</option>`).join('')}</select>`;
+  else if(m.type=='pool') ctl=`<div class="tw"><table class="sec pool" id="poolT"></table></div><button type="button" class="sm" id="poolAdd" style="margin-top:6px">+ Add map</button>`;
+  else if(m.type=='number'||m.type=='w') ctl=`<input type="number" id="${id}" value="${esc(v)}" step="${o.step??'any'}" ${o.min!=null?`min="${o.min}"`:''} ${o.max!=null?`max="${o.max}"`:''} inputmode="decimal" ${m.type=='w'?'min="-1000" max="1000"':''}>`;
+  else ctl=`<input type="${m.type=='password'?'password':'text'}" id="${id}" value="${esc(v)}" autocomplete="off" ${m.type=='run'?'list="runList"':''}>`;
+  return `<div class="fld${o.wide?' wide':''}" data-k="${m.k}">${head}${ctl}<div class="err" id="e_${m.k}"></div>${m.type=='run'?'<small class="mut" id="runInfo"></small>':''}</div>`;
+}
+function sectionHtml([id,title,keys],c){
+  const ms=keys.map(meta), main=ms.filter(m=>!m.o.more), more=ms.filter(m=>m.o.more);
+  const groups=list=>{ if(id!='rew') return `<div class="fg">${list.map(m=>fieldHtml(m,c)).join('')}</div>`;
+    const gs=[...new Set(list.map(m=>m.o.group))]; return gs.map(g=>`<div class="sub2">${esc(g)}</div><div class="fg">${list.filter(m=>m.o.group==g).map(m=>fieldHtml(m,c)).join('')}</div>`).join('') };
+  const extra={rew:`<div class="acts" style="margin-bottom:6px"><button type="button" class="sm" id="bLean">Lean preset</button><button type="button" class="sm" id="bLs">Linesight preset</button><button type="button" class="sm" id="bReset">Reset weights</button><span class="mut" id="preMsg"></span></div>`,
+    cars:`<div class="flex" style="margin-top:10px"><span class="mut">Not sure how many cars? The benchmark tries 6/8/10/12.</span><button type="button" class="sm" id="bBench2">Benchmark cars</button></div>`,
+    note:`<div class="flex" style="margin-top:10px"><span class="mut" id="dcMsg"></span><button type="button" class="sm" id="bDc">Send test</button></div>`}[id]||'';
+  const nl=ms.filter(isLive).length, when=nl==ms.length?'all changes apply live (next lap)':nl?'apply at the next Start · <span class="tag live">live</span> = next lap':'changes apply at the next Start';
+  return `<section class="card sc" id="s_${id}" aria-labelledby="h_${id}"><div class="ch"><h3 id="h_${id}">${esc(title)} <small>${when}</small></h3><button type="button" class="link" data-rs="${id}">Reset section</button></div>
+    ${id=='rew'?extra:''}${groups(main)}${more.length?`<details class="more"><summary>More (${more.length})</summary>${groups(more)}</details>`:''}${id!='rew'?extra:''}</section>`;
+}
+function fillForm(c){
+  $('form').innerHTML=SECTIONS.map(s=>sectionHtml(s,c)).join('');
+  $('snav').innerHTML=SECTIONS.map(([id,t])=>`<button type="button" data-go="${id}"><span>${esc(t)}</span><span class="n" id="n_${id}"></span></button>`).join('');
+  $('secSel').innerHTML=SECTIONS.map(([id,t])=>`<option value="${id}">${esc(t)}</option>`).join('');
+  for(const b of document.querySelectorAll('[data-go]')) b.onclick=()=>goSec(b.dataset.go);
+  $('secSel').onchange=()=>goSec($('secSel').value);
+  for(const b of document.querySelectorAll('[data-rs]')) b.onclick=()=>resetSection(b.dataset.rs);
+  setPool(c.map_pool||[]); $('poolAdd').onclick=()=>{addPoolRow({map:'',pb_file:'',pb_seconds:0}); onEdit()};
+  if(!$('form').dataset.l){ $('form').addEventListener('input',onEdit); $('form').addEventListener('change',onEdit); $('form').dataset.l=1 }
+  $('f_algo').addEventListener('change',iqnUi); iqnUi();
+  $('f_map').addEventListener('change',()=>{const m=$('f_map').value.trim().toLowerCase(), r=RUNS.find(x=>(x.map||'').toLowerCase()==m);
+    if(r){$('f_run').value=r.name; runInfo(); onEdit()}});
+  $('f_run').addEventListener('input',runInfo); runInfo();
+  $('bLean').onclick=()=>preset(LEAN,'Lean preset filled in - press Save.');
+  $('bLs').onclick=()=>preset(LINES,'Linesight preset filled in - press Save.');
+  $('bReset').onclick=()=>preset(Object.fromEntries(WMETA.map(m=>[m.k,m.default])),'Default weights filled in - press Save.');
+  $('bBench2').onclick=()=>$('bBench').click();
+  $('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('dcMsg').textContent=j.message};
+  onEdit(); search();
+}
+function goSec(id){ const e=$('s_'+id); if(!e) return; e.scrollIntoView({behavior:'smooth',block:'start'});
+  for(const b of document.querySelectorAll('[data-go]')) b.classList.toggle('on',b.dataset.go==id); $('secSel').value=id;
+  const f=e.querySelector('input:not([type=hidden]),select'); if(f) f.focus({preventScroll:true}) }
+function iqnUi(){ const on=$('f_algo').value=='iqn'; for(const k in F) if(F[k][3]&&F[k][3].iqn){const e=document.querySelector(`.fld[data-k="${k}"]`); if(e) e.classList.toggle('hide',!on)} }
+function preset(vals,msg){ for(const m of WMETA) $('f_'+m.k).value=vals[m.k]??0; $('preMsg').textContent=msg; onEdit() }
+// map pool table
+function addPoolRow(e){ const tr=document.createElement('tr'); const n=$('poolT').rows.length;
+  tr.innerHTML=`<td><input type="text" aria-label="Map ${n} path" value="${esc(e.map)}" placeholder="map path"></td><td><input type="text" aria-label="Map ${n} PB file" value="${esc(e.pb_file||'')}" placeholder="PB file (optional)"></td>`+
+    `<td style="width:110px"><input type="number" aria-label="Map ${n} PB seconds" value="${e.pb_seconds||''}" min="0" max="3600" step="any" placeholder="PB s"></td><td style="width:40px"><button type="button" class="sm" aria-label="Remove map ${n}">✕</button></td>`;
+  tr.querySelector('button').onclick=()=>{tr.remove(); onEdit()}; $('poolT').appendChild(tr) }
+function setPool(list){ $('poolT').innerHTML='<tr><th>Map path</th><th>PB file</th><th>PB s</th><th></th></tr>'; for(const e of list) addPoolRow(e) }
+function readPool(){ return [...$('poolT').rows].slice(1).map(r=>{const i=r.querySelectorAll('input');return {map:i[0].value.trim(),pb_file:i[1].value.trim(),pb_seconds:parseFloat(i[2].value)||0}}).filter(e=>e.map) }
+function valOf(k){ const m=meta(k), e=$('f_'+k); if(m.type=='pool') return readPool(); if(m.type=='checkbox') return e.checked; return e.value }
+function readForm(){ const o={}; for(const k in DEF) o[k]=(meta(k).type=='pool'||$('f_'+k))?valOf(k):BASE[k]; return o }
+function norm(k,v){ const d=DEF[k]; if(typeof d=='number') return v===''||v==null?'':Number(v); if(typeof d=='boolean') return !!v; if(Array.isArray(d)) return JSON.stringify(v||[]); return String(v??'') }
+function validate(k){ const m=meta(k), e=$('f_'+k); if(!e||!(m.type=='number'||m.type=='w')) return '';
+  const s=e.value.trim(), x=Number(s), o=m.o, lo=m.type=='w'?-1000:o.min, hi=m.type=='w'?1000:o.max;
+  let msg=''; if(s===''||!isFinite(x)) msg='Enter a number'; else if(lo!=null&&x<lo) msg=`At least ${lo}`; else if(hi!=null&&x>hi) msg=`At most ${hi}`;
+  else if(o.step===1&&!Number.isInteger(x)) msg='Whole number';
+  e.classList.toggle('bad',!!msg); e.setAttribute('aria-invalid',msg?'true':'false'); $('e_'+k).textContent=msg; return msg }
+function onEdit(){
+  BAD=new Set(); let dirty=false; const cnt={};
+  for(const [id,,keys] of SECTIONS){ cnt[id]=0; for(const k of keys){ if(!$('f_'+k)&&meta(k).type!='pool') continue;
+    const v=valOf(k); if(validate(k)) BAD.add(k);
+    if(norm(k,v)!==norm(k,BASE[k])&&!(k=='github_token'&&v=='********')) dirty=true;
+    const dd=$('d_'+k); if(dd){ const ch=norm(k,v)!==norm(k,DEF[k])&&!(k=='github_token'&&(v==''||v=='********')); dd.classList.toggle('on',ch); if(ch) cnt[id]++ } } }
+  for(const id in cnt){ const n=$('n_'+id); if(n) n.textContent=cnt[id]?cnt[id]:''; n&&(n.title=cnt[id]+' changed from default') }
+  DIRTY=dirty; const bar=$('saveBar'); bar.classList.toggle('dirty',dirty);
+  $('saved').textContent=BAD.size?`${BAD.size} field${BAD.size>1?'s':''} invalid - fix to save`:dirty?'Unsaved changes':'No unsaved changes';
+  $('bSave').disabled=!dirty||BAD.size>0; $('bDiscard').disabled=!dirty }
+function resetSection(id){ const s=SECTIONS.find(x=>x[0]==id); for(const k of s[2]){ const m=meta(k), e=$('f_'+k); if(k=='run'||k=='reward_v'||k=='github_token') continue;
+    if(m.type=='pool') setPool(DEF[k]||[]); else if(m.type=='checkbox') e.checked=!!DEF[k]; else if(e) e.value=DEF[k] } iqnUi(); onEdit() }
+function search(){ const q=$('sSearch').value.trim().toLowerCase();
+  for(const [id,,keys] of SECTIONS){ let any=false; const sc=$('s_'+id);
+    for(const k of keys){ const m=meta(k), el=sc.querySelector(`.fld[data-k="${k}"]`); if(!el) continue; const lab=el.querySelector('label[data-t]');
+      const hit=!q||[m.label,k,hintOf(m)].some(t=>String(t).toLowerCase().includes(q));
+      el.style.display=hit?'':'none'; if(hit&&!el.classList.contains('hide')) any=true;
+      const t=lab.dataset.t, i=q?t.toLowerCase().indexOf(q):-1;
+      lab.innerHTML=i<0?esc(t):esc(t.slice(0,i))+'<mark>'+esc(t.slice(i,i+q.length))+'</mark>'+esc(t.slice(i+q.length));
+      if(q&&hit){ const d=el.closest('details'); if(d) d.open=true } }
+    sc.classList.toggle('nomatch',!!q&&!any) } }
+async function saveSettings(){ if(BAD.size) return false;
+  const body=readForm(); const r=await fetch('/api/config',{method:'POST',body:JSON.stringify(body)});
+  if(r.status>=400){ $('saved').textContent='Save failed'; return false }
+  const s=await (await fetch('/api/state')).json(); BASE=s.config; fillForm(BASE); $('saved').textContent='Saved.'; setTimeout(onEdit,1500); return true }
+function discard(){ fillForm(BASE) }
+$('bSave').onclick=saveSettings; $('bDiscard').onclick=discard; $('sSearch').oninput=search;
+
 let RUNS=[];
+const _x=0;
 const runKey=n=>String(n).toLowerCase().replace(/[^a-z0-9]/g,'');
 function runLabel(r){ return [r.map_name||'map not recorded yet', r.champion_ms?'champion '+(r.champion_ms/1000).toFixed(3)+' s':'no champion', (r.steps||0).toLocaleString()+' steps', r.last?'trained '+new Date(r.last*1000).toLocaleString():''].filter(Boolean).join(' · ') }
 function runInfo(){ const e=$('runInfo'); if(!e||!$('f_run')) return; const r=RUNS.find(x=>runKey(x.name)==runKey($('f_run').value));
   e.textContent=r?(r.name!=$('f_run').value.trim()?`= existing run "${r.name}": `:'existing run: ')+runLabel(r):'new run (starts from scratch unless a run of this map exists)' }
-function readPool(txt){ return txt.split('\n').map(l=>l.split('|').map(x=>x.trim())).filter(p=>p[0]).map(p=>({map:p[0],pb_file:p[1]||'',pb_seconds:parseFloat(p[2])||0})) }
-function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); o[k]=t=='checkbox'?e.checked:t=='pool'?readPool(e.value):e.value}
-  for(const m of WMETA) o[m.k]=$('f_'+m.k).value; return o }
 async function post(p,b){ const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}); const j=await r.json(); if(r.status>=400) alert(j.message); setTimeout(tick,300) }
-$('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
+$('bOpen').onclick=()=>post('/api/open');
 $('bStart').onclick=()=>startTraining(false);
 async function startTraining(fresh){
   const r=await fetch('/api/start',{method:'POST',body:JSON.stringify({new:fresh})}); const j=await r.json();
@@ -175,13 +390,20 @@ function showChoice(j){
     $('modal').classList.add('hide'); startTraining(false) };
   $('mNew').onclick=()=>{ $('modal').classList.add('hide'); startTraining(true) };
   $('mCancel').onclick=()=>$('modal').classList.add('hide') } $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
-$('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
-$('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
-$('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
-$('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('saved').textContent=j.message};
-$('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
-const VIEWS={n1:'dash',n2:'set',n3:'hubv'};
-for(const n in VIEWS) $(n).onclick=()=>{for(const m in VIEWS){$(m).className=m==n?'on':''; $(VIEWS[m]).className=m==n?'':'hide'} if(n=='n3') loadHub(false)};
+const VIEWS={n1:'dash',n2:'set',n3:'hubv'}; let VIEW='n1', PENDING=null;
+function show(n){ VIEW=n; for(const m in VIEWS){$(m).className=m==n?'on':''; $(m).setAttribute('aria-current',m==n?'page':'false'); $(VIEWS[m]).classList.toggle('hide',m!=n)}
+  $('saveBar').classList.toggle('hide',n!='n2'); if(n=='n3') loadHub(false); if(n!='n2') tick() }
+for(const n in VIEWS) $(n).onclick=()=>{ if(VIEW=='n2'&&n!='n2'&&DIRTY){ PENDING=n; $('leave').classList.remove('hide'); $('lvStay').focus(); return } show(n) };
+$('lvSave').onclick=async()=>{ if(await saveSettings()){ $('leave').classList.add('hide'); show(PENDING) } };
+$('lvDrop').onclick=()=>{ discard(); $('leave').classList.add('hide'); show(PENDING) };
+$('lvStay').onclick=()=>$('leave').classList.add('hide');
+// collapsible dashboard cards (remembered per browser)
+const CLOSED=new Set(store.get('closed',[]));
+for(const c of document.querySelectorAll('#dash .card[data-c]')){ const h=c.querySelector('.ch'); const b=document.createElement('button');
+  b.className='tog'; b.type='button'; const set=()=>{const cl=CLOSED.has(c.dataset.c); c.classList.toggle('closed',cl); b.textContent=cl?'▸':'▾'; b.setAttribute('aria-expanded',String(!cl));
+    b.setAttribute('aria-label',(cl?'Expand ':'Collapse ')+h.textContent.trim())};
+  b.onclick=()=>{ CLOSED.has(c.dataset.c)?CLOSED.delete(c.dataset.c):CLOSED.add(c.dataset.c); store.set('closed',[...CLOSED]); set(); tick() };
+  h.prepend(b); set() }
 
 const TCOL={tick:['#3b8bea','TICK (game physics)'],obs:['#39c46a','building inputs'],env:['#e8a33a','rewards / rules'],wait:['#8b93a0','waiting for an action']};
 let HUB=null;
@@ -294,7 +516,8 @@ let S_LAST=null;
 function hitTxt(s){ const h=s&&s.hit_ramp; if(!h||!s.config.w_hit) return '';
   return `Wall-hit penalty at <b>${Math.round(h.factor*100)}%</b> ${h.on===false?'(ramp off)':h.reached?'(reached 60% finished: stays at 100%)':`(finish rate ${Math.round(h.rate*100)}% of the last 100 laps; 100% from 60%)`}<br>` }
 function render(s){ S_LAST=s;
-  const c=s.config; if(!cfgLoaded){fillForm(c,s.weights);cfgLoaded=true} LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
+  const c=s.config; LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
+  if(!cfgLoaded){ DEF=s.defaults||{}; WMETA=s.weights||[]; BASE=c; fillForm(c); cfgLoaded=true }
   drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
   const run=s.state=='running'||s.state=='playing';

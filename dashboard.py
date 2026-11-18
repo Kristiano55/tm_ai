@@ -336,6 +336,7 @@ def build_state():
                for k in sorted({k for r in S.rbs[-5:] for k in r})},
         "ends": S.ends[-1500:], "track": track_outline(rd), "lean": cfgmod.LEAN, "linesight": cfgmod.LINESIGHT,
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
+        "defaults": {**cfgmod.DEFAULTS, "github_token": ""},
         "best_run": read_json(rd / "best_run.json") or None,
         "last_play": read_json(rd / "play_result.json") or None,
         "prof": S.prof, "bench": read_json(rd / "bench.json") or None,

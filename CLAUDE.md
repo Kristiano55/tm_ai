@@ -226,6 +226,13 @@ verify incl. a faked time, benchmark). The fake game records real inputs (`expor
 - File writes that other processes read are atomic (`write_json`, `save_npy` -> tmp + `os.replace`).
 - Errors from TICK (`TransportError`) reconnect and end the lap; file trouble must never stop training.
 - Dashboard: no external JS libs, dark theme, labels in plain language with defaults shown.
+- Settings page is driven by ONE table in dashboard.html: `F` (key -> [short label, help, type, {min,max,step,opts,
+  more,live,wide,group,iqn}]) and `SECTIONS` (order of sections + their keys). A new config key needs an entry in
+  both (weights: type 'w', help comes from config.WEIGHTS). Help = "?" tooltip (with default + live/at start);
+  `more` = under "More"; `live` = picked up by running cars (weights, ghost window, cut-behind). Search, changed-
+  from-default dots, Reset section, validation, the sticky Save/Discard bar and the leave-with-unsaved banner all
+  read that table. /api/state sends `defaults`. Dashboard cards collapse (localStorage `tmai.closed`).
+  Check: every DEFAULTS key once in F and in one section; Save round trip (see the test notes in git history).
 - Commit messages end with the Co-Authored-By line; the GitHub repo is public (Kristiano55/tm_ai).
 
 ## Open ideas / backlog
