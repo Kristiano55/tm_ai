@@ -62,6 +62,7 @@ DEFAULTS = {
     "github_user": "",         # your GitHub name (pack author / verifier)
     "github_token": "",        # optional, for direct release uploads; empty = the browser does it (nothing stored)
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
+    "analog_steer": True,      # PPO: steering is one analog value -127..127 instead of 21 levels (IQN keeps levels)
     "gas_brake": True,         # PPO: 4th throttle mode = gas + brake held together (IQN keeps 3 modes)
     "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
     "aux_weight": 0.05,        # PPO: auxiliary heads (wall hit soon, time to next CP, wheels grounded), training only

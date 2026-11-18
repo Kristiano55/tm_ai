@@ -125,7 +125,17 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
 
 ## Key design decisions (and why)
-- **Actions:** 21 progressive steering levels (fine near centre) x {gas, coast, brake, gas+brake} (`gas_brake`,
+- **Analog steering** (`analog_steer`, default true, PPO only; IQN prints "Analog steering is PPO-only" and keeps
+  levels): action = Box [steer -1..1, mode]; `AnalogPolicy` (ppo_ext) + `HybridDist`: Categorical mode x tanh-Gaussian
+  steer (log_prob with tanh correction, |a| clamped 0.999 = still 127). Steer mean u = atanh(sum softmax(level logits /
+  0.01) x level/127) + `steer_res` (init 0), so action_net keeps the 21+modes layout and old runs convert by copy
+  (fake run: identical deterministic lap). Learnable `log_std` from 6/127, capped by the `decay_steps` halving (min
+  10 %); upd events log `sstd` (dashboard). Sent/exported steer = round(a x 127) (`steer_value`). levels.json
+  `policy` "analog1" (off -> "priv1", converts back). SIL stores float actions (`analog` flag in sil.npz, old
+  level indices converted on load). `run_episode` drives the way the model was trained; VecNormalize.load gets the
+  current action space; IQN warm start maps an analog champion to the nearest level; packs store `analog` +
+  `steer_levels` in model.json.
+- **Actions (analog_steer off / IQN):** 21 progressive steering levels (fine near centre) x {gas, coast, brake, gas+brake} (`gas_brake`,
   PPO only; IQN keeps 3). `GAS`/`BRAKE` mode sets + `MODE_VEC` (last-action inputs: gas+brake = [1,0,1], layout
   unchanged) everywhere (steps, mid-start replays). Conversion: new logit = brake logit - 3 (same argmax); `ticks_per_step` 5 (50 ms)
   default, 3 (30 ms) possible. Per-step costs scale with `tf = ticks/5` so they mean the same per second.

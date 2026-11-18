@@ -47,7 +47,11 @@ def _policy_arrays(zip_path):
     m = PPO.load(str(zip_path), device="cpu")                # our own local file
     sd = m.policy.state_dict()
     arrays = {k.replace(".", "__"): v.detach().cpu().numpy().astype(np.float32) for k, v in sd.items()}
-    meta = {"obs_dim": int(m.observation_space.shape[0]), "nvec": [int(x) for x in m.action_space.nvec],
+    analog = not hasattr(m.action_space, "nvec")
+    lv = list(getattr(m.policy, "steer_levels", None) or T.STEER_LEVELS["progressive"].tolist())
+    nvec = [len(lv), T.n_modes_of(m.action_space)] if analog else [int(x) for x in m.action_space.nvec]
+    meta = {"obs_dim": int(m.observation_space.shape[0]), "nvec": nvec, "analog": analog,
+            "steer_levels": [int(x) for x in lv],
             "net_arch": {"pi": [256, 256], "vf": [256, 256]}, "keys": list(sd.keys()),
             "num_timesteps": int(m.num_timesteps)}
     return arrays, meta
@@ -163,13 +167,13 @@ def export_pack(cfg, source, out_dir, author="anonymous", wr=None, note=""):
 class _SpacesEnv:
     """Spaces only, to build a local SB3 model for the pack's weights (no game, nothing else)."""
 
-    def __init__(self, dim, nvec):
+    def __init__(self, dim, nvec, analog=False):
         import gymnasium as gym
         from gymnasium import spaces
 
         class E(gym.Env):
             observation_space = spaces.Box(-10.0, 10.0, (dim,), np.float32)
-            action_space = spaces.MultiDiscrete(nvec)
+            action_space = T.action_space(nvec, analog)
 
             def reset(self, *, seed=None, options=None):
                 return np.zeros(dim, np.float32), {}
@@ -218,8 +222,9 @@ def build_model(man, files):
         raise pc.PackError("unsupported network layout")
     if mm["obs_dim"] != T.TMEnv.N_BASE + 41 + T.N_PRIV:
         raise pc.PackError("observation size does not match this version")
-    env = DummyVecEnv([_SpacesEnv(mm["obs_dim"], mm["nvec"]).cls])
-    model = T.make_model(env)
+    analog = bool(mm.get("analog"))
+    env = DummyVecEnv([_SpacesEnv(mm["obs_dim"], mm["nvec"], analog).cls])
+    model = T.make_model(env, mm.get("steer_levels"))
     sd = model.policy.state_dict()
     with np.load(io.BytesIO(files["model.npz"]), allow_pickle=False) as z:
         arrays = {k.replace("__", "."): z[k] for k in z.files}
@@ -253,7 +258,8 @@ def import_pack(path, dest, expect_sha256=None, expect_size=None, as_base=False)
         model.save(str(dest / "champion"))
     T.write_json(dest / "levels.json", {"steer": mm.get("steer_levels") or T.STEER_LEVELS["progressive"].tolist(),
                                         "obs_base": T.TMEnv.N_BASE, "modes": int(mm["nvec"][1]),
-                                        "obs_dim": int(mm["obs_dim"]), "policy": "priv1"})
+                                        "obs_dim": int(mm["obs_dim"]),
+                                        "policy": "analog1" if mm.get("analog") else "priv1"})
     if "vecnorm.json" in files:
         from stable_baselines3.common.vec_env import VecNormalize
         v = json.loads(files["vecnorm.json"])

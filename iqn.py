@@ -553,7 +553,7 @@ def train(cfg):
             pend[i].pop(0)
 
     # optional warm start: the first ~50k steps are driven by a PPO run's champion
-    ppo, warm = None, cfg["iqn_warm_run"]
+    ppo, warm, ppo_analog = None, cfg["iqn_warm_run"], False
     if warm and int(ctr[0]) == 0:
         src = cfgmod.ROOT / "runs" / warm / "champion.zip"
         try:
@@ -561,6 +561,7 @@ def train(cfg):
             if not src.exists():
                 raise FileNotFoundError(f"no champion.zip in run '{warm}'")
             ppo = PPO.load(str(src), device="cpu")
+            ppo_analog = not hasattr(ppo.action_space, "nvec")
             if ppo.observation_space.shape != (dim,):
                 raise ValueError("that run uses a different input layout")
             T.say(f"Warm start: driving ~50k steps with the champion of PPO run '{warm}' into the replay memory ...")
@@ -576,6 +577,11 @@ def train(cfg):
                 T.say(f"Warm start done: {buf.n:,} experiences from the PPO champion.")
             else:
                 pa, _ = ppo.predict(obs_b, deterministic=True)
+                if ppo_analog:                               # analog PPO champion: nearest steering level
+                    lv = np.asarray(T.STEER_LEVELS[cfg["steer_mode"]], np.float64)
+                    pa = np.stack([np.abs(pa[:, :1] * 127.0 - lv[None]).argmin(1),
+                                   np.clip(np.round(pa[:, 1]), 0, nvec[1] - 1)], 1).astype(np.int64)
+                pa = np.minimum(pa, np.asarray(nvec) - 1)
                 rnd = rng.random(len(pa)) < 0.1
                 pa[rnd] = np.stack([rng.integers(nvec[0], size=rnd.sum()), rng.integers(nvec[1], size=rnd.sum())], 1)
                 return pa[:, 0] * nvec[1] + pa[:, 1]

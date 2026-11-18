@@ -41,6 +41,82 @@ class PrivPolicy(ActorCriticPolicy):
         self.aux_head = nn.Linear(self.mlp_extractor.latent_dim_pi, 3)     # hit / grounded logits, CP time
 
 
+STEER_T = 0.01                      # temperature of the level-expectation steer mean (low: matches the old argmax)
+A_MAX = 0.999                       # |tanh| limit of steer mean and log_prob (0.999 x 127 still rounds to 127)
+STEER_STD0 = 6.0 / 127.0            # starting steer exploration (std after tanh, near the centre)
+
+
+class HybridDist:
+    """Action [steer, mode]: steer in [-1, 1] = tanh(Gaussian u) (x127 -> TM steering), mode = Categorical.
+    log_prob includes the tanh correction; entropy = Categorical + Gaussian (of u)."""
+    EPS = 1e-6
+
+    def __init__(self, logits, mu, log_std):
+        self.cat = th.distributions.Categorical(logits=logits)
+        self.mu, self.std = mu, log_std.exp().expand_as(mu)
+        self.normal = th.distributions.Normal(mu, self.std)
+
+    def log_prob(self, actions):
+        a = actions[..., 0].clamp(-A_MAX, A_MAX)           # full lock (+-127) = the mean's own limit
+        u = th.atanh(a)
+        lp = self.normal.log_prob(u) - th.log(1 - a * a + self.EPS)
+        return lp + self.cat.log_prob(actions[..., 1].round().long().clamp(0, self.cat.logits.shape[-1] - 1))
+
+    def entropy(self):
+        return self.cat.entropy() + self.normal.entropy()
+
+    def sample(self):
+        return th.stack([th.tanh(self.normal.rsample()), self.cat.sample().float()], -1)
+
+    def mode(self):
+        return th.stack([th.round(th.tanh(self.mu) * 127.0) / 127.0, self.cat.probs.argmax(-1).float()], -1)
+
+    def get_actions(self, deterministic=False):
+        return self.mode() if deterministic else self.sample()
+
+
+class AnalogPolicy(PrivPolicy):
+    """PrivPolicy with analog steering. action_net keeps the discrete layout (steer-level logits + mode logits),
+    so old runs convert by plain copy: steer mean u = atanh(sum softmax(level logits / T) * level / 127) + steer_res,
+    steer_res starts at 0 (= the old argmax). Learnable log_std, capped by the exploration decay."""
+
+    def __init__(self, *a, steer_levels=None, **k):
+        self.steer_levels = list(steer_levels or [])
+        super().__init__(*a, **k)
+
+    def _build(self, lr_schedule):
+        super()._build(lr_schedule)
+        n_lv, n_modes = len(self.steer_levels), int(round(float(self.action_space.high[1]))) + 1
+        lat = self.mlp_extractor.latent_dim_pi
+        self.action_net = nn.Linear(lat, n_lv + n_modes)
+        nn.init.orthogonal_(self.action_net.weight, gain=0.01)
+        nn.init.zeros_(self.action_net.bias)
+        self.steer_res = nn.Linear(lat, 1)
+        nn.init.zeros_(self.steer_res.weight)
+        nn.init.zeros_(self.steer_res.bias)
+        self.log_std = nn.Parameter(th.tensor([float(np.log(STEER_STD0))]))
+        self.register_buffer("lv", th.tensor(np.asarray(self.steer_levels, np.float32) / 127.0))
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+    def _get_action_dist_from_latent(self, latent_pi):
+        out = self.action_net(latent_pi)
+        n_lv = len(self.steer_levels)
+        e = (th.softmax(out[..., :n_lv] / STEER_T, -1) * self.lv).sum(-1).clamp(-A_MAX, A_MAX)
+        mu = th.atanh(e) + self.steer_res(latent_pi)[..., 0]
+        return HybridDist(out[..., n_lv:], mu, self.log_std)
+
+    def _predict(self, observation, deterministic=False):
+        return self.get_distribution(observation).get_actions(deterministic=deterministic)
+
+    def _get_constructor_parameters(self):
+        d = super()._get_constructor_parameters()
+        d["steer_levels"] = self.steer_levels
+        return d
+
+    def steer_std(self):
+        return float(self.log_std.detach().exp()) * 127.0
+
+
 def aux_labels(rows, starts, ticks_per_step):
     """rows [T, E, 4] = (wall hit, grounded, race tick, checkpoints) after each step; starts [T, E] = the obs is a
     new episode's first. Returns y [T, E, 3] and mask [T, E, 3] (CP time only where the next CP is in sight)."""
@@ -75,14 +151,15 @@ class SILBuffer:
     """Top laps per map (fastest first). Raw (unscaled) rewards: returns are scaled with the CURRENT reward scaling
     at training time, so old laps stay on the same scale as the value net."""
 
-    def __init__(self):
+    def __init__(self, analog=False, levels=None):
+        self.analog, self.levels = analog, np.asarray(levels if levels is not None else [], np.float64)
         self.laps = {}                                            # map key -> [(ms, obs f16 [T,D], act [T,2], rew [T])]
 
     def add(self, key, ms, obs, act, rew):
         L = self.laps.setdefault(key or "", [])
         if len(L) >= SIL_LAPS and ms >= L[-1][0]:
             return False
-        L.append((int(ms), np.asarray(obs, np.float16), np.asarray(act, np.int16), np.asarray(rew, np.float32)))
+        L.append((int(ms), np.asarray(obs, np.float16), np.asarray(act, np.float32 if self.analog else np.int16), np.asarray(rew, np.float32)))
         L.sort(key=lambda x: x[0])
         del L[SIL_LAPS:]
         return True
@@ -106,7 +183,7 @@ class SILBuffer:
             ret.append(G)
         O, A, R = np.concatenate(obs), np.concatenate(act), np.concatenate(ret)
         idx = np.random.randint(0, len(O), size=min(k, len(O)))
-        return O[idx].astype(np.float32), A[idx].astype(np.int64), R[idx]
+        return O[idx].astype(np.float32), A[idx].astype(np.float32 if self.analog else np.int64), R[idx]
 
     def save(self, path):
         keys, ms, lens, O, A, R = [], [], [], [], [], []
@@ -122,7 +199,7 @@ class SILBuffer:
             return
         tmp = f"{path}.tmp.npz"
         np.savez_compressed(tmp, keys=np.array(keys, dtype="U80"), ms=np.array(ms), lens=np.array(lens),
-                            obs=np.concatenate(O), act=np.concatenate(A), rew=np.concatenate(R))
+                            obs=np.concatenate(O), act=np.concatenate(A).astype(np.float32), analog=np.array(self.analog), rew=np.concatenate(R))
         import os
         os.replace(tmp, path)
 
@@ -131,9 +208,17 @@ class SILBuffer:
             with np.load(path, allow_pickle=False) as z:
                 if z["obs"].shape[1] != dim:
                     return False                                  # older input layout: start a new collection
+                act = np.asarray(z["act"], np.float64)
+                was = bool(z["analog"]) if "analog" in z.files else False
+                if len(self.levels) and was != self.analog:          # convert stored steering to the current kind
+                    act = act.copy()
+                    if self.analog:                                   # level index -> steer value / 127
+                        act[:, 0] = self.levels[np.clip(act[:, 0].astype(int), 0, len(self.levels) - 1)] / 127.0
+                    else:                                             # steer value -> nearest level
+                        act[:, 0] = np.abs(act[:, :1] * 127.0 - self.levels[None]).argmin(1)
                 i = 0
                 for k, m, n in zip(z["keys"], z["ms"], z["lens"]):
-                    self.add(str(k), int(m), z["obs"][i:i + n], z["act"][i:i + n], z["rew"][i:i + n])
+                    self.add(str(k), int(m), z["obs"][i:i + n], act[i:i + n], z["rew"][i:i + n])
                     i += int(n)
             return True
         except (OSError, ValueError, KeyError):

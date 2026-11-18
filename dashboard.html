@@ -253,6 +253,7 @@ const I={step:1}, F={
  iqn_mid_start_p:['PB/WR starts','Share of IQN laps that start along your PB/WR.','number',{min:0,max:1,step:'any',iqn:1}],
  iqn_rollback:['Rollback','IQN: roll back to the champion after bad tests.','checkbox',{iqn:1}],
  iqn_device:['Learner device','Auto = GPU if PyTorch has CUDA, else CPU.','select',{iqn:1,opts:[['auto','Auto'],['cpu','CPU'],['cuda','GPU (CUDA)']]}],
+ analog_steer:['Analog steering','PPO: steer anywhere from -127 to 127 (like a pad) instead of 21 fixed levels. Old runs convert and drive the same at first. Off = the 21 levels. IQN always uses levels.','checkbox'],
  gas_brake:['Gas + brake mode','PPO: a 4th throttle choice, gas and brake held together (drifts). Old runs convert: their driving stays the same at first. IQN ignores it.','checkbox'],
  sil_weight:['Self-imitation','PPO: learn again from the AI\'s own top-20 laps where they beat its current estimate. 0 = off.','number',{min:0,max:2,step:'any'}],
  aux_weight:['Aux heads','PPO: extra training targets (wall hit soon, time to next CP, wheels grounded). Training only. 0 = off.','number',{min:0,max:2,step:'any'}],
@@ -265,7 +266,7 @@ const SECTIONS=[
    'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
  ['line','Track & line',['line_refresh_s','mid_start_p','mid_start_every_s','sec_fallback','cut_behind_s']],
- ['learn','Learning (PPO)',['horizon_s','decay_steps','gas_brake','sil_weight','aux_weight']],
+ ['learn','Learning (PPO)',['horizon_s','decay_steps','analog_steer','gas_brake','sil_weight','aux_weight']],
  ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
  ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
  ['note','Notifications',['discord_webhook','discord_every_min']],
@@ -562,7 +563,8 @@ function render(s){ S_LAST=s;
   draw($('c3'),[{t:'l',p:s.v,c:'#3b8bea',w:1}],v=>v.toFixed(1));
   draw($('c4'),[{t:'l',p:s.vl,c:'#3b8bea',w:1}],v=>v.toFixed(3));
   const L=s.learn||{}; $('vlTxt').textContent=[L.aux!=null?`Aux heads loss ${L.aux.toFixed(3)}`:'',
-    L.sil!=null?`Self-imitation loss ${L.sil.toFixed(3)} (${Math.round((L.sil_act||0)*100)}% of samples better than expected, ${n0(L.sil_n)} steps of top laps)`:''].filter(Boolean).join(' · ');
+    L.sil!=null?`Self-imitation loss ${L.sil.toFixed(3)} (${Math.round((L.sil_act||0)*100)}% of samples better than expected, ${n0(L.sil_n)} steps of top laps)`:'',
+    L.sstd!=null?`Steering exploration ±${L.sstd.toFixed(1)} of 127`:''].filter(Boolean).join(' · ');
 }
 async function tick(){ try{ render(await (await fetch('/api/state')).json()) }catch(e){} }
 tick(); setInterval(tick,2000); addEventListener('resize',tick);

@@ -51,6 +51,20 @@ STEER_LEVELS = {
 _HANG = {"file": None, "pet": time.time(), "guard": None}
 
 
+def action_space(nvec, analog):
+    """PPO/IQN action space: MultiDiscrete [steer level, mode], or with analog steering Box [steer -1..1, mode]."""
+    if analog:
+        return spaces.Box(np.array([-1.0, 0.0], np.float32), np.array([1.0, nvec[1] - 1], np.float32), dtype=np.float32)
+    return spaces.MultiDiscrete(nvec)
+
+
+def steer_value(a0, levels, analog):
+    """Policy steering output -> TM steering -127..127 (integer)."""
+    if analog:
+        return int(np.clip(np.round(float(a0) * 127.0), -127, 127))
+    return int(levels[int(a0)])
+
+
 def _hang_file():
     """runs/<run>/hang.txt, opened once and kept open (faulthandler writes to it from C, even when Python hangs)."""
     if _HANG["file"] is None:
@@ -641,7 +655,10 @@ class TMEnv(gym.Env):
         self.max_ticks = int(cfg["max_lap_seconds"] * 100)
         # throttle: gas / coast / brake (+ gas+brake with gas_brake; PPO only, IQN keeps 3 modes)
         self.n_modes = 4 if (cfg.get("gas_brake", True) and not self.iqn) else 3
-        self.action_space = spaces.MultiDiscrete([len(self.STEER), self.n_modes])
+        # analog steering (PPO): action [steer -1..1, mode]; else [steer level, mode]
+        self.analog = bool(cfg.get("analog_steer", True)) and not self.iqn
+        self.nvec = [len(self.STEER), self.n_modes]
+        self.action_space = action_space(self.nvec, self.analog)
         self.priv = not self.iqn                     # privileged inputs for PPO's value net (after the lidar)
         self.pb_ms = float(cfg.get("pb_seconds") or 0) * 1000.0
         self.observation_space = spaces.Box(-10.0, 10.0, (self.N_BASE + len(self.lidar.rays)
@@ -1282,8 +1299,8 @@ class TMEnv(gym.Env):
 
     def step(self, action):
         watchdog()
-        si, mode = int(action[0]), int(action[1])
-        steer = int(self.STEER[si])
+        mode = int(np.clip(np.round(float(action[1])), 0, self.n_modes - 1))
+        steer = steer_value(action[0], self.STEER, self.analog)
         self.acts.append((steer, mode))
         c0 = time.perf_counter()
         try:
@@ -1498,8 +1515,8 @@ def car_worker(cfg, run_dir, conn, rot=None):
             cfg, run_dir = rot["maps"][idx]
         env = TMEnv(cfg, run_dir)
         obs, _ = env.reset()
-        conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.action_space.nvec],
-                   int(env.n_seg)))
+        conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.nvec],
+                   int(env.n_seg), bool(env.analog)))
         waited = 0.0
         while True:
             w0 = time.perf_counter()
@@ -1581,6 +1598,7 @@ class CarPool:
             self.close()
             raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
         self.dim, self.nvec, self.n_seg = m[2], m[3], m[4]
+        self.analog = bool(m[5]) if len(m) > 5 else False
         return m[1]
 
     def replace(self, i):
@@ -1658,7 +1676,7 @@ def make_pool_vecenv(cfg, run_dir, specs=None):
             self.n_seg = self.pool.n_seg
             self.render_mode = None
             obs_space = spaces.Box(-10.0, 10.0, (self.pool.dim,), np.float32)
-            VecEnv.__init__(self, cfg["envs"], obs_space, spaces.MultiDiscrete(self.pool.nvec))
+            VecEnv.__init__(self, cfg["envs"], obs_space, action_space(self.pool.nvec, self.pool.analog))
 
         def reset(self):
             return np.stack(self.cur)
@@ -1744,11 +1762,11 @@ def bench(cfg):
         pool = CarPool(dict(cfg, mid_start_p=0.0, iqn_mid_start_p=0.0, lidar_every=lidar_every), run_dir, n)
         try:
             for i in range(n):
-                pool.send(i, [rng.integers(8, 13), 0])
+                pool.send(i, [rng.uniform(-0.2, 0.2) if pool.analog else rng.integers(8, 13), 0])
             t0, warm = time.time(), True
             while True:
                 for i, *_ in pool.poll(1.0):
-                    pool.send(i, [rng.integers(8, 13), 0])
+                    pool.send(i, [rng.uniform(-0.2, 0.2) if pool.analog else rng.integers(8, 13), 0])
                 now = time.time()
                 if warm and now - t0 > min(5.0, secs / 5):           # skip the start-up seconds
                     pool.take_prof()
@@ -1792,6 +1810,7 @@ def run_episode(env, model, seed=None):
     import torch
     if seed is not None:
         torch.manual_seed(int(seed))
+    env.analog = isinstance(model.action_space, spaces.Box)    # drive the way the model was trained
     obs, _ = env.reset()
     done, info = False, {}
     while not done:
@@ -1811,8 +1830,14 @@ def set_gamma(cfg):
     return GAMMA[0]
 
 
-def make_model(env):
-    from ppo_ext import TMPPO, PrivPolicy
+def make_model(env, levels=None):
+    from ppo_ext import TMPPO, PrivPolicy, AnalogPolicy
+    if isinstance(env.action_space, spaces.Box):         # analog steering: the level logits feed the steer mean
+        lv = list(levels if levels is not None else STEER_LEVELS["progressive"].tolist())
+        return TMPPO(AnalogPolicy, env, device="cpu", verbose=0,
+                     n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
+                     learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,
+                     policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]), steer_levels=[int(x) for x in lv]))
     return TMPPO(PrivPolicy, env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
                n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
                learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
@@ -1890,6 +1915,10 @@ def transfer_policy(old, new, old_levels, new_levels, old_base=N_BASE0, new_base
     new.num_timesteps, new._n_updates = old.num_timesteps, old._n_updates
 
 
+def n_modes_of(space):
+    return int(space.high[1]) + 1 if isinstance(space, spaces.Box) else int(space.nvec[1])
+
+
 def migrate(run_dir, cfg, env):
     """If the steering levels or the observation layout changed since the checkpoints were saved,
     convert them (latest + champion) so training continues instead of starting over."""
@@ -1900,25 +1929,28 @@ def migrate(run_dir, cfg, env):
     old_levels = np.array(saved.get("steer", STEER_LEVELS["uniform"].tolist()))
     old_base = int(saved.get("obs_base", N_BASE0))
     same_levels = len(old_levels) == len(new_levels) and np.array_equal(old_levels, new_levels)
-    new_modes, new_dim = int(env.action_space.nvec[1]), int(env.observation_space.shape[0])
+    new_modes, new_dim = n_modes_of(env.action_space), int(env.observation_space.shape[0])
     old_modes, old_dim = int(saved.get("modes", 3)), int(saved.get("obs_dim", old_base + 41))
+    analog = isinstance(env.action_space, spaces.Box)
+    tag = "analog1" if analog else "priv1"           # analog1 = PrivPolicy + analog steering head (AnalogPolicy)
     if not same_levels or old_base != new_base or old_modes != new_modes or old_dim != new_dim \
-            or saved.get("policy") != "priv1":
+            or saved.get("policy") != tag:
         for name in ("latest", "champion"):
             p = run_dir / f"{name}.zip"
             if not p.exists():
                 continue
             try:
-                old, new = PPO.load(str(p), device="cpu"), make_model(env)
+                old, new = PPO.load(str(p), device="cpu"), make_model(env, new_levels)
                 transfer_policy(old, new, old_levels, new_levels, old_base, new_base)
                 new.save(str(run_dir / name))
                 say(f"Converted {name}.zip to the current layout (steering {len(old_levels)}->{len(new_levels)}, "
-                    f"throttle modes {old_modes}->{new_modes}, inputs {old_dim}->{new_dim}).")
+                    f"throttle modes {old_modes}->{new_modes}, inputs {old_dim}->{new_dim}, "
+                    f"steering {saved.get('policy') == 'analog1' and 'analog' or 'levels'}->{analog and 'analog' or 'levels'}).")
             except Exception as e:     # never load weights under the wrong layout
                 p.replace(run_dir / f"{name}.unconverted.zip")
                 say(f"Could not convert {name}.zip ({str(e)[:80]}); moved aside, starting fresh.")
     write_json(lv_file, {"steer": new_levels.tolist(), "obs_base": new_base, "modes": new_modes, "obs_dim": new_dim,
-                         "policy": "priv1"})
+                         "policy": tag})
 
 
 # --- champion tests, dashboard events, stop conditions ----------------------------------------
@@ -2140,6 +2172,13 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 f = 0.5 ** (self.model.num_timesteps / ds)
                 self.model.lr_schedule = get_schedule_fn(max(3e-4 * f, 3e-5))
                 self.model.ent_coef = max(0.005 * f, 0.0005)
+            pol = self.model.policy
+            if hasattr(pol, "steer_std"):                  # analog steering: exploration std decays with it
+                import torch
+                from ppo_ext import STEER_STD0
+                cap = float(np.log(STEER_STD0 * max(0.5 ** (self.model.num_timesteps / ds) if ds else 1.0, 0.1)))
+                with torch.no_grad():
+                    pol.log_std.clamp_(max=cap, min=float(np.log(0.2 / 127.0)))
             nv = self.model.logger.name_to_value
             if "train/value_loss" in nv:
                 steps = self.model.num_timesteps - self.steps0
@@ -2148,7 +2187,8 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                     ent=float(nv.get("train/entropy_loss", 0.0)), ev=float(nv.get("train/explained_variance", 0.0)),
                     speed=steps * cfg["ticks_per_step"] / 100.0 / max(time.time() - self.t0, 1e-6),
                     **{k2: round(float(nv[k1]), 5) for k1, k2 in (("train/aux_loss", "aux"), ("train/sil_loss", "sil"),
-                       ("train/sil_active", "sil_act"), ("train/sil_steps", "sil_n")) if k1 in nv})
+                       ("train/sil_active", "sil_act"), ("train/sil_steps", "sil_n")) if k1 in nv},
+                    **({"sstd": round(pol.steer_std(), 3)} if hasattr(pol, "steer_std") else {}))
                 self.save_all()
             if self.rb_steps:                                  # reward breakdown, per step, since the last update
                 per = {k: v / self.rb_steps for k, v in self.rb.items()}
@@ -2172,7 +2212,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 raw = vn.get_original_reward() if vn is not None else self.locals["rewards"]
                 obs, acts = self.model._last_obs, self.locals["actions"]
                 for i, (info, done) in enumerate(zip(infos, dones)):
-                    self.ep[i].append((obs[i].astype(np.float16), acts[i].astype(np.int16), float(raw[i])))
+                    self.ep[i].append((obs[i].astype(np.float16), acts[i].astype(np.float32), float(raw[i])))
                     if done:
                         if info.get("finished") and not info.get("mid") and not info.get("pool") and len(self.ep[i]) > 5:
                             o, a, r = zip(*self.ep[i])
@@ -2475,6 +2515,7 @@ def train(cfg):
         try:
             env = VecNormalize.load(str(vn_file), venv)
             env.training, env.gamma = True, GAMMA[0]
+            env.action_space = venv.action_space          # the pickle holds the old action space (steering kind)
             say("Loaded reward scaling (vecnorm.pkl)")
         except Exception:                       # input size changed: keep just the reward scale
             try:
@@ -2490,6 +2531,7 @@ def train(cfg):
     if env is None:
         env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA[0])
     migrate(run_dir, cfg, env)
+    analog = isinstance(env.action_space, spaces.Box)
 
     model, latest, champ_zip = None, run_dir / "latest.zip", run_dir / "champion.zip"
     notice, errs = None, []
@@ -2523,14 +2565,16 @@ def train(cfg):
     if notice:
         say("!" * 12 + " " + notice + " " + "!" * 12)
     if model is None:
-        model = make_model(env)
+        model = make_model(env, STEER_LEVELS[cfg["steer_mode"]])
     model.sil_weight, model.aux_weight = float(cfg["sil_weight"]), float(cfg["aux_weight"])
     model.ticks_per_step = cfg["ticks_per_step"]
     if model.sil_weight > 0:
-        model.sil = SILBuffer()
+        model.sil = SILBuffer(analog, STEER_LEVELS[cfg["steer_mode"]])
         if model.sil.load(str(run_dir / "sil.npz"), int(env.observation_space.shape[0])):
             say(f"Self-imitation memory: {sum(len(v) for v in model.sil.laps.values())} laps loaded")
-    say(f"PPO: {model.action_space.nvec[1]} throttle modes{' (gas+brake on)' if model.action_space.nvec[1] == 4 else ''}, "
+    nm = n_modes_of(model.action_space)
+    say(f"PPO: {'analog steering (-127..127), ' if analog else '21 steering levels, '}"
+        f"{nm} throttle modes{' (gas+brake on)' if nm == 4 else ''}, "
         f"self-imitation {model.sil_weight:g}, aux heads {model.aux_weight:g}, critic with {N_PRIV} extra inputs")
     if from_base:
         write_json(run_dir / "base.json", {**from_base, "base_steps": int(model.num_timesteps)})
@@ -2655,7 +2699,7 @@ def selftest(cfg):
     seen = {"wheel material": Counter(), "wheel gameplay": Counter(), "ray material": Counter()}
     ice = {}
     for _ in range(40):
-        o, r, term, trunc, info = env.step(np.array([10, 0]))              # straight, full gas
+        o, r, term, trunc, info = env.step(np.array([0.0, 0]) if env.analog else np.array([10, 0]))   # straight, full gas
         t = env._last_t
         for m in getattr(t.wheels, "material_id", []):
             seen["wheel material"][int(m)] += 1
@@ -2672,7 +2716,7 @@ def selftest(cfg):
                 ice[name] = max(ice.get(name, -1e9), _f(rt, name, float("nan")))
         if term or trunc:
             break
-    print("steering levels:", env.STEER.tolist())
+    print("steering:", "analog -127..127 (PPO)" if env.analog else env.STEER.tolist())
     print("route points:", len(env.route) - 1, "| route length: %.0f m" % env.lap_len,
           "| reference line:", "yes" if env.dense is not None else "not yet")
     print("local velocity m/s (expect z > 0, x ~ 0):", np.round(o[1:4] * 100, 2))
@@ -2771,6 +2815,8 @@ if __name__ == "__main__":
     if cfg["run_type"] == "base" and cfg["algo"] == "iqn":
         raise SystemExit("Base runs are PPO only: set the algorithm to PPO.")
     if cfg["algo"] == "iqn" and a.cmd in ("train", "drive"):
+        if cfg.get("analog_steer"):
+            say("Analog steering is PPO-only: IQN drives with the 21 steering levels.")
         import iqn
         {"train": iqn.train, "drive": iqn.drive}[a.cmd](cfg)
     else:
