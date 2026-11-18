@@ -62,6 +62,9 @@ DEFAULTS = {
     "github_user": "",         # your GitHub name (pack author / verifier)
     "github_token": "",        # optional, for direct release uploads; empty = the browser does it (nothing stored)
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
+    "gas_brake": True,         # PPO: 4th throttle mode = gas + brake held together (IQN keeps 3 modes)
+    "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
+    "aux_weight": 0.05,        # PPO: auxiliary heads (wall hit soon, time to next CP, wheels grounded), training only
     "w_hit_ramp": True,        # wall-hit penalty ramps in with the finish rate (25 % below 30 % finished, 100 % from 60 %)
     "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }

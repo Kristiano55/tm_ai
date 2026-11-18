@@ -27,7 +27,7 @@ import config as cfgmod
 import packcheck as pc
 import tm_ai as T
 
-CODE_VERSION = "2026.11.18"          # bump when the pack / input format changes; the hub lists compatible versions
+CODE_VERSION = "2026.11.19"          # bump when the pack / input format changes; the hub lists compatible versions
 PACK_EXT = ".tmbrain.zip"
 
 
@@ -37,7 +37,7 @@ def input_fingerprint(env_cls=None):
     spec = {"n_base0": T.N_BASE0, "extra": list(T.EXTRA_NAMES), "n_mem": E.N_MEM, "n_path": E.N_PATH,
             "n_diff": E.N_DIFF, "n_surf": T.N_SURF, "surf_rays": list(E.SURF_RAYS), "n_ice": E.N_ICE,
             "n_base": E.N_BASE, "look": list(E.LOOK), "preview": list(E.PREVIEW), "path3d": E.PATH3D,
-            "lidar": [32, 4, 5]}
+            "lidar": [32, 4, 5], "n_priv": T.N_PRIV, "policy": "priv1"}
     return pc.sha256_bytes(pc.canonical(spec).encode())[:16]
 
 
@@ -108,7 +108,7 @@ def export_pack(cfg, source, out_dir, author="anonymous", wr=None, note=""):
     arrays, mmeta = _policy_arrays(model_zip)
     lv = T.read_json(rd / "levels.json")
     mmeta.update(steer_levels=lv.get("steer"), obs_base=lv.get("obs_base"))
-    if mmeta["obs_base"] != T.TMEnv.N_BASE:
+    if mmeta["obs_base"] != T.TMEnv.N_BASE or lv.get("obs_dim") != T.TMEnv.N_BASE + 41 + T.N_PRIV:
         raise SystemExit("This run's model uses an older input layout: train it once with this version, then export.")
     files["model.npz"] = _npz_bytes(arrays)
     files["model.json"] = json.dumps(mmeta).encode()
@@ -216,7 +216,7 @@ def build_model(man, files):
     mm = json.loads(files["model.json"])
     if mm.get("net_arch") != {"pi": [256, 256], "vf": [256, 256]}:
         raise pc.PackError("unsupported network layout")
-    if mm["obs_dim"] != T.TMEnv.N_BASE + 41:
+    if mm["obs_dim"] != T.TMEnv.N_BASE + 41 + T.N_PRIV:
         raise pc.PackError("observation size does not match this version")
     env = DummyVecEnv([_SpacesEnv(mm["obs_dim"], mm["nvec"]).cls])
     model = T.make_model(env)
@@ -252,7 +252,8 @@ def import_pack(path, dest, expect_sha256=None, expect_size=None, as_base=False)
     if not as_base:
         model.save(str(dest / "champion"))
     T.write_json(dest / "levels.json", {"steer": mm.get("steer_levels") or T.STEER_LEVELS["progressive"].tolist(),
-                                        "obs_base": T.TMEnv.N_BASE})
+                                        "obs_base": T.TMEnv.N_BASE, "modes": int(mm["nvec"][1]),
+                                        "obs_dim": int(mm["obs_dim"]), "policy": "priv1"})
     if "vecnorm.json" in files:
         from stable_baselines3.common.vec_env import VecNormalize
         v = json.loads(files["vecnorm.json"])

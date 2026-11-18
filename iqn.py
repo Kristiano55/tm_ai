@@ -454,6 +454,9 @@ def train(cfg):
     if n_env + 3 > (os.cpu_count() or 1):
         T.say(f"Warning: {n_env} cars + learner + tester need ~{n_env + 3} CPU threads, this PC has "
               f"{os.cpu_count()}: fewer cars may run faster (try 'python tm_ai.py bench').")
+    if cfg.get("gas_brake", True) or cfg.get("sil_weight", 0) or cfg.get("aux_weight", 0):
+        T.say("IQN: gas+brake, self-imitation, the value-net-only inputs and the aux heads are PPO features; "
+              "IQN keeps its 3 throttle modes and inputs.")
     pool = T.CarPool(cfg, run_dir, n_env)                     # cars in their own processes, not in lock-step
     dim, nvec = pool.dim, pool.nvec
     n_act = int(nvec[0] * nvec[1])

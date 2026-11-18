@@ -325,6 +325,7 @@ def build_state():
         "notice": S.notice, "run_warnings": list(cfgmod.RUN_WARNINGS),
         "runs": runs_cached(), "run_folder": rd.name,
         "tests_total": len(S.tests), "promotions": sum(1 for t in S.tests if t["promoted"]),
+        "learn": {k: upd.get(k) for k in ("aux", "sil", "sil_act", "sil_n")},
         "updates": upd.get("u", 0), "steps": upd.get("steps", 0), "speed": upd.get("speed"),
         "laps": downsample([[n, s] for n, s in fin]),
         "tests": [{"lap_n": t["lap_n"], "ms": t["ms"], "champ_ms": t["champ_ms"],

@@ -12,6 +12,9 @@ _HANG=os.environ.get("TICKGYM_FAKE_HANG","")
 ASPHALT, DIRT = 16, 6
 def _mat(z): return DIRT if 600<=z<800 else ASPHALT
 def _gp(z): return 3 if 300<=z<320 else 0
+# TICKGYM_FAKE_CORNER=1: a "corner" for z 400..460: above 35 m/s the car is slowed to 35, unless gas AND brake are
+# held together (a drift), which keeps up to 60 m/s. So gas+brake is the fast way through it.
+CORNER=os.environ.get("TICKGYM_FAKE_CORNER")=="1"
 def _detour(): return _DET=="1" or (_DET not in ("","0") and os.path.exists(_DET))
 # TICKGYM_FAKE_MS=5: each step waits ~5 ms (random, like a busy TICK server); a raycast ~1 ms. Default 0 = instant.
 import time, random
@@ -72,18 +75,25 @@ class G:
     acc=True
     @property
     def next_tick(s): return s.tick
-    def reset(s,seed=0): s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.rec=[];return s.tel()
+    def reset(s,seed=0): s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];return s.tel()
     def step(s,ticks,actions=(),steer=None,accelerate=None,brake=None):
         for a in actions:
             if a.kind=='accel': s.acc=bool(a.value)
+            if a.kind=='brake': s.brk=bool(a.value)
         if accelerate is not None:
             if bool(accelerate)!=s.acc: s.rec.append(Action(s.tick,'accel',int(bool(accelerate))))   # what export() returns
             s.acc=bool(accelerate)
+        if brake is not None:
+            if bool(brake)!=getattr(s,'brk',False): s.rec.append(Action(s.tick,'brake',int(bool(brake))))
+            s.brk=bool(brake)
         accelerate=s.acc
         if _HANG and os.path.exists(_HANG):
             try: os.remove(_HANG); time.sleep(10**6)
             except FileNotFoundError: pass
-        _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),s.vmax); s.v=max(s.v,0); s.z+=s.v*ticks/100; return s.tel()
+        _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),s.vmax); s.v=max(s.v,0)
+        if getattr(s,'brk',False) and not accelerate: s.v=max(s.v-2,0)
+        if CORNER and 400<=s.z<460: s.v=min(s.v,60.0 if (accelerate and s.brk) else 35.0)
+        s.z+=s.v*ticks/100; return s.tel()
     def _scan(s,n,z):
         hit=[1 if 32<=i<36 else 0 for i in range(n)]
         return NS(hit=hit,distance=[2.0 if h else 0 for h in hit],material_id=[s.mat(z+20) if h else 0 for h in hit])

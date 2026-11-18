@@ -63,6 +63,11 @@ def _hang_file():
     return _HANG["file"]
 
 
+GAS, BRAKE = (0, 3), (2, 3)                      # throttle modes: 0 gas, 1 coast, 2 brake, 3 gas + brake
+MODE_VEC = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1]], dtype=np.float64)   # last-action inputs (gas, coast, brake)
+from ppo_ext import N_PRIV  # noqa: E402  (privileged critic inputs, appended after the lidar)
+
+
 def watchdog(seconds=90):
     """Re-armed while things move. If this process is stuck this long, all its threads' stacks go to hang.txt."""
     _HANG["pet"] = time.time()
@@ -634,8 +639,13 @@ class TMEnv(gym.Env):
 
         self.ticks = cfg["ticks_per_step"]
         self.max_ticks = int(cfg["max_lap_seconds"] * 100)
-        self.action_space = spaces.MultiDiscrete([len(self.STEER), 3])    # 3 = gas / coast / brake
-        self.observation_space = spaces.Box(-10.0, 10.0, (self.N_BASE + len(self.lidar.rays),), np.float32)
+        # throttle: gas / coast / brake (+ gas+brake with gas_brake; PPO only, IQN keeps 3 modes)
+        self.n_modes = 4 if (cfg.get("gas_brake", True) and not self.iqn) else 3
+        self.action_space = spaces.MultiDiscrete([len(self.STEER), self.n_modes])
+        self.priv = not self.iqn                     # privileged inputs for PPO's value net (after the lidar)
+        self.pb_ms = float(cfg.get("pb_seconds") or 0) * 1000.0
+        self.observation_space = spaces.Box(-10.0, 10.0, (self.N_BASE + len(self.lidar.rays)
+                                                          + (N_PRIV if self.priv else 0),), np.float32)
         self._last_obs = np.zeros(self.observation_space.shape, np.float32)
 
     # --- mid-track starts (curriculum) ----------------------------------------------------------
@@ -684,8 +694,8 @@ class TMEnv(gym.Env):
             else:
                 limit //= (2 if self.guide else 1)
             for i, (steer, mode) in enumerate(acts[:-self.mid_every // 2]):
-                t = self.g.step(self.ticks, steer=int(steer), accelerate=(mode == 0), brake=(mode == 2))
-                pa = np.concatenate([[steer / 127.0], np.eye(3)[int(mode)], pa[:4]])
+                t = self.g.step(self.ticks, steer=int(steer), accelerate=int(mode) in GAS, brake=int(mode) in BRAKE)
+                pa = np.concatenate([[steer / 127.0], MODE_VEC[int(mode)], pa[:4]])
                 if t.finished:
                     break
                 if (i + 1) % self.mid_every == 0 and len(self.starts) < limit:
@@ -1094,6 +1104,21 @@ class TMEnv(gym.Env):
         clear = float(np.clip((fwd - speed * 1.2) / (speed * 0.8 + 1.0), 0.0, 1.0))
         return straight * clear
 
+    def _privileged(self, s):
+        """Value-net-only inputs (the actor sees 0): ghost / PB time left, metres to the next checkpoint and to the
+        finish, gap to the ghost, failure rate of this section."""
+        tick = float(getattr(self, "_tick", 0))
+        length = self.dense[2][-1] if self.dense is not None else self.lap_len
+        g_left = 0.0
+        if self.prof is not None:
+            g_left = (self.prof[1][-1] - float(np.interp(s, self.prof[0], self.prof[1]))) / 100.0 / 60.0
+        pb_left = (self.pb_ms / 1000.0 - tick / 100.0) / 60.0 if self.pb_ms else 0.0
+        d_cp = 0.0
+        if self.cp_arc is not None and 0 <= self.taken < len(self.cp_arc):
+            d_cp = (float(self.cp_arc[self.taken]) - s) / 500.0
+        return [float(np.clip(g_left, -5, 5)), float(np.clip(pb_left, -5, 5)), float(np.clip(d_cp, -2, 5)),
+                float(np.clip((length - s) / 1000.0, -1, 10)), float(np.clip(self.phi / 5.0, -2, 2)), self._difficulty()]
+
     def _surface(self, t):
         """Surface inputs: per wheel material + gameplay surface (one-hot over the shared vocabulary), material of
         the road ahead seen by the downward / centre lidar rays, and the ice state. Gameplay + ice need RUNTIME
@@ -1191,6 +1216,8 @@ class TMEnv(gym.Env):
         f += list(self._surface(t))                                  # what the wheels are on, what is ahead, ice
         hit, dist = self._lid
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
+        if self.priv:
+            f += self._privileged(s)
         self._last_obs = np.clip(np.nan_to_num(np.asarray(f, dtype=np.float32)), -10, 10)
         return self._last_obs
 
@@ -1240,6 +1267,7 @@ class TMEnv(gym.Env):
             t = self.g.reset(seed=0)
         pos = np.asarray(t.vehicle.position, dtype=np.float64)
         tick = int(t.race.race_tick) if self.start_i is not None else 0
+        self._tick = tick
         self.di = 0
         self._s = self._global_progress(pos, self.taken) if self.start_i is not None else self._progress(pos, 0)
         self.phi = self._phi(self._s, tick)
@@ -1259,7 +1287,7 @@ class TMEnv(gym.Env):
         self.acts.append((steer, mode))
         c0 = time.perf_counter()
         try:
-            t = self.g.step(self.ticks, steer=steer, accelerate=(mode == 0), brake=(mode == 2))
+            t = self.g.step(self.ticks, steer=steer, accelerate=mode in GAS, brake=mode in BRAKE)
             self._read_lidar(t)
             c1 = time.perf_counter()
             self.tm["tick"] += c1 - c0                           # TICK round trips (step + any raycast)
@@ -1272,6 +1300,7 @@ class TMEnv(gym.Env):
         W, r = self.W, {}
         pos = np.asarray(t.vehicle.position, dtype=np.float64)
         taken, tick = int(t.race.checkpoints_taken), int(t.race.race_tick)
+        self._tick = tick
         s = self._progress(pos, taken)
         speed = float(t.vehicle.speed)
         dp = s - self._s                      # _s = progress already paid; a skipped stretch is paid at
@@ -1300,7 +1329,7 @@ class TMEnv(gym.Env):
             behind = float(np.clip(-phi / 0.3, 0.0, 1.0))
             r["guide"] = -W["w_guide"] * tf * min(d / 8.0, 1.0) * behind
         r["crash"] = -W["w_crash"] * max(0.0, self.prev_speed - speed - 3.0)    # sudden speed loss = wall hit
-        if mode == 2:
+        if mode in BRAKE:
             r["brake"] = -W["w_brake"] * tf
         elif mode == 1:
             r["coast"] = -W["w_coast"] * tf
@@ -1321,7 +1350,7 @@ class TMEnv(gym.Env):
         self.prev_speed = speed
         self._s = self._s + dp if s >= self._s else s
         self.pa_old = np.concatenate([self.pa[4:8], self.pa_old[:8]])
-        self.pa = np.concatenate([[steer / 127.0], np.eye(3)[mode], self.pa[:4]])
+        self.pa = np.concatenate([[steer / 127.0], MODE_VEC[mode], self.pa[:4]])
         prev_taken = self.hist[-1][4] if self.hist else taken
         self.hist.append([*pos, tick, taken])
         if self.sec_mode and taken < len(self.sec_mode) and self.sec_mode[taken] == "ai" and self.pb_dense is not None:
@@ -1390,6 +1419,8 @@ class TMEnv(gym.Env):
         self.tm["obs"] += c3 - c2
         self.tm["env"] += c2 - c1                                # rewards, progress, stuck rules
         self.tm["n"] += 1
+        info["aux"] = (float(_f(t.runtime, "wall_hit_this_step") if self.extra else 0.0) or float(r["crash"] < 0),
+                       float(np.any(np.asarray(t.wheels.contact, dtype=bool))), tick, taken)
         if terminated or truncated:
             info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
             info["tm"], self.tm = self.tm, {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}
@@ -1781,8 +1812,8 @@ def set_gamma(cfg):
 
 
 def make_model(env):
-    from stable_baselines3 import PPO
-    return PPO("MlpPolicy", env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
+    from ppo_ext import TMPPO, PrivPolicy
+    return TMPPO(PrivPolicy, env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
                n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
                learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
@@ -1847,7 +1878,14 @@ def transfer_policy(old, new, old_levels, new_levels, old_base=N_BASE0, new_base
         key = f"action_net.{part}"
         o = sd_old[key].cpu().numpy().astype(np.float64)
         steer = interp_rows(old_levels, o[:n_old], new_levels)
-        sd_new[key] = torch.tensor(np.concatenate([steer, o[n_old:]]), dtype=sd_new[key].dtype)
+        modes = o[n_old:]
+        m_new = int(sd_new[key].shape[0]) - len(new_levels)
+        if m_new > len(modes):                     # new gas+brake mode = the brake row, 3 lower: never the
+            extra = modes[2:3].copy()               # most likely mode, so the first actions stay identical
+            if part == "bias":
+                extra -= 3.0
+            modes = np.concatenate([modes, extra])
+        sd_new[key] = torch.tensor(np.concatenate([steer, modes[:m_new]]), dtype=sd_new[key].dtype)
     new.policy.load_state_dict(sd_new)
     new.num_timesteps, new._n_updates = old.num_timesteps, old._n_updates
 
@@ -1862,7 +1900,10 @@ def migrate(run_dir, cfg, env):
     old_levels = np.array(saved.get("steer", STEER_LEVELS["uniform"].tolist()))
     old_base = int(saved.get("obs_base", N_BASE0))
     same_levels = len(old_levels) == len(new_levels) and np.array_equal(old_levels, new_levels)
-    if not same_levels or old_base != new_base:
+    new_modes, new_dim = int(env.action_space.nvec[1]), int(env.observation_space.shape[0])
+    old_modes, old_dim = int(saved.get("modes", 3)), int(saved.get("obs_dim", old_base + 41))
+    if not same_levels or old_base != new_base or old_modes != new_modes or old_dim != new_dim \
+            or saved.get("policy") != "priv1":
         for name in ("latest", "champion"):
             p = run_dir / f"{name}.zip"
             if not p.exists():
@@ -1871,11 +1912,13 @@ def migrate(run_dir, cfg, env):
                 old, new = PPO.load(str(p), device="cpu"), make_model(env)
                 transfer_policy(old, new, old_levels, new_levels, old_base, new_base)
                 new.save(str(run_dir / name))
-                say(f"Converted {name}.zip to the current steering/observation layout.")
+                say(f"Converted {name}.zip to the current layout (steering {len(old_levels)}->{len(new_levels)}, "
+                    f"throttle modes {old_modes}->{new_modes}, inputs {old_dim}->{new_dim}).")
             except Exception as e:     # never load weights under the wrong layout
                 p.replace(run_dir / f"{name}.unconverted.zip")
                 say(f"Could not convert {name}.zip ({str(e)[:80]}); moved aside, starting fresh.")
-    write_json(lv_file, {"steer": new_levels.tolist(), "obs_base": new_base})
+    write_json(lv_file, {"steer": new_levels.tolist(), "obs_base": new_base, "modes": new_modes, "obs_dim": new_dim,
+                         "policy": "priv1"})
 
 
 # --- champion tests, dashboard events, stop conditions ----------------------------------------
@@ -2052,6 +2095,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
             self.trackers, self.stuckws = {}, {}
+            self.ep = [[] for _ in range(cfg["envs"])]       # self-imitation: the lap each car is driving
             self.ramps = {}                                  # wall-hit ramp per run folder (per map in base runs)
             self.finished_once = (run_dir / "best_run.json").exists() or bool(read_json(best_file).get("champion_ms"))
             freeze_guard(run_dir, seconds=max(180.0, 2.0 * time_budget(cfg) + 60.0))
@@ -2065,6 +2109,10 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
         def status(self, state, reason=""):
             write_json(status_file, {"state": state, "reason": reason, "pid": os.getpid(),
                                      "heartbeat": time.time(), "started": self.t0})
+
+        def _ret_scale(self):
+            vn = self.model.get_vec_normalize_env()
+            return 1.0 / float(np.sqrt(vn.ret_rms.var + vn.epsilon)) if vn is not None and vn.norm_reward else 1.0
 
         def _on_rollout_end(self):
             self.last_v = float(self.model.rollout_buffer.values.mean())
@@ -2083,6 +2131,10 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                     self.ema[k] = v.detach().clone()
 
         def _on_rollout_start(self):
+            self.model.aux_rows = []                        # aux-head labels of this rollout, one row per step
+            self.model.ret_scale = self._ret_scale()
+            vn = self.model.get_vec_normalize_env()
+            self.model.ret_clip = float(vn.clip_reward) if vn is not None else 10.0
             ds = cfg["decay_steps"]
             if ds:                                         # exploit more as training goes on
                 f = 0.5 ** (self.model.num_timesteps / ds)
@@ -2094,7 +2146,9 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 log(k="upd", u=int(self.model._n_updates), steps=int(self.model.num_timesteps),
                     v=self.last_v, vl=float(nv["train/value_loss"]),
                     ent=float(nv.get("train/entropy_loss", 0.0)), ev=float(nv.get("train/explained_variance", 0.0)),
-                    speed=steps * cfg["ticks_per_step"] / 100.0 / max(time.time() - self.t0, 1e-6))
+                    speed=steps * cfg["ticks_per_step"] / 100.0 / max(time.time() - self.t0, 1e-6),
+                    **{k2: round(float(nv[k1]), 5) for k1, k2 in (("train/aux_loss", "aux"), ("train/sil_loss", "sil"),
+                       ("train/sil_active", "sil_act"), ("train/sil_steps", "sil_n")) if k1 in nv})
                 self.save_all()
             if self.rb_steps:                                  # reward breakdown, per step, since the last update
                 per = {k: v / self.rb_steps for k, v in self.rb.items()}
@@ -2110,7 +2164,23 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 self.rb, self.rb_steps = {}, 0
 
         def _on_step(self):
-            for info, done in zip(self.locals["infos"], self.locals["dones"]):
+            infos, dones = self.locals["infos"], self.locals["dones"]
+            if self.model.aux_rows is not None:
+                self.model.aux_rows.append([list(i.get("aux") or (0.0, 0.0, 0, 0)) for i in infos])
+            if self.model.sil is not None and self.model.sil_weight > 0:
+                vn = self.model.get_vec_normalize_env()
+                raw = vn.get_original_reward() if vn is not None else self.locals["rewards"]
+                obs, acts = self.model._last_obs, self.locals["actions"]
+                for i, (info, done) in enumerate(zip(infos, dones)):
+                    self.ep[i].append((obs[i].astype(np.float16), acts[i].astype(np.int16), float(raw[i])))
+                    if done:
+                        if info.get("finished") and not info.get("mid") and not info.get("pool") and len(self.ep[i]) > 5:
+                            o, a, r = zip(*self.ep[i])
+                            if self.model.sil.add(info.get("map"), info["race_ms"], np.stack(o), np.stack(a), np.array(r)):
+                                say(f"Self-imitation: lap {info['race_ms'] / 1000:.3f} s kept"
+                                    + (f" ({info['map']})" if info.get("map") else ""))
+                        self.ep[i] = []
+            for info, done in zip(infos, dones):
                 if done:
                     fin, pool_lap = bool(info.get("finished")), bool(info.get("pool"))
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
@@ -2236,6 +2306,11 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
 
         def save_all(self):
             self.model.save(run_dir / "latest")
+            if self.model.sil is not None:
+                try:
+                    self.model.sil.save(str(run_dir / "sil.npz"))      # the run's own laps; never exported in packs
+                except OSError:
+                    pass
             vn = self.model.get_vec_normalize_env()
             if vn is not None:
                 vn.save(str(run_dir / "vecnorm.pkl"))
@@ -2372,7 +2447,8 @@ def setup_cars(cfg, run_dir, pnorm):
 
 def train(cfg):
     import torch
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO  # noqa: F401
+    from ppo_ext import TMPPO, SILBuffer
     from stable_baselines3.common.vec_env import VecNormalize
 
     run_dir = cfgmod.run_dir(cfg)
@@ -2425,7 +2501,7 @@ def train(cfg):
             if not src.exists():
                 continue
             try:
-                model = PPO.load(str(src), env=env, device="cpu")
+                model = TMPPO.load(str(src), env=env, device="cpu")
                 model.target_kl = 0.02
                 model.gamma = model.rollout_buffer.gamma = GAMMA[0]
                 say(f"Planning horizon {cfg['horizon_s']:.0f} s -> gamma {GAMMA[0]:.4f} at {cfg['ticks_per_step'] * 10} ms")
@@ -2448,6 +2524,14 @@ def train(cfg):
         say("!" * 12 + " " + notice + " " + "!" * 12)
     if model is None:
         model = make_model(env)
+    model.sil_weight, model.aux_weight = float(cfg["sil_weight"]), float(cfg["aux_weight"])
+    model.ticks_per_step = cfg["ticks_per_step"]
+    if model.sil_weight > 0:
+        model.sil = SILBuffer()
+        if model.sil.load(str(run_dir / "sil.npz"), int(env.observation_space.shape[0])):
+            say(f"Self-imitation memory: {sum(len(v) for v in model.sil.laps.values())} laps loaded")
+    say(f"PPO: {model.action_space.nvec[1]} throttle modes{' (gas+brake on)' if model.action_space.nvec[1] == 4 else ''}, "
+        f"self-imitation {model.sil_weight:g}, aux heads {model.aux_weight:g}, critic with {N_PRIV} extra inputs")
     if from_base:
         write_json(run_dir / "base.json", {**from_base, "base_steps": int(model.num_timesteps)})
         say(f"Started from base '{from_base['base_name']}' (id {from_base['base_id']}, "

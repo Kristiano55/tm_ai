@@ -36,6 +36,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   separate spawn process** (sends `ROLLBACK` file to the learner), optional **warm start** (`iqn_warm_run`: ~50k
   steps of a PPO run's `champion.zip`, eps 0.1, into the replay memory; fresh runs only).
   Saves `latest.pt`, `champion.pt`, `iqn.json`.
+- `ppo_ext.py` — `PrivPolicy` (asymmetric critic: last `N_PRIV` inputs masked to 0 for the actor; `aux_head`),
+  `TMPPO` (train() = normal PPO update, then 4 extra steps of self-imitation + aux losses), `SILBuffer`, `aux_labels`.
+  Its own module so saved models reference `ppo_ext.*` (not `__main__`).
 - `packcheck.py` — pack safety checks (stdlib + numpy; byte-identical copy in `hub_template/tools/`).
 - `packs.py` — brain packs: `export_pack` (run or `base:NAME` -> data-only zip), `import_pack` (safe: never unpickles
   or runs pack content; rebuilds a local SB3 model, remaps surface one-hots to the local vocabulary), `CODE_VERSION`,
@@ -122,7 +125,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
 
 ## Key design decisions (and why)
-- **Actions:** 21 progressive steering levels (fine near centre) x {gas, coast, brake}; `ticks_per_step` 5 (50 ms)
+- **Actions:** 21 progressive steering levels (fine near centre) x {gas, coast, brake, gas+brake} (`gas_brake`,
+  PPO only; IQN keeps 3). `GAS`/`BRAKE` mode sets + `MODE_VEC` (last-action inputs: gas+brake = [1,0,1], layout
+  unchanged) everywhere (steps, mid-start replays). Conversion: new logit = brake logit - 3 (same argmax); `ticks_per_step` 5 (50 ms)
   default, 3 (30 ms) possible. Per-step costs scale with `tf = ticks/5` so they mean the same per second.
 - **Observations** (564 non-lidar + 41 lidar): car-frame velocity/rotation/up, wheels, steer/gear, last actions, route
   lookahead, 41 extras (effects/runtime/ghost/line offset), track preview (10 pts), short history (5 steps),
@@ -130,6 +135,15 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   All route points of a step are interpolated in one batch (`_route_points`, `to_car_frame_many`): ~5x faster obs.
   **New features must be appended at the end of the non-lidar block** so `migrate()` / `widen_columns()` can
   convert old PPO checkpoints (new input weights start at 0 = same behaviour). IQN checkpoints don't convert.
+- **Privileged critic inputs** (PPO, `N_PRIV` = 6, AFTER the lidar): ghost time left, PB time left, m to next CP, m to
+  finish, ghost gap, section failure rate. Actor sees 0 (`MaskedMlpExtractor`), so first actions stay identical.
+- **Self-imitation** (`sil_weight` 0.1): top-20 finished full laps per map (obs f16, action, RAW reward) in
+  `sil.npz` (run folder, never in packs). Returns use the current VecNormalize scale + per-step clip like PPO;
+  loss -logp x max(R - V, 0) + 0.005 x adv^2. Being active on ~all samples early is normal (laps beat V).
+- **Aux heads** (`aux_weight` 0.05, training only, on the actor latent): wall hit within 0.5 s, wheels grounded
+  within 0.3 s (BCE), seconds to next CP /10 (MSE). Labels from `info["aux"]` per step (callback -> `aux_rows`).
+  upd events carry `aux`, `sil`, `sil_act`, `sil_n`; shown under the value-loss card.
+- `levels.json` also stores `modes`, `obs_dim`, `policy` ("priv1"); any difference -> `migrate()` converts.
 - **Old `icing` / `on_ice` extras slots stay 0** (trained checkpoints have untrained weights there). Real ice inputs
   are in the surface block: per wheel `{fl,fr,rl,rr}_icing_state` + `_icing_blend`, front/rear icing grip scale - 1,
   `is_any_wheel_on_ice_or_snow`. selftest prints the raw values (summer map: 0, grip scales 1).
@@ -220,6 +234,8 @@ Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, o
 `TMAI_BENCH_S` / `TMAI_BENCH_CARS` shorten the benchmark. `TICKGYM_FAKE_DETOUR=1` adds a 620 m side loop at z=200 (just doable inside the 8 s far-off limit at full gas);
 `TICKGYM_FAKE_DETOUR=<file>` only while that file exists. Section fallback test: trace `pb.txt` ("0 accel 1") with
 `prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
+`TICKGYM_FAKE_CORNER=1`: z 400..460 caps speed at 35 m/s unless gas AND brake are held (60). The fake brake now
+slows the car when held without gas (random IQN driving rarely finishes in 1 min there; with the old fake it does).
 `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
 Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
 hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).

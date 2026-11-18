@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="tmai_hub_"))
-for f in ("tm_ai.py", "config.py", "packs.py", "packcheck.py", "hub.py", "iqn.py"):
+for f in ("tm_ai.py", "config.py", "packs.py", "packcheck.py", "hub.py", "iqn.py", "ppo_ext.py"):
     shutil.copy(REPO / f, TMP / f)
 shutil.copytree(REPO / "hub_template", TMP / "hub_template")
 sys.path[:0] = [str(TMP), str(REPO / "tests")]
@@ -79,7 +79,8 @@ def make_fixture():
     model.save(str(rd / "champion"))
     model.save(str(rd / "latest"))
     VecNormalize(venv, norm_obs=False).save(str(rd / "vecnorm.pkl"))
-    T.write_json(rd / "levels.json", {"steer": T.STEER_LEVELS["progressive"].tolist(), "obs_base": T.TMEnv.N_BASE})
+    T.write_json(rd / "levels.json", {"steer": T.STEER_LEVELS["progressive"].tolist(), "obs_base": T.TMEnv.N_BASE,
+                                      "modes": 3, "obs_dim": dim, "policy": "priv1"})
     env.close()
     return cfg, int(rec.finish_ms)
 
