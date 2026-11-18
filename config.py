@@ -56,6 +56,12 @@ DEFAULTS = {
     "progress_norm_m": 1000,   # base (and runs started from a base): progress pays as if every lap were this long
     "base_from": "",           # map run: start from this base model (name in runs/_base); empty = off
     "pool_cars": 1,            # map run with a map pool: cars that keep driving pool maps (no forgetting); 0 = off
+    "hub_index_url": "https://kristiano55.github.io/tm_ai-brains/index.json",   # public brain hub index
+    "hub_benchmark_url": "",   # empty = benchmark.json next to the index
+    "hub_repo": "Kristiano55/tm_ai-brains",
+    "github_user": "",         # your GitHub name (pack author / verifier)
+    "github_token": "",        # optional, for direct release uploads; empty = the browser does it (nothing stored)
+    "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
     "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }
 

@@ -194,6 +194,42 @@ def section_rows(rd):
     return rows
 
 
+HUB_CACHE = cfgmod.ROOT / "runs" / "_hub" / "index.json"
+
+
+def hub_state(refresh=False):
+    """The hub index (cached in runs/_hub/index.json, like tm_ai.py hub), my lineage, hub log tail."""
+    cfg = cfgmod.load()
+    err = None
+    if refresh or not HUB_CACHE.exists():
+        try:
+            import urllib.request
+            req = urllib.request.Request(cfg["hub_index_url"], headers={"User-Agent": "tm_ai-dashboard"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read(50 * 1024 * 1024).decode("utf-8"))
+            HUB_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = HUB_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, HUB_CACHE)
+        except Exception as e:
+            err = f"could not load {cfg['hub_index_url']}: {str(e)[:120]}"
+    idx = read_json(HUB_CACHE)
+    mine = set()
+    for f in list((cfgmod.ROOT / "runs").glob("*/base.json")) + list((cfgmod.ROOT / "runs" / "_base").glob("*/base.json")):
+        b = read_json(f).get("base_id")
+        if b:
+            mine.add(b)
+    try:
+        log = (cfgmod.ROOT / "runs" / "_hub" / "hub.log").read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+    except OSError:
+        log = []
+    user = cfg.get("github_user", "")
+    return {"index": idx, "error": err, "age_s": round(time.time() - HUB_CACHE.stat().st_mtime) if HUB_CACHE.exists() else None,
+            "lineage": sorted(mine), "user": user, "repo": cfg["hub_repo"],
+            "verifier": bool(user) and user.lower() in [v.lower() for v in idx.get("verifiers") or []],
+            "busy": alive(), "log": log}
+
+
 def safe(fn, *a):
     try:
         return fn(*a)
@@ -253,7 +289,8 @@ def build_state():
     except OSError:
         log = []
     return {
-        "config": cfg, "state": state, "reason": reason,
+        "config": {**cfg, "github_token": "********" if cfg.get("github_token") else ""},
+        "state": state, "reason": reason,
         "can_play": champion_path(cfg).exists(),
         "pb_ms": cfg["pb_seconds"] * 1000 if cfg["pb_seconds"] else None,
         "champion_ms": best.get("champion_ms"), "first_test_ms": best.get("first_test_ms"),
@@ -437,19 +474,29 @@ def start(kind, extra=()):
     if alive():
         return 409, "Something is already running."
     base = cfg["run_type"] == "base"
-    if base and not cfg["map_pool"]:
+    if kind == "hub":
+        pass
+    elif base and not cfg["map_pool"]:
         return 400, "Add maps to the map pool in Settings first (base run)."
-    if not base and not cfg["map"]:
+    elif not base and not cfg["map"]:
         return 400, "Set the map path in Settings first."
     if base and cfg["algo"] != "ppo" and kind == "train":
         return 400, "Base runs are PPO only."
     if kind == "play" and not champion_path(cfg).exists():
         return 400, "No champion yet."
+    if kind == "hub":
+        rd = cfgmod.ROOT / "runs" / "_hub"
+        rd.mkdir(parents=True, exist_ok=True)
+        logf = open(rd / "hub.log", "a", encoding="utf-8")
+        PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", "hub", *extra], cwd=str(ROOT), stdout=logf,
+                                     stderr=subprocess.STDOUT)
+        PROC["kind"], PROC["t0"] = kind, time.time()
+        return 200, "started - see the Hub tab's log"
     if kind == "transfer" and not (cfgmod.base_dir(cfg["base_name"]) / "latest.zip").exists():
         return 400, f"Base '{cfg['base_name']}' has no model yet."
     rd = cfgmod.run_dir(cfg)
     logf = open(rd / "train.log", "a", encoding="utf-8")
-    cmd = {"train": "train", "bench": "bench", "transfer": "transfer"}.get(kind, "drive")
+    cmd = {"train": "train", "bench": "bench", "transfer": "transfer", "hub": "hub"}.get(kind, "drive")
     PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", cmd, *extra],
                                  cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
     PROC["kind"], PROC["t0"] = kind, time.time()
@@ -459,7 +506,7 @@ def start(kind, extra=()):
 def stop():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
-    if PROC["kind"] in ("play", "bench", "transfer") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
+    if PROC["kind"] in ("play", "bench", "transfer", "hub") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
         kill_proc()
         return
     (rd / "STOP").write_text("stop")                       # graceful: saves the model first
@@ -495,6 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, (ROOT / "dashboard.html").read_bytes(), "text/html")
         elif self.path.startswith("/api/state"):
             self.send(200, json.dumps(build_state()))
+        elif self.path.startswith("/api/hub"):
+            self.send(200, json.dumps(hub_state("refresh=1" in self.path)))
         else:
             self.send(404, "{}")
 
@@ -506,9 +555,18 @@ class Handler(BaseHTTPRequestHandler):
             body = {}
         code, msg = 200, "ok"
         if self.path == "/api/config":
+            if body.get("github_token") == "********":       # masked in the page: keep the saved token
+                body["github_token"] = cfgmod.load().get("github_token", "")
             cfgmod.save(body)
         elif self.path == "/api/start":
             code, msg = start("train")
+        elif self.path == "/api/hub/import":
+            pid = "".join(c for c in str(body.get("id") or "") if c.isalnum() or c == "-")
+            name = "".join(c for c in str(body.get("name") or pid) if c.isalnum() or c in "-_")
+            code, msg = (400, "no pack id") if not pid else start(
+                "hub", ["import", pid, "--as", name] + (["--base"] if body.get("base") else []))
+        elif self.path == "/api/hub/verify_pending":
+            code, msg = start("hub", ["verify-pending"])
         elif self.path == "/api/transfer":
             m = str(body.get("map") or "").strip().strip('"')
             if not m:

@@ -27,7 +27,7 @@ canvas{width:100%;height:210px;display:block}canvas.t{height:240px}
 pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;min-height:90px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:26px}h3.sec{margin:6px 0 12px;font-size:16px}label small{color:var(--mut);font-size:11px}
 label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
-input[type=text],input[type=number],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
+input[type=text],input[type=number],input[type=password],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
 .hide{display:none}
 table.sec{width:100%;border-collapse:collapse;font-size:13px}table.sec th{text-align:left;color:var(--mut);font-weight:400;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--line)}
 table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--red)}td.ok{color:var(--grn)}td.fb{color:var(--org)}
@@ -36,7 +36,7 @@ table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--
 <header>
   <div class="logo">&raquo;</div>
   <div><h1>Trackmania AI</h1><div class="sub" id="sub">&nbsp;</div></div>
-  <nav><a id="n1" class="on">Dashboard</a><a id="n2">Settings</a></nav>
+  <nav><a id="n1" class="on">Dashboard</a><a id="n3">Hub</a><a id="n2">Settings</a></nav>
   <div class="sp"></div>
   <div class="pill"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
   <button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button>
@@ -89,6 +89,18 @@ table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--
     <button id="bBench">Benchmark cars</button></div></div>
   <div class="card"><pre id="log"></pre></div>
 </main>
+<main id="hubv" class="hide"><div class="card">
+  <div class="flex" style="align-items:center"><h3 style="margin:0">Brain hub <small id="hubSub">shared AI drivers - data only (JSON + weights), never code</small></h3>
+    <span><button id="hRef">Refresh</button> <button id="hVer" class="hide">Verify pending packs</button></span></div>
+  <div class="grid" style="margin:12px 0 10px;grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
+    <label>Map (name or UID)<input type="text" id="hMap"></label>
+    <label>Min. benchmark score<input type="number" id="hBench" step="any"></label>
+    <label>Sort by<select id="hSort"><option value="ver">Verified first</option><option value="wr">Time vs WR</option><option value="bench">Benchmark score</option><option value="votes">Votes</option></select></label>
+    <label class="ck"><input type="checkbox" id="hOnlyV"> Verified only</label>
+    <label class="ck"><input type="checkbox" id="hLin"> Same lineage as my bases</label>
+  </div>
+  <table class="sec" id="hubT"><tr><td class="mut">loading ...</td></tr></table>
+  <pre id="hubLog" style="margin-top:10px;min-height:0"></pre></div></main>
 <main id="set" class="hide"><div class="card"><form id="form" onsubmit="return false"></form>
   <p><button class="p" id="bSave">Save settings</button> <button id="bReset">Reset weights to defaults</button> <button id="bLean">Lean preset</button> <button id="bLs">Linesight preset</button> <button id="bDc">Send Discord test</button> <span class="mut" id="saved"></span></p>
   <p class="mut">Training settings apply the next time you press Start training. Reward weights (and "end a lap when behind the ghost") are picked up live by running cars at the start of their next lap.</p></div></main>
@@ -100,7 +112,9 @@ const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; em
  ['pool_rotate_laps','Base: a car changes pool map every N laps (when there are more maps than cars)','number'],
  ['progress_norm_m','Base: progress pays as if every lap were this long (m)','number'],
  ['base_from','Map run: start from this base model (base name; empty = off)','text'],
- ['pool_cars','Map run: cars that keep driving the pool maps (no forgetting; 0 = off)','number'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+ ['pool_cars','Map run: cars that keep driving the pool maps (no forgetting; 0 = off)','number'],
+ ['github_user','Hub: your GitHub user name (pack author / verifier)','text'],['github_token','Hub: GitHub token for direct uploads (optional; empty = the browser does it, nothing stored)','password'],
+ ['hub_index_url','Hub: index URL','text'],['hub_repo','Hub: repository','text'],['maps_folder','Hub: your maps folder (verify / benchmark find maps there)','text'],['hub_benchmark_url','Hub: benchmark.json URL (empty = next to the index)','text'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
  ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
@@ -139,9 +153,39 @@ $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('
 $('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
 $('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('saved').textContent=j.message};
 $('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').textContent='Saved.'; setTimeout(()=>$('saved').textContent='',2000)};
-$('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
+const VIEWS={n1:'dash',n2:'set',n3:'hubv'};
+for(const n in VIEWS) $(n).onclick=()=>{for(const m in VIEWS){$(m).className=m==n?'on':''; $(VIEWS[m]).className=m==n?'':'hide'} if(n=='n3') loadHub(false)};
 
 const TCOL={tick:['#3b8bea','TICK (game physics)'],obs:['#39c46a','building inputs'],env:['#e8a33a','rewards / rules'],wait:['#8b93a0','waiting for an action']};
+let HUB=null;
+async function loadHub(refresh){ try{ HUB=await (await fetch('/api/hub'+(refresh?'?refresh=1':''))).json(); drawHub() }catch(e){ $('hubT').innerHTML='<tr><td class="mut">hub not reachable</td></tr>' } }
+const ST={verified:'ok',failed:'bad',quarantined:'bad',unverified:''};
+function packTime(m){ const v=(m.verified||{}).drive_ms; return v||m.champion_ms||null }
+function wrRatio(p){ const r=p.maps.filter(m=>m.wr_ms&&packTime(m)).map(m=>packTime(m)/m.wr_ms); return r.length?Math.min(...r):Infinity }
+function drawHub(){
+  if(!HUB) return; const ix=HUB.index||{}, q=$('hMap').value.trim().toLowerCase(), mb=parseFloat($('hBench').value);
+  $('hubSub').textContent=(HUB.error?HUB.error+' · ':'')+`${(ix.packs||[]).length} packs · index ${HUB.age_s==null?'not loaded':Math.round(HUB.age_s/60)+' min old'} · data only (JSON + weights), never code`;
+  $('hVer').classList.toggle('hide',!HUB.verifier); $('hVer').disabled=HUB.busy; $('hubLog').textContent=(HUB.log||[]).join('\n');
+  let ps=(ix.packs||[]).filter(p=>(!q||p.maps.some(m=>(m.name||'').toLowerCase().includes(q)||(m.uid||'').toLowerCase().includes(q)))
+    &&(!$('hOnlyV').checked||p.status=='verified')&&(!$('hLin').checked||(p.lineage||[]).some(b=>HUB.lineage.includes(b)))
+    &&(isNaN(mb)||(p.benchmark_score||0)>=mb));
+  const srt=$('hSort').value;
+  ps.sort(srt=='wr'?(a,b)=>wrRatio(a)-wrRatio(b):srt=='bench'?(a,b)=>(b.benchmark_score||0)-(a.benchmark_score||0):srt=='votes'?(a,b)=>(b.votes||0)-(a.votes||0)
+    :(a,b)=>((b.status=='verified')-(a.status=='verified'))||(b.created-a.created));
+  const f=ms=>ms?(ms/1000).toFixed(3)+' s':'–', esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  $('hubT').innerHTML=ps.length?'<tr><th>Pack</th><th>Status</th><th>Maps (verified drive / claimed champion, vs WR)</th><th>Benchmark</th><th>Votes</th><th></th></tr>'+ps.map(p=>
+    `<tr><td><code>${esc(p.pack_id)}</code><br><span class="mut">${esc(p.kind)} · by ${esc(p.author)}${(p.lineage||[]).some(b=>HUB.lineage.includes(b))?' · same lineage':''}</span></td>`+
+    `<td class="${ST[p.status]||''}">${esc(p.status)}${p.verifier?'<br><span class="mut">by '+esc(p.verifier)+'</span>':''}</td>`+
+    `<td>${p.maps.map(m=>`${esc(m.name||m.uid)}: ${f(packTime(m))}${(m.verified||{}).drive_ms?' ✓':''}${m.wr_ms&&packTime(m)?' <span class="mut">(+'+((packTime(m)-m.wr_ms)/1000).toFixed(3)+')</span>':''}`).join('<br>')}</td>`+
+    `<td>${p.benchmark_score??'–'}</td><td>${p.votes||0}</td>`+
+    `<td style="white-space:nowrap"><button data-imp="${esc(p.pack_id)}" data-kind="${esc(p.kind)}" ${p.status=='quarantined'||HUB.busy?'disabled':''}>Import</button> <button data-rep="${esc(p.pack_id)}">Report</button></td></tr>`).join('')
+    :'<tr><td class="mut">no packs match</td></tr>';
+  for(const b of document.querySelectorAll('[data-imp]')) b.onclick=()=>{const id=b.dataset.imp, base=b.dataset.kind=='base';
+    const name=prompt((base?'Import as base model. Base name:':'Import into a new run. Run name:'),id); if(name) post('/api/hub/import',{id,name,base}).then(()=>setTimeout(()=>loadHub(false),1500))};
+  for(const b of document.querySelectorAll('[data-rep]')) b.onclick=()=>window.open(`https://github.com/${HUB.repo}/issues/new?template=report.yml&title=${encodeURIComponent('Report: '+b.dataset.rep)}&pack=${encodeURIComponent(b.dataset.rep)}`,'_blank','noopener');
+}
+$('hRef').onclick=()=>loadHub(true); $('hVer').onclick=()=>{if(confirm('Verify every unverified pack you have the maps for? (replays + best-of-3 drives; result pages open in the browser)')) post('/api/hub/verify_pending').then(()=>setTimeout(()=>loadHub(false),1500))};
+for(const id of ['hMap','hBench','hSort','hOnlyV','hLin']) $(id).oninput=$(id).onchange=drawHub;
 function drawBase(s){
   const on=!!s.maps; $('baseCard').classList.toggle('hide',!on); if(!on) return;
   const f=v=>v==null?'–':v.toFixed(3)+' s';

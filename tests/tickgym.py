@@ -41,7 +41,7 @@ class Action:
     def __init__(s,tick,kind,value=0): s.tick,s.kind,s.value=tick,kind,value
 class InputText:
     @staticmethod
-    def write(p,a): open(p,"w").write("x")
+    def write(p,a): open(p,"w").write("".join(f"{int(x.tick)*10} {x.kind} {int(x.value)}\n" for x in a))
     @staticmethod
     def read(p):
         return [Action(int(l.split()[0])//10,l.split()[1],int(l.split()[2])) for l in open(p) if l.strip()]
@@ -72,11 +72,13 @@ class G:
     acc=True
     @property
     def next_tick(s): return s.tick
-    def reset(s,seed=0): s.z=0.;s.v=0.;s.tick=0;s.acc=True;return s.tel()
+    def reset(s,seed=0): s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.rec=[];return s.tel()
     def step(s,ticks,actions=(),steer=None,accelerate=None,brake=None):
         for a in actions:
             if a.kind=='accel': s.acc=bool(a.value)
-        if accelerate is not None: s.acc=accelerate
+        if accelerate is not None:
+            if bool(accelerate)!=s.acc: s.rec.append(Action(s.tick,'accel',int(bool(accelerate))))   # what export() returns
+            s.acc=bool(accelerate)
         accelerate=s.acc
         if _HANG and os.path.exists(_HANG):
             try: os.remove(_HANG); time.sleep(10**6)
@@ -93,8 +95,12 @@ class G:
     def restore(s,snap):
         s.z,s.v,s.tick=G.snaps[snap.id]; return s.tel()
     def discard(s,*a): pass
-    def export(s): return NS(finish_ms=s.tick*10,actions=[])
+    def export(s): return NS(finish_ms=s.tick*10,actions=list(getattr(s,"rec",[])))
     def close(s): pass
 class Client:
     def __init__(s,*a,**k): pass
-    def open_map(s,m): return NS(connect=lambda g,l,timeout=None:G(l,m),close=lambda:None)
+    def open_map(s,m):
+        import hashlib
+        uid="FAKE"+hashlib.sha1(str(m).encode()).hexdigest()[:10]
+        return NS(connect=lambda g,l,timeout=None:G(l,m),close=lambda:None,
+                  info=NS(map=NS(map_uid=uid,sha256=hashlib.sha256(str(m).encode()).hexdigest())))

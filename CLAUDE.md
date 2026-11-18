@@ -15,7 +15,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   mid-track starts, `CarPool` (asynchronous cars: each car process steps as soon as its own action arrives, pipes +
   `connection.wait`), `bench`, profiling (`prof_summary`), `raise_priority` (psutil, Windows only), PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
   EMA weights by the callback; rollback via `ROLLBACK` file), `selftest`, `drive`. CLI:
-  `python tm_ai.py selftest|train|drive|bench|transfer` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
+  `python tm_ai.py selftest|train|drive|bench|transfer` (settings from `config.json`); packs/hub:
+  `tm_ai.py export|import|publish|verify|benchmark <target>` and `tm_ai.py hub list|search|import|refresh|verify-pending`. Dispatches to `iqn.py` when `algo == "iqn"`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
   epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
@@ -26,6 +27,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   separate spawn process** (sends `ROLLBACK` file to the learner), optional **warm start** (`iqn_warm_run`: ~50k
   steps of a PPO run's `champion.zip`, eps 0.1, into the replay memory; fresh runs only).
   Saves `latest.pt`, `champion.pt`, `iqn.json`.
+- `packcheck.py` — pack safety checks (stdlib + numpy; byte-identical copy in `hub_template/tools/`).
+- `packs.py` — brain packs: `export_pack` (run or `base:NAME` -> data-only zip), `import_pack` (safe: never unpickles
+  or runs pack content; rebuilds a local SB3 model, remaps surface one-hots to the local vocabulary), `CODE_VERSION`,
+  `input_fingerprint()`.
+- `hub.py` — hub client: cached index, list/search/import by id, publish, verify, benchmark, verify-pending.
+- `hub_template/` — the hub repo (to be pushed as Kristiano55/tm_ai-brains): schema, Actions, tools, docs.
 - `config.py` — `DEFAULTS`, `WEIGHTS` (reward weights: key -> (default, label, hint)), presets `LEAN`, `LINESIGHT`,
   `load()/coerce()/save()` (atomic), `reward_v` migration of old configs, `run_dir()`.
 - `dashboard.py` + `dashboard.html` — stdlib HTTP server on 127.0.0.1:8765; starts/stops `tm_ai.py` as a subprocess,
@@ -51,6 +58,36 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   seeded from the base's map folder); their laps carry `pool: 1` and are ignored by stats, trackers, dashboard.
 - Transfer score: `python tm_ai.py transfer --map <path> [--pb file]` (dashboard button): base latest.zip, best of 3, no
   learning, folder `transfer/<slug>/`; result in `transfers.json` (time or end reason, checkpoint, x/z, share of lap).
+
+## Brain packs + hub (data only, nothing from a pack is ever executed)
+- Pack zip `<pack_id>.tmbrain.zip`: manifest.json (pack_format 1, pack_id `<author>-<8 hex>`, kind map|base, code
+  version, input fingerprint, base_id, lineage, maps by UID with claimed champion/best times + PB/WR, sha256 of every
+  file), model.json + model.npz (policy weights, plain float arrays), vecnorm.json, materials.json, per map
+  `maps/<uid>/` champion.txt + best.txt (TICK input files of the claims), centerline/profile .npy/.json, sections.json.
+- packcheck rules: only .json .txt .npz .npy .md; no absolute paths / `..` / symlinks / encryption; pickle, exe, ELF,
+  script and zip magic rejected by content; npy/npz loaded with allow_pickle=False, no object dtype; size, member
+  count and compression-ratio limits; every file listed in the manifest with matching sha256.
+- Map identity: `session.info.map.map_uid`; TMEnv writes `map_info.json` per run and `runs/_maps.json` (uid -> path),
+  used by verify/benchmark (also `--map UID=PATH`, or the `maps_folder` setting by file name, confirmed by UID).
+- verify: replay each claimed TICK input file (`trace_record`, exact ms must match), then the pack's driver best-of-3
+  with seeds None/1000/1001 on the pack's line/ghost; verdict verified only if all replays match and it finishes.
+  Output `runs/_hub/verifications/<id>.json` with `digest` (sha256 of canonical JSON) + `signed_off`; opens GitHub's
+  pre-filled new-file page `verifications/<id>/<user>.json`. `--benchmark` adds the benchmark score (in the digest).
+- benchmark: hub benchmark.json maps (uid, name, par_ms); per map 100 x par/time (max 150), no finish 50 x share of
+  lap, missing map 0; score = average over all maps.
+- publish: export + sha256/size + `packs/<id>.json` entry (status unverified) -> opens the release page of the user's
+  fork (tag `pack-<id>`, attach the zip) and the pre-filled new-file page (GitHub makes the PR). With `github_token`
+  the release asset is uploaded via the API. The dashboard masks the token ("********" keeps the saved one).
+- Hub repo: one PR = one file (`packs/<id>.json` or `verifications/<id>/<user>.json`); `validate.yml` runs
+  `tools/validate_pr.py` from main (pull_request_target; PR files read as data only). `build.yml` runs
+  `tools/build_index.py` -> index.json (committed) + Pages leaderboard. Status: verified/failed only from a
+  verifiers.txt user's file with matching sha256 + digest; quarantined by an open `report` issue "Report: <id>" newer
+  than the last verification; votes = 👍 on a `vote` issue "Vote: <id>". compat.json lists accepted fingerprints:
+  ADD the new fingerprint there whenever the input layout changes (and bump CODE_VERSION).
+- Dashboard Hub tab: cached index (`runs/_hub/index.json`, Refresh), filters map / verified / same lineage / min
+  benchmark, sort verified / vs WR / benchmark / votes, Import (runs `tm_ai.py hub import`), Report (pre-filled
+  issue), "Verify pending packs" for verifiers. Hub jobs log to `runs/_hub/hub.log`.
+- Pack combine (merging packs) is NOT implemented here (the brain-pack prompt was never pushed to this repo).
 
 ## Run folder `runs/<run>/`
 `events.jsonl` (k = start | lap | test | upd | rb | prof | stop; prof = 5-min "where the time goes"), `status.json` (heartbeat), `train.log`, `best.json`
@@ -161,6 +198,8 @@ hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake 
 `time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.
+Packs + hub: `python tests/test_hub.py` (temp copy; safety checks, PR validator, index builder, file:// import,
+verify incl. a faked time, benchmark). The fake game records real inputs (`export()` / `InputText`) and has map UIDs.
 
 ## Conventions
 - Never break running users: config changes go through `coerce`/migration; resume must keep working or move old

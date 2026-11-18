@@ -187,6 +187,24 @@ def surface_slot(kind, sid):
     return _VOCAB[kind][sid]
 
 
+MAPS_FILE = cfgmod.ROOT / "runs" / "_maps.json"
+
+
+def remember_map(uid, path, sha=None, run_dir=None):
+    """Map UID -> local file (runs/_maps.json, used by verify / benchmark) and the run folder's map_info.json."""
+    try:
+        rec = {"uid": uid, "path": str(path), "sha256": sha, "name": Path(str(path)).name}
+        if run_dir is not None and read_json(Path(run_dir) / "map_info.json").get("uid") != uid:
+            write_json(Path(run_dir) / "map_info.json", rec)
+        d = read_json(MAPS_FILE)
+        if d.get(uid, {}).get("path") != str(path):
+            MAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            d[uid] = rec
+            write_json(MAPS_FILE, d)
+    except Exception:                                      # file trouble must never stop training
+        pass
+
+
 def onehot_ids(kind, ids, valid=None):
     """[len(ids) * 17] one-hots; rows where valid is False stay all zero (e.g. a ray that hit nothing)."""
     out = np.zeros((len(ids), N_SURF + 1), np.float32)
@@ -544,6 +562,10 @@ class TMEnv(gym.Env):
         self.sec_rate, self.sec_mode, self._sec_m, self.pb_dense, self.pb_cut = [], [], None, None, None
 
         self.session = Client(timeout=60).open_map(cfg["map"])
+        mi = getattr(getattr(self.session, "info", None), "map", None)
+        self.map_uid = getattr(mi, "map_uid", None)
+        if self.map_uid:
+            remember_map(self.map_uid, cfg["map"], getattr(mi, "sha256", None), self.run_dir)
         # 32-ray level fan, 4 downward rays (drops/gaps), 5 forward-up rays (ceilings, overhangs)
         fan = Lidar.fan(rays=32, fov_degrees=180, range_m=120)
         down = Lidar.directions([0, 0, 0, 0], [-4, -12, -25, -45], range_m=40)
@@ -2476,7 +2498,45 @@ def selftest(cfg):
     env.close()
 
 
+def pack_cli(argv):
+    """publish / verify / benchmark / export / import / hub: brain packs and the public hub (hub.py, packs.py)."""
+    import hub
+    import packs
+    cfg = cfgmod.load()
+    cmd, rest = argv[0], argv[1:]
+    ap = argparse.ArgumentParser(prog=f"tm_ai.py {cmd}")
+    if cmd == "hub":
+        return hub.main(cfg, rest)
+    ap.add_argument("target", help="run name, base:NAME, pack zip or pack id")
+    ap.add_argument("--map", action="append", help="UID=PATH of a local map (verify / benchmark)")
+    ap.add_argument("--wr", type=float, default=None, help="publish/export: world record time in seconds")
+    ap.add_argument("--note", default="")
+    ap.add_argument("--as", dest="name", default=None, help="import: run (or base) name")
+    ap.add_argument("--base", action="store_true", help="import as a base model")
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--benchmark", action="store_true", help="verify: also run the benchmark maps")
+    a = ap.parse_args(rest)
+    if cmd == "publish":
+        hub.cmd_publish(cfg, a.target, a.wr, a.note, open_browser=not a.no_browser)
+    elif cmd == "export":
+        path, man = packs.export_pack(cfg, a.target, cfgmod.ROOT / "runs" / "_hub" / "out",
+                                      author=cfg["github_user"] or "anonymous", wr=a.wr, note=a.note)
+        say(f"Exported {path}")
+    elif cmd == "import":
+        name = a.name or Path(a.target).name.split(".")[0]
+        dest = cfgmod.base_dir(name) if a.base else cfgmod.ROOT / "runs" / name
+        man = packs.import_pack(a.target, dest, as_base=a.base)
+        say(f"Imported pack {man['pack_id']} into {dest}")
+    elif cmd == "verify":
+        hub.cmd_verify(cfg, a.target, hub.parse_overrides(a.map), open_browser=not a.no_browser, bench=a.benchmark)
+    elif cmd == "benchmark":
+        hub.cmd_benchmark(cfg, a.target, hub.parse_overrides(a.map))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("hub", "publish", "verify", "benchmark", "export", "import"):
+        pack_cli(sys.argv[1:])
+        raise SystemExit(0)
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer"])
     ap.add_argument("--pb", default="", help="transfer: optional PB file of that map (for a target line)")
