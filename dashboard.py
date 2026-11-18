@@ -581,7 +581,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/config":
             if body.get("github_token") == "********":       # masked in the page: keep the saved token
                 body["github_token"] = cfgmod.load().get("github_token", "")
-            cfgmod.save(body)
+            merged = cfgmod.load()                            # merge: a partial save never resets other settings
+            merged.update({k: v for k, v in body.items() if k in cfgmod.DEFAULTS})
+            cfgmod.save(merged)
         elif self.path == "/api/start":
             cfg = cfgmod.load()
             others = [] if body.get("new") or alive() else safe(cfgmod.start_conflict, cfg)

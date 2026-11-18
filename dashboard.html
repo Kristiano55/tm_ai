@@ -517,7 +517,7 @@ function hitTxt(s){ const h=s&&s.hit_ramp; if(!h||!s.config.w_hit) return '';
   return `Wall-hit penalty at <b>${Math.round(h.factor*100)}%</b> ${h.on===false?'(ramp off)':h.reached?'(reached 60% finished: stays at 100%)':`(finish rate ${Math.round(h.rate*100)}% of the last 100 laps; 100% from 60%)`}<br>` }
 function render(s){ S_LAST=s;
   const c=s.config; LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
-  if(!cfgLoaded){ DEF=s.defaults||{}; WMETA=s.weights||[]; BASE=c; fillForm(c); cfgLoaded=true }
+  if(!cfgLoaded){ DEF=s.defaults||Object.assign({},c);   /* never empty: an empty DEF would save an empty config */ WMETA=s.weights||[]; BASE=c; fillForm(c); cfgLoaded=true }
   drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
   const run=s.state=='running'||s.state=='playing';
