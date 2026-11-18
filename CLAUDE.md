@@ -4,6 +4,15 @@ Owner: Kris (Kristiano55). Windows PC, Ryzen 5 5600, Python 3.12, TICK 3.0 at `%
 Install folder on his PC: `C:\Users\Kris\Documents\tm-ai`. Maps: `C:\Users\Kris\Documents\Trackmania\Maps\...`.
 He is a TM2020 TAS / SpeedTAS player, not an ML engineer: explain changes in Trackmania terms, keep replies short.
 
+## Standing rules for every task
+- Existing runs must convert and resume; new inputs/actions start neutral (same first actions after conversion).
+- PPO is primary; IQN must keep running (skip unsupported features there with a clear message).
+- Pure AI learning: never imitate PB/WR/pack inputs, never bruteforce.
+- Test only what the change touches on the fake tickgym, plus one short PPO resume smoke test; no screenshots
+  unless the UI changed; read only the code you need.
+- Finish with: update CLAUDE.md if behaviour changed, commit, push to main.
+- Report in at most 10 lines: what changed, settings added (name + default), tests run, anything not done.
+
 ## What it is
 An AI that learns to drive Trackmania 2020 maps through **tickgym** (https://tm.achepta.com/tickgym/), a Python
 library that runs the game's own deterministic physics via TICK. The same seed + inputs always give the same race.
