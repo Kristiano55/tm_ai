@@ -65,6 +65,7 @@ class Store:
         self.rbs, self.ends = [], []
         self.sess_t0, self.sess_lap0, self.last_t = None, 0, None
         self.prof = None
+        self.map_laps, self.map_n, self.map_tests = {}, {}, {}
 
     def refresh(self, path):
         if path != self.path:
@@ -94,6 +95,13 @@ class Store:
             if k == "start":
                 self.sess_t0, self.sess_lap0 = e["t"], self.n_all
             elif k == "lap":
+                if e.get("pool"):                      # pool cars of a map run: not this map's laps
+                    continue
+                if e.get("map"):                       # base run: per-map stats
+                    ml = self.map_laps.setdefault(e["map"], [])
+                    ml.append(e.get("ms"))
+                    del ml[:-100]
+                    self.map_n[e["map"]] = self.map_n.get(e["map"], 0) + 1
                 self.n_all += 1
                 if e.get("x") is not None and e.get("end") != "finished":
                     self.ends.append([e["x"], e["z"], e.get("end", ""), 1 if e.get("mid") else 0])
@@ -104,6 +112,8 @@ class Store:
                     self.laps.append((self.n_all, e.get("ms")))
             elif k == "test":
                 self.tests.append(e)
+                if e.get("map"):
+                    self.map_tests[e["map"]] = self.map_tests.get(e["map"], 0) + 1
             elif k == "upd":
                 self.upds.append(e)
             elif k == "prof":
@@ -191,6 +201,22 @@ def safe(fn, *a):
         return []
 
 
+def map_rows(cfg, rd):
+    """Base run: one row per pool map - champion vs PB, tests, finish rate."""
+    rows = []
+    for e in cfg["map_pool"]:
+        slug = cfgmod.map_slug(e["map"])
+        md = rd / "maps" / slug
+        best = read_json(md / "best.json")
+        pb = e.get("pb_seconds") or ((read_json(md / "pb_trace.json").get("ms") or 0) / 1000.0) or None
+        ml = STORE.map_laps.get(slug, [])
+        rows.append({"name": Path(e["map"]).name, "slug": slug, "pb": pb,
+                     "champ": best.get("champion_ms") / 1000.0 if best.get("champion_ms") else None,
+                     "tests": STORE.map_tests.get(slug, 0), "laps": STORE.map_n.get(slug, 0),
+                     "fin": round(100 * sum(1 for x in ml if x) / len(ml)) if ml else None})
+    return rows
+
+
 def build_state():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
@@ -202,13 +228,13 @@ def build_state():
     fresh = status.get("state") == "running" and now - status.get("heartbeat", 0) < 150
     running = train_alive or fresh
     playing = alive() and PROC["kind"] == "play"
-    benching = alive() and PROC["kind"] == "bench"
+    benching = alive() and PROC["kind"] in ("bench", "transfer")
     if running:
         state, reason = "running", ""
     elif playing:
         state, reason = "playing", "champion is driving"
     elif benching:
-        state, reason = "benchmarking", "testing car counts (see the log)"
+        state, reason = "benchmarking", ("testing car counts" if PROC["kind"] == "bench" else "transfer test") + " (see the log)"
     elif status.get("state") == "running":
         state, reason = "stopped", "stopped unexpectedly"
     else:
@@ -228,7 +254,7 @@ def build_state():
         log = []
     return {
         "config": cfg, "state": state, "reason": reason,
-        "can_play": (rd / ("champion.pt" if cfg["algo"] == "iqn" else "champion.zip")).exists(),
+        "can_play": champion_path(cfg).exists(),
         "pb_ms": cfg["pb_seconds"] * 1000 if cfg["pb_seconds"] else None,
         "champion_ms": best.get("champion_ms"), "first_test_ms": best.get("first_test_ms"),
         "laps_total": S.n_all, "mid_laps": S.n_mid,
@@ -254,6 +280,9 @@ def build_state():
         "last_play": read_json(rd / "play_result.json") or None,
         "prof": S.prof, "bench": read_json(rd / "bench.json") or None,
         "sections": safe(section_rows, rd),
+        "maps": safe(map_rows, cfg, rd) if cfg["run_type"] == "base" else None,
+        "transfers": list(read_json(rd / "transfers.json").values()) if cfg["run_type"] == "base" else None,
+        "base": read_json(rd / "base.json") or None,
     }
 
 
@@ -396,17 +425,32 @@ def frozen_guard():
             pass
 
 
-def start(kind):
+def champion_path(cfg):
+    rd = cfgmod.run_dir(cfg)
+    if cfg["run_type"] == "base":
+        return rd / "maps" / cfgmod.map_slug(cfg["map_pool"][0]["map"]) / "champion.zip" if cfg["map_pool"] else rd / "-"
+    return rd / ("champion.pt" if cfg["algo"] == "iqn" else "champion.zip")
+
+
+def start(kind, extra=()):
     cfg = cfgmod.load()
     if alive():
         return 409, "Something is already running."
-    if not cfg["map"]:
+    base = cfg["run_type"] == "base"
+    if base and not cfg["map_pool"]:
+        return 400, "Add maps to the map pool in Settings first (base run)."
+    if not base and not cfg["map"]:
         return 400, "Set the map path in Settings first."
-    if kind == "play" and not (cfgmod.run_dir(cfg) / ("champion.pt" if cfg["algo"] == "iqn" else "champion.zip")).exists():
+    if base and cfg["algo"] != "ppo" and kind == "train":
+        return 400, "Base runs are PPO only."
+    if kind == "play" and not champion_path(cfg).exists():
         return 400, "No champion yet."
+    if kind == "transfer" and not (cfgmod.base_dir(cfg["base_name"]) / "latest.zip").exists():
+        return 400, f"Base '{cfg['base_name']}' has no model yet."
     rd = cfgmod.run_dir(cfg)
     logf = open(rd / "train.log", "a", encoding="utf-8")
-    PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", {"train": "train", "bench": "bench"}.get(kind, "drive")],
+    cmd = {"train": "train", "bench": "bench", "transfer": "transfer"}.get(kind, "drive")
+    PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", cmd, *extra],
                                  cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
     PROC["kind"], PROC["t0"] = kind, time.time()
     return 200, "ok"
@@ -415,7 +459,7 @@ def start(kind):
 def stop():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
-    if PROC["kind"] in ("play", "bench") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
+    if PROC["kind"] in ("play", "bench", "transfer") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
         kill_proc()
         return
     (rd / "STOP").write_text("stop")                       # graceful: saves the model first
@@ -465,6 +509,12 @@ class Handler(BaseHTTPRequestHandler):
             cfgmod.save(body)
         elif self.path == "/api/start":
             code, msg = start("train")
+        elif self.path == "/api/transfer":
+            m = str(body.get("map") or "").strip().strip('"')
+            if not m:
+                code, msg = 400, "Give the path of a map that is not in the pool."
+            else:
+                code, msg = start("transfer", ["--map", m] + (["--pb", str(body["pb"])] if body.get("pb") else []))
         elif self.path == "/api/bench":
             code, msg = start("bench")
         elif self.path == "/api/play":

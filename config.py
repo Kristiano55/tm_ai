@@ -49,6 +49,13 @@ DEFAULTS = {
     "pb_file": "",             # your PB as a TICK input text file: traced once into a target line + timing (empty = off)
     "mid_start_p": 0.25,       # share of training laps that start partway along the champion's lap (0 = off)
     "mid_start_every_s": 2.0,  # spacing of those start points along the champion lap, seconds     # rebuild the reference line + ghost when the champion beats it by this much (0 = never)
+    "run_type": "map",         # "map" = one map (run folder runs/<run>), "base" = shared driver over map_pool
+    "base_name": "base",       # base runs live in runs/_base/<base_name>/ (one sub-folder per pool map)
+    "map_pool": [],            # [{"map": path, "pb_file": path or "", "pb_seconds": 0}, ...]
+    "pool_rotate_laps": 20,    # base: a car moves to another pool map every N laps (if more maps than cars)
+    "progress_norm_m": 1000,   # base (and runs started from a base): progress pays as if every lap were this long
+    "base_from": "",           # map run: start from this base model (name in runs/_base); empty = off
+    "pool_cars": 1,            # map run with a map pool: cars that keep driving pool maps (no forgetting); 0 = off
     "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }
 
@@ -124,12 +131,33 @@ def coerce(cfg):
                 v = int(float(v))
             elif isinstance(d, float):
                 v = float(v)
+            elif isinstance(d, list):
+                v = json.loads(v) if isinstance(v, str) else list(v)
             else:
                 v = str(v).strip().strip('"')
         except (TypeError, ValueError):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    pool = []
+    for e in out["map_pool"] if isinstance(out["map_pool"], list) else []:
+        if isinstance(e, str):
+            e = {"map": e}
+        if isinstance(e, dict) and str(e.get("map", "")).strip():
+            try:
+                pbs = float(e.get("pb_seconds") or 0)
+            except (TypeError, ValueError):
+                pbs = 0.0
+            pool.append({"map": str(e["map"]).strip().strip('"'), "pb_file": str(e.get("pb_file") or "").strip().strip('"'),
+                         "pb_seconds": pbs})
+    out["map_pool"] = pool
+    if out["run_type"] not in ("map", "base"):
+        out["run_type"] = "map"
+    for k in ("base_name", "base_from"):
+        out[k] = "".join(c for c in out[k] if c.isalnum() or c in "-_")
+    out["base_name"] = out["base_name"] or "base"
+    out["pool_rotate_laps"] = max(1, out["pool_rotate_laps"])
+    out["pool_cars"] = max(0, out["pool_cars"])
     out["lidar_every"] = min(max(1, out["lidar_every"]), 5)
     if out["iqn_device"] not in ("auto", "cpu", "cuda"):
         out["iqn_device"] = "auto"
@@ -153,6 +181,28 @@ def save(cfg):
 
 
 def run_dir(cfg):
-    d = ROOT / "runs" / cfg["run"]
+    """runs/<run>/ for a map run, runs/_base/<base_name>/ for a base run."""
+    d = base_dir(cfg["base_name"]) if cfg.get("run_type") == "base" else ROOT / "runs" / cfg["run"]
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def base_dir(name):
+    return ROOT / "runs" / "_base" / name
+
+
+def map_slug(path):
+    """Folder name for a map: its file name + a short hash of the full path (two maps never share a folder)."""
+    import hashlib
+    stem = Path(str(path)).name
+    for ext in (".Map.Gbx", ".map.gbx", ".Gbx", ".gbx"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+    clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)[:40].strip("_") or "map"
+    return f"{clean}_{hashlib.sha1(str(path).encode('utf-8')).hexdigest()[:6]}"
+
+
+def map_cfg(cfg, entry, pnorm=0, pool=False):
+    """Settings of one car/tester on one pool map: the map, its PB, the progress normalisation."""
+    return dict(cfg, map=entry["map"], pb_file=entry.get("pb_file", ""), pb_seconds=float(entry.get("pb_seconds") or 0),
+                _slug=map_slug(entry["map"]), _pnorm=pnorm, _pool=pool)

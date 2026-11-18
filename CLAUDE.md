@@ -15,7 +15,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   mid-track starts, `CarPool` (asynchronous cars: each car process steps as soon as its own action arrives, pipes +
   `connection.wait`), `bench`, profiling (`prof_summary`), `raise_priority` (psutil, Windows only), PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
   EMA weights by the callback; rollback via `ROLLBACK` file), `selftest`, `drive`. CLI:
-  `python tm_ai.py selftest|train|drive|bench` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
+  `python tm_ai.py selftest|train|drive|bench|transfer` (settings from `config.json`). Dispatches to `iqn.py` when `algo == "iqn"`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
   epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
@@ -33,6 +33,24 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   guard (restarts training if heartbeat is stale 150 s).
 - `setup.bat` (pip install, CPU torch), `start_dashboard.bat`, `requirements.txt`.
 - `tests/tickgym.py` — **fake tickgym** for testing without Windows/TICK/the game (see Testing).
+
+## Base driver (PPO only) `runs/_base/<base_name>/`
+- `run_type` "base" + `map_pool` ([{map, pb_file, pb_seconds}], dashboard: one line per map "path | PB file | PB s").
+  Base folder: latest.zip, vecnorm.pkl (one shared reward scaling), levels.json, tester_base.zip, events.jsonl (laps +
+  tests tagged `map`), status.json, `base.json` (`base_id` uuid, maps). Per map `maps/<slug>/` (`map_slug` = file name +
+  path hash): everything of a normal run folder (line, ghost, PB trace, mid-starts, best.json + champion.zip/.txt,
+  sections, best runs). `setup_cars`: car i -> map i (`CarPool` specs); with more maps than cars each car rotates
+  itself (`car_worker` rot: + `envs` maps every `pool_rotate_laps` laps). Tester: one map per test, round-robin, no
+  rollback; trackers + stuck hints per map. Play champion = first pool map's champion.
+- Map-neutral progress: `_pnorm` = `progress_norm_m` (1000) in base runs and runs started from a base:
+  `pscale = clip(1000 / line length, 0.2, 5)` on progress + give-up cost. Finish/checkpoint bonuses unchanged. Inputs are
+  map-neutral (all car-frame / relative / per-lap fractions / shared surface vocabulary; no absolute positions or race time).
+- New run from base: `base_from` in a map run without latest.zip -> copies latest.zip + vecnorm.pkl + levels.json
+  (`migrate()` converts an older layout), writes `runs/<run>/base.json` {base_name, base_id, base_steps}.
+- No forgetting: `pool_cars` (default 1) cars of a map run drive the pool maps (`runs/<run>/pool/<slug>/`, line/ghost
+  seeded from the base's map folder); their laps carry `pool: 1` and are ignored by stats, trackers, dashboard.
+- Transfer score: `python tm_ai.py transfer --map <path> [--pb file]` (dashboard button): base latest.zip, best of 3, no
+  learning, folder `transfer/<slug>/`; result in `transfers.json` (time or end reason, checkpoint, x/z, share of lap).
 
 ## Run folder `runs/<run>/`
 `events.jsonl` (k = start | lap | test | upd | rb | prof | stop; prof = 5-min "where the time goes"), `status.json` (heartbeat), `train.log`, `best.json`
@@ -104,8 +122,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **PPO is the main algorithm** (Kris, after IQN stalled on Training - 22). IQN code + settings stay; the dashboard
   shows IQN settings only when IQN is chosen. Defaults = recommended PPO setup: Lean weights, 8 cars, 50 ms,
   mid-starts 0.25 (after the first finish), best-of-3 tests.
-- **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best"); cross-map base model (parked
-  for later); random switching of steering layouts mid-training.
+- **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best");  random switching of steering layouts mid-training.
 
 ## Speed
 - Profiling every 5 min (`TMAI_PROF_S`): per car step TICK / inputs / rewards / waiting-for-action ms, learner
@@ -133,6 +150,7 @@ PYTHONPATH=<repo>/tests python3 -u tm_ai.py train          # PPO; add "algo":"iq
 TMAI_IQN_WARMUP=3000 ...                                   # shorter IQN warm-up for tests
 ```
 The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3 s at 30 ms is optimal.
+Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, own material ids) for base tests.
 `TICKGYM_FAKE_MS=5` makes each fake step take ~5 ms (random, like a busy TICK) for speed tests;
 `TMAI_BENCH_S` / `TMAI_BENCH_CARS` shorten the benchmark. `TICKGYM_FAKE_DETOUR=1` adds a 620 m side loop at z=200 (just doable inside the 8 s far-off limit at full gas);
 `TICKGYM_FAKE_DETOUR=<file>` only while that file exists. Section fallback test: trace `pb.txt` ("0 accel 1") with
@@ -155,6 +173,6 @@ Test checkpoint conversion by training with the previous git version first, then
 ## Open ideas / backlog
 - Wheel contact material input (check tickgym telemetry fields via selftest).
 - Learning-rate warm restart when layout/timing changes (PPO).
-- Cross-map base driver with map pool (parked by Kris).
+- Base: lap-time chart mixes maps in base runs (per-map table is the real view).
 - Run comparison view in the dashboard.
 - Check selftest's raw ice values on a real ice/snow map.

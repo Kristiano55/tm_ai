@@ -27,7 +27,7 @@ canvas{width:100%;height:210px;display:block}canvas.t{height:240px}
 pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;min-height:90px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:26px}h3.sec{margin:6px 0 12px;font-size:16px}label small{color:var(--mut);font-size:11px}
 label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
-input[type=text],input[type=number],select{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
+input[type=text],input[type=number],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
 .hide{display:none}
 table.sec{width:100%;border-collapse:collapse;font-size:13px}table.sec th{text-align:left;color:var(--mut);font-weight:400;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--line)}
 table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--red)}td.ok{color:var(--grn)}td.fb{color:var(--org)}
@@ -76,6 +76,10 @@ table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--
     <div class="card"><div class="lg"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span></div>
       <h3>Where laps end <small>full laps bright, mid-track faint</small></h3><canvas id="cMap" style="height:300px"></canvas></div>
   </div>
+  <div class="card hide" id="baseCard"><h3>Base maps <small id="baseSub">one shared driver, each map with its own champion, line and ghost</small></h3>
+    <table class="sec" id="mapT"></table>
+    <div class="flex" style="margin-top:10px;align-items:center"><span class="mut" id="trTxt">Transfer test: drive the base on a map it never trained on (best of 3, no learning).</span>
+    <button id="bTr">Transfer test</button></div></div>
   <div class="card"><h3>Sections <small>checkpoint to checkpoint: your PB/WR split, the AI's best split, how often laps fail there, which target the AI chases</small></h3>
     <table class="sec" id="secT"><tr><td class="mut">no data yet</td></tr></table></div>
   <div class="card"><h3>Where the time goes <small>one car step, last 5-minute summary</small></h3>
@@ -91,7 +95,12 @@ table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--
 <script>
 const $=id=>document.getElementById(id);
 const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
-const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; empty = off)','text'],['discord_every_min','Discord summary every N minutes','number'],['algo','Learning algorithm','select'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; empty = off)','text'],['discord_every_min','Discord summary every N minutes','number'],['algo','Learning algorithm','select'],['run_type','Run type','select'],['base_name','Base name (base runs: runs/_base/<name>)','text'],
+ ['map_pool','Map pool - one map per line: map path | PB file (optional) | PB seconds (optional)','pool'],
+ ['pool_rotate_laps','Base: a car changes pool map every N laps (when there are more maps than cars)','number'],
+ ['progress_norm_m','Base: progress pays as if every lap were this long (m)','number'],
+ ['base_from','Map run: start from this base model (base name; empty = off)','text'],
+ ['pool_cars','Map run: cars that keep driving the pool maps (no forgetting; 0 = off)','number'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
  ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
@@ -105,11 +114,12 @@ const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; em
  ['mid_start_p','Share of laps that start mid-track (0 = off)','number'],['mid_start_every_s','Mid-track start points every (s of the champion lap)','number'],
  ['line_refresh_s','Rebuild reference line + ghost when the champion beats it by (s, 0 = never)','number'],
  ['stop_at_pb','Stop training when the champion beats my PB','checkbox'],['extra_obs','Extra observations (turbo, grip, wall hits, ghost speed, line offset …)','checkbox'],['resume','Resume from latest checkpoint','checkbox']];
-const OPTS={algo:[['ppo','PPO (recommended)'],['iqn','IQN - experimental (Linesight-style; more settings appear)']],iqn_device:[['auto','Auto (GPU if PyTorch has CUDA, else CPU)'],['cpu','CPU'],['cuda','GPU (CUDA)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
+const OPTS={run_type:[['map','One map'],['base','Base driver (all maps in the pool, one shared model)']],algo:[['ppo','PPO (recommended)'],['iqn','IQN - experimental (Linesight-style; more settings appear)']],iqn_device:[['auto','Auto (GPU if PyTorch has CUDA, else CPU)'],['cpu','CPU'],['cuda','GPU (CUDA)']],steer_mode:[['progressive','Progressive (fine near centre, coarse at the edges)'],['uniform','Uniform (10% steps)']]};
 let cfgLoaded=false;
 let WMETA=[], LEAN={}, LINES={};
 function fillForm(c,w){ WMETA=w||WMETA;
-  const fld=([k,l,t])=>t=='checkbox'?
+  const poolTxt=v=>(v||[]).map(e=>[e.map,e.pb_file||'',e.pb_seconds||''].join(' | ').replace(/( \| )+$/,'')).join('\n');
+  const fld=([k,l,t])=>t=='pool'?`<label style="grid-column:1/-1">${l}<textarea id="f_${k}" rows="4">${poolTxt(c[k])}</textarea></label>`:t=='checkbox'?
     `<label class="ck"><input type="checkbox" id="f_${k}" ${c[k]?'checked':''}> ${l}</label>`:t=='select'?
     `<label>${l}<select id="f_${k}">${OPTS[k].map(([v,n])=>`<option value="${v}" ${c[k]==v?'selected':''}>${n}</option>`).join('')}</select></label>`:
     `<label>${l}<input type="${t}" step="any" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}"></label>`;
@@ -118,11 +128,12 @@ function fillForm(c,w){ WMETA=w||WMETA;
     <h3 class="sec">Reward weights</h3><div class="grid">${WMETA.map(wt).join('')}</div>`;
   const iqnUi=()=>{const on=$('f_algo').value=='iqn'; for(const [k] of FIELDS) if(k.startsWith('iqn_')||k=='minirace_s') $('f_'+k).closest('label').classList.toggle('hide',!on)};
   $('f_algo').onchange=iqnUi; iqnUi() }
-function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); o[k]=t=='checkbox'?e.checked:e.value}
+function readPool(txt){ return txt.split('\n').map(l=>l.split('|').map(x=>x.trim())).filter(p=>p[0]).map(p=>({map:p[0],pb_file:p[1]||'',pb_seconds:parseFloat(p[2])||0})) }
+function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); o[k]=t=='checkbox'?e.checked:t=='pool'?readPool(e.value):e.value}
   for(const m of WMETA) o[m.k]=$('f_'+m.k).value; return o }
 async function post(p,b){ const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}); const j=await r.json(); if(r.status>=400) alert(j.message); setTimeout(tick,300) }
 $('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
-$('bStart').onclick=()=>post('/api/start'); $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
+$('bStart').onclick=()=>post('/api/start'); $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
 $('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
 $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
 $('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
@@ -131,6 +142,17 @@ $('bSave').onclick=async()=>{await post('/api/config',readForm()); $('saved').te
 $('n1').onclick=$('n2').onclick=e=>{const s=e.target.id=='n2'; $('n1').className=s?'':'on'; $('n2').className=s?'on':''; $('dash').className=s?'hide':''; $('set').className=s?'':'hide'};
 
 const TCOL={tick:['#3b8bea','TICK (game physics)'],obs:['#39c46a','building inputs'],env:['#e8a33a','rewards / rules'],wait:['#8b93a0','waiting for an action']};
+function drawBase(s){
+  const on=!!s.maps; $('baseCard').classList.toggle('hide',!on); if(!on) return;
+  const f=v=>v==null?'–':v.toFixed(3)+' s';
+  if(s.base) $('baseSub').textContent=`base "${s.base.name}" · id ${s.base.base_id} · one shared driver, each map with its own champion, line and ghost`;
+  $('mapT').innerHTML='<tr><th>Map</th><th>Champion</th><th>PB</th><th>Difference</th><th>Champion tests</th><th>Finished (last 100 laps)</th><th>Laps</th></tr>'+
+    s.maps.map(r=>{const d=(r.champ!=null&&r.pb)?r.champ-r.pb:null;
+      return `<tr><td>${r.name}</td><td>${f(r.champ)}</td><td>${r.pb?f(r.pb):'–'}</td><td class="${d==null?'':d>0?'bad':'ok'}">${d==null?'–':(d>0?'+':'')+d.toFixed(3)+' s'}</td><td>${r.tests}</td><td>${r.fin==null?'–':r.fin+'%'}</td><td>${r.laps}</td></tr>`}).join('');
+  const tr=s.transfers||[]; if(tr.length) $('trTxt').textContent='Transfer: '+tr.map(t=>{const b=t.best;
+    return `${t.map.split(/[\\/]/).pop()}: `+(b.finished?(b.ms/1000).toFixed(3)+' s':`no finish, ${Math.round(b.progress*100)}% (${b.end} after CP ${b.cp})`)}).join(' · ');
+  $('bTr').disabled=s.state=='running'||s.state=='benchmarking';
+}
 function drawSections(rows){
   if(!rows||!rows.length){$('secT').innerHTML='<tr><td class="mut">no data yet (filled in as laps end)</td></tr>';return}
   const f=v=>v==null?'–':v.toFixed(2)+' s';
@@ -222,7 +244,7 @@ function render(s){
   $('kLaps').textContent=n0(s.laps_total); $('kFin').textContent=(s.finished_pct==null?'':`${s.finished_pct}% of full laps finished`)+(s.mid_laps?` · ${n0(s.mid_laps)} mid-track`:'');
   $('kAvg').textContent=sec(s.recent_avg); $('kBest').textContent=sec(s.best_lap);
   $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'')}${(s.best_lap-pb/1000).toFixed(2)} s vs PB`:'';
-  drawTime(s); drawSections(s.sections);
+  drawTime(s); drawSections(s.sections); drawBase(s);
   $('kSpeed').textContent=s.speed?Math.round(s.speed)+'x':'–'; $('kCars').textContent=`vs real time · league of ${c.envs} cars`;
   $('kTests').textContent=n0(s.tests_total); $('kProm').textContent=`${s.promotions} faster champions found`;
   $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;

@@ -516,6 +516,8 @@ class TMEnv(gym.Env):
         self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
         self.iqn = cfg.get("algo") == "iqn"          # IQN charges failure itself: no give-up penalty here
+        self.slug, self.pool_car = cfg.get("_slug") or None, bool(cfg.get("_pool"))   # base / pool map tags
+        self.pnorm, self.pscale = float(cfg.get("_pnorm") or 0.0), 1.0     # map-neutral progress (base runs)
         self.cut_behind = float(cfg["cut_behind_s"])
         self.ghost_window = float(cfg["ghost_window_s"])
         self.vcp_every = float(cfg["vcp_every_s"])
@@ -1132,6 +1134,9 @@ class TMEnv(gym.Env):
         self.pa_old = np.zeros(12)
         self.sbuf, self.pbuf, self.nbuf, self.far, self.stall = [], [], [], 0, 0
         self.limit = self._limit_ticks()
+        if self.pnorm > 0:                     # every map's full lap pays like a pnorm-metre lap (clipped 0.2..5 so
+            length = self.dense[2][-1] if self.dense is not None else self.lap_len   # driving always beats waiting)
+            self.pscale = float(np.clip(self.pnorm / max(length, 1.0), 0.2, 5.0))
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
         if self.starts and self.np_random.random() < self.mid_p:
@@ -1186,7 +1191,7 @@ class TMEnv(gym.Env):
         speed = float(t.vehicle.speed)
         dp = s - self._s                      # _s = progress already paid; a skipped stretch is paid at
         dp = min(dp, 10.0) if dp >= 0 else max(dp, -10.0)   # <= 10 m per step, a backward jump costs once
-        r["progress"] = W["w_progress"] * dp
+        r["progress"] = W["w_progress"] * dp * self.pscale
         tf = self.tf
         r["time"] = -W["w_time"] * tf
         r["steer"] = -W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
@@ -1243,7 +1248,7 @@ class TMEnv(gym.Env):
         length = self.dense[2][-1] if self.dense is not None else self.lap_len
         # Ending a lap early (stuck / off the track) costs what driving the rest of it would have paid,
         # so giving up is never cheaper than pushing on through a bad section.
-        give_up = W["w_progress"] * max(0.0, length - s)
+        give_up = W["w_progress"] * max(0.0, length - s) * self.pscale
         if self.iqn:                            # IQN charges failure itself (time cost for the rest of the mini-race)
             give_up = 0.0
         if t.finished:
@@ -1291,7 +1296,8 @@ class TMEnv(gym.Env):
             self._blame(s, end not in ("finished",))
         info = {"finished": bool(t.finished), "race_ms": int(t.race.race_time_ms),
                 "cp": taken, "tick": tick, "end": end, "mid": self.start_i is not None, "cp0": self.cp0,
-                "secs_wr": list(self.sec_wr),
+                "secs_wr": list(self.sec_wr), "map": self.slug, "pool": 1 if self.pool_car else 0,
+                "n_seg": int(self.n_seg),
                 "x": round(float(pos[0]), 1), "z": round(float(pos[2]), 1)}
         c2 = time.perf_counter()
         obs = self._obs(t, s)
@@ -1364,11 +1370,16 @@ def raise_priority(tick_too=False):
         pass
 
 
-def car_worker(cfg, run_dir, conn):
+def car_worker(cfg, run_dir, conn, rot=None):
     """One car in its own process. Steps as soon as it gets an action; resets by itself when a lap ends.
-    Replies (obs, reward, done, info, timing) where timing = (TICK, observation, rest of env, waited for action)."""
+    Replies (obs, reward, done, info, timing) where timing = (TICK, observation, rest of env, waited for action).
+    rot (map pool): {"maps": [(cfg, run_dir), ...], "start": i, "stride": k, "every": N}: the car drives
+    maps[start] and moves on by `stride` maps every N laps (only when there are more maps than such cars)."""
     raise_priority()
     try:
+        idx, laps = (rot["start"] % len(rot["maps"]), 0) if rot else (0, 0)
+        if rot:
+            cfg, run_dir = rot["maps"][idx]
         env = TMEnv(cfg, run_dir)
         obs, _ = env.reset()
         conn.send(("ready", obs, int(env.observation_space.shape[0]), [int(x) for x in env.action_space.nvec],
@@ -1389,6 +1400,11 @@ def car_worker(cfg, run_dir, conn):
                 info["terminal_observation"] = obs
                 info["TimeLimit.truncated"] = bool(trunc and not term)
                 r0 = time.perf_counter()
+                laps += 1
+                if rot and len(rot["maps"]) > rot["stride"] and laps % rot["every"] == 0:   # next pool map
+                    env.close()
+                    idx = (idx + rot["stride"]) % len(rot["maps"])
+                    env = TMEnv(*rot["maps"][idx])
                 obs, _ = env.reset()
                 tm = (tm[0] + time.perf_counter() - r0,) + tm[1:]     # reset = TICK work
             conn.send(("step", obs, r, done, info, tm))
@@ -1409,10 +1425,12 @@ class CarPool:
     DEADLINE = float(os.environ.get("TMAI_CAR_DEADLINE", 120))   # a car step taking longer = hung car, replaced
     # (a reset that builds mid-track starts replays a whole lap: on long maps the deadline grows, see __init__)
 
-    def __init__(self, cfg, run_dir, n):
+    def __init__(self, cfg, run_dir, n, specs=None):
+        """specs: per car (cfg, run_dir, rot) to give cars their own maps (base runs, pool cars); None = all alike."""
         import multiprocessing as mp
         from multiprocessing.connection import wait
         self._wait, self.cfg, self.run_dir = wait, cfg, str(run_dir)
+        self.specs = specs or [(cfg, str(run_dir), None)] * n
         if "TMAI_CAR_DEADLINE" not in os.environ:
             self.DEADLINE = max(120.0, 3.0 * time_budget(cfg))
         self.ctx = mp.get_context("spawn")
@@ -1429,7 +1447,8 @@ class CarPool:
 
     def _spawn(self, i):
         a, b = self.ctx.Pipe()
-        p = self.ctx.Process(target=car_worker, args=(self.cfg, self.run_dir, b), daemon=True)
+        c_cfg, c_dir, rot = self.specs[i]
+        p = self.ctx.Process(target=car_worker, args=(c_cfg, str(c_dir), b, rot), daemon=True)
         p.start()
         b.close()
         self.conns[i], self.procs[i] = a, p
@@ -1511,14 +1530,14 @@ class CarPool:
                 p.terminate()
 
 
-def make_pool_vecenv(cfg, run_dir):
+def make_pool_vecenv(cfg, run_dir, specs=None):
     """PPO's cars: lock-step like SubprocVecEnv (PPO's rollouts need it) but a hung car is replaced instead of
     freezing the whole training."""
     from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
     class PoolVecEnv(VecEnv):
         def __init__(self):
-            self.pool = CarPool(cfg, run_dir, cfg["envs"])
+            self.pool = CarPool(cfg, run_dir, cfg["envs"], specs)
             self.cur = list(self.pool.first_obs)
             self.n_seg = self.pool.n_seg
             self.render_mode = None
@@ -1797,16 +1816,18 @@ def time_budget(cfg):
     return float(cfg["max_lap_seconds"])
 
 
-def ppo_test_worker(cfg, run_dir, inbox, busy):
+def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
     """Champion tests for PPO in their own process (spawn): best of N laps with the EMA weights it is sent.
-    Writes champion.zip/.txt, champ_trace, champion_actions, the reference line; asks for a rollback via ROLLBACK."""
+    Writes champion.zip/.txt, champ_trace, champion_actions, the reference line; asks for a rollback via ROLLBACK.
+    maps (base run): [(cfg, map folder, slug), ...] tested round-robin, one map per test, files in that map's
+    folder; no rollbacks (one shared model)."""
     import torch
     from stable_baselines3 import PPO
     torch.set_num_threads(1)
     raise_priority()
     run_dir = Path(run_dir)
-    events, best_file = run_dir / "events.jsonl", run_dir / "best.json"
-    line_file, line_meta = run_dir / "centerline.npy", run_dir / "centerline.json"
+    events = run_dir / "events.jsonl"
+    rr, cur = 0, None
 
     def log(**kw):
         kw["t"] = round(time.time(), 2)
@@ -1819,18 +1840,26 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
         if msg is None:
             break
         try:
+            mcfg, R, slug = maps[rr % len(maps)] if maps else (cfg, run_dir, None)
+            R = Path(R)
+            rr += 1
+            if maps and cur != slug and env is not None:          # next pool map: one test gym at a time
+                env.close()
+                env = None
+            cur = slug
+            best_file, line_file, line_meta = R / "best.json", R / "centerline.npy", R / "centerline.json"
             if env is None:
                 try:                           # needs one extra gym slot besides the training cars
-                    env = TMEnv(cfg, run_dir, shorten=False, role="champion test")
+                    env = TMEnv(mcfg, R, shorten=False, role="champion test")
                 except Exception as e:
                     say(f"Champion tests disabled: {e}. Lower 'envs' by one to enable them.")
                     busy.value = -1
                     continue
             if model is None:
-                model = PPO.load(str(run_dir / "tester_base.zip"), device="cpu")
+                model = PPO.load(str(run_dir / "tester_base.zip"), device="cpu")   # layout only
             model.policy.load_state_dict(msg["sd"])
             best_try = None                    # best of N: argmax lap + seeded laps, keep the fastest
-            n_try = test_tries(cfg, run_dir)
+            n_try = test_tries(mcfg, R)
             for sd in [None] + [1000 + i for i in range(max(0, n_try - 1))]:
                 inf = run_episode(env, model, sd)
                 tr = {"info": inf, "seed": sd, "hist": list(env.hist), "acts": list(env.acts), "rec": env.g.export()}
@@ -1842,7 +1871,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
             fin, rec = bool(info["finished"]), tr["rec"]
             tests += 1
             try:                               # watch any test in TICK, also failed ones
-                InputText.write(str(run_dir / "last_test.txt"), rec.actions)
+                InputText.write(str(R / "last_test.txt"), rec.actions)
             except Exception:
                 pass
             ms = int(rec.finish_ms) if fin else None
@@ -1853,26 +1882,26 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
                 best.setdefault("first_test_ms", ms)
             if fin and (champ is None or ms < champ):
                 promoted, bad = True, 0
-                model.save(run_dir / "champion_tmp.zip")         # champion = the smoothed weights
-                os.replace(run_dir / "champion_tmp.zip", run_dir / "champion.zip")
+                model.save(R / "champion_tmp.zip")         # champion = the smoothed weights
+                os.replace(R / "champion_tmp.zip", R / "champion.zip")
                 best["champion_ms"] = champ = ms
                 best["champion_seed"] = tr["seed"]
-                save_npy(run_dir / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
-                InputText.write(str(run_dir / "champion.txt"), rec.actions)
+                save_npy(R / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
+                InputText.write(str(R / "champion.txt"), rec.actions)
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
                 bad += 1
-                if bad >= cfg["rollback_after"]:
-                    if (run_dir / "champion.zip").exists():
-                        (run_dir / "ROLLBACK").write_text("1")
+                if bad >= cfg["rollback_after"] and not maps:
+                    if (R / "champion.zip").exists():
+                        (R / "ROLLBACK").write_text("1")
                         rolled = True
                     bad = 0
             else:
                 bad = 0
-            ca = run_dir / "champion_actions.json"
+            ca = R / "champion_actions.json"
             if fin and (promoted or not ca.exists()):          # route for the mid-track starts
                 write_json(ca, {"ms": ms, "acts": env.acts})
-            if fin and not (run_dir / "champ_trace.npy").exists():
-                save_npy(run_dir / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
+            if fin and not (R / "champ_trace.npy").exists():
+                save_npy(R / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
             line_ms = read_json(line_meta).get("ms") or best.get("first_test_ms")   # old runs: line from the first test
             refresh = cfg["line_refresh_s"] and promoted and line_ms and ms <= line_ms - cfg["line_refresh_s"] * 1000
             if env.guide:
@@ -1882,15 +1911,15 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
                 save_npy(line_file, make_line(np.asarray(env.hist)[:, :3]))
                 env._load_line()
                 for f in ("profile.json", "profile.npy"):
-                    (run_dir / f).unlink(missing_ok=True)
+                    (R / f).unlink(missing_ok=True)
                 env._offer_profile(ms)
                 env._ghost_from_best()                           # ghost = faster of this lap and the best saved run
                 write_json(line_meta, {"ms": ms, "t": time.time()})
                 say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
             write_json(best_file, best)
             log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled,
-                tries=n_try, seed=tr["seed"])
-            say(f"Champion test {tests} (best of {n_try}): "
+                tries=n_try, seed=tr["seed"], map=slug)
+            say(f"Champion test {tests}{' on ' + slug if slug else ''} (best of {n_try}): "
                 + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
                 + (" -> NEW CHAMPION" if promoted else "") + (" -> rolling back to champion" if rolled else ""))
         except Exception as e:
@@ -1905,7 +1934,9 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
         env.close()
 
 
-def _make_callback(cfg, run_dir, tracker=None):
+def _make_callback(cfg, run_dir, tracker=None, maps=None):
+    """maps (base run): [(cfg, folder, slug), ...]: per-map section trackers + stuck hints, round-robin tests."""
+    by_slug = {m[2]: m for m in maps or []}
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.utils import get_schedule_fn
 
@@ -1927,6 +1958,7 @@ def _make_callback(cfg, run_dir, tracker=None):
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
+            self.trackers, self.stuckws = {}, {}
             freeze_guard(run_dir, seconds=max(180.0, 2.0 * time_budget(cfg) + 60.0))
             self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
             log(k="start", cfg=cfg)
@@ -1983,14 +2015,25 @@ def _make_callback(cfg, run_dir, tracker=None):
         def _on_step(self):
             for info, done in zip(self.locals["infos"], self.locals["dones"]):
                 if done:
-                    self.laps += 1
-                    self.since += 1
-                    fin = bool(info.get("finished"))
+                    fin, pool_lap = bool(info.get("finished")), bool(info.get("pool"))
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
-                        end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
-                    self.stuckw.add(info)
-                    if tracker is not None:
-                        tracker.add(info)
+                        end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"),
+                        **({"map": info["map"]} if info.get("map") else {}), **({"pool": 1} if pool_lap else {}))
+                    if not pool_lap:                     # pool cars of a map run: no effect on this map's stats
+                        self.laps += 1
+                        self.since += 1
+                        slug = info.get("map")
+                        if maps and slug in by_slug:     # base run: per-map trackers
+                            if slug not in self.trackers:
+                                mc, md, _ = by_slug[slug]
+                                self.trackers[slug] = SectionTracker(md, mc, n_sections(md, info.get("n_seg") or 1))
+                                self.stuckws[slug] = StuckWatch()
+                            self.trackers[slug].add(info)
+                            self.stuckws[slug].add(info)
+                        else:
+                            self.stuckw.add(info)
+                            if tracker is not None:
+                                tracker.add(info)
                     tm = info.get("tm")
                     if tm:
                         self.ptm += [tm["tick"], tm["obs"], tm["env"], 0.0, tm["n"]]
@@ -2016,14 +2059,15 @@ def _make_callback(cfg, run_dir, tracker=None):
                 if cfg["time_limit_min"] and now - self.t0 > cfg["time_limit_min"] * 60:
                     self.reason = "time limit reached"
                     return False
-                self.check_rollback()
-                if tracker is not None:
+                if not maps:
+                    self.check_rollback()
+                for tr_ in ([tracker] if tracker is not None else []) + list(self.trackers.values()):
                     try:
-                        tracker.update(log)
+                        tr_.update(log)
                     except Exception as e:                      # never stop training over this
                         say(f"Section tracking error: {str(e)[:100]}")
                 champ, pb = read_json(best_file).get("champion_ms"), cfg["pb_seconds"]
-                if cfg["stop_at_pb"] and pb and champ and champ <= pb * 1000:
+                if cfg["stop_at_pb"] and pb and champ and champ <= pb * 1000 and not maps:
                     self.reason = "reached your PB"
                     return False
                 self.status("running")
@@ -2035,8 +2079,8 @@ def _make_callback(cfg, run_dir, tracker=None):
             import multiprocessing as mp
             ctx = mp.get_context("spawn")
             self.inbox, self.busy = ctx.Queue(), ctx.Value("i", 0)
-            self.tester = ctx.Process(target=ppo_test_worker, args=(cfg, str(run_dir), self.inbox, self.busy),
-                                      daemon=True)
+            self.tester = ctx.Process(target=ppo_test_worker, args=(cfg, str(run_dir), self.inbox, self.busy,
+                                                                    maps), daemon=True)
             self.tester.start()
 
         def champion_test(self):
@@ -2060,7 +2104,8 @@ def _make_callback(cfg, run_dir, tracker=None):
                         pass
                     self.tester_start()
                 return
-            self.check_rollback()                                # never send a test before a pending rollback
+            if not maps:
+                self.check_rollback()                            # never send a test before a pending rollback
             self.since = 0
             sd = self.ema if getattr(self, "ema", None) is not None else self.model.policy.state_dict()
             self.busy.value = 1
@@ -2132,6 +2177,88 @@ def prepare_guide(cfg, run_dir):
             "where it is slower, and any section it drives faster replaces yours.")
 
 
+def base_info(name, maps=None):
+    """runs/_base/<name>/base.json: the base model's unique id (created once) and its pool maps."""
+    d = cfgmod.base_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    info = read_json(d / "base.json")
+    if not info.get("base_id"):
+        import uuid
+        info = {"base_id": uuid.uuid4().hex[:12], "created": time.time(), "name": name}
+    if maps is not None:
+        info["maps"] = maps
+    write_json(d / "base.json", info)
+    return info
+
+
+def start_from_base(cfg, run_dir):
+    """Map run with base_from set and no model of its own yet: copy the base model + reward scaling (the layout
+    is converted by migrate() if it changed). Returns the base record for the run's base.json, or None."""
+    name = cfg["base_from"]
+    if not name or (run_dir / "latest.zip").exists():
+        return None
+    src = cfgmod.base_dir(name)
+    if not (src / "latest.zip").exists():
+        say(f"Base '{name}' has no model yet (runs/_base/{name}/latest.zip); starting from scratch")
+        return None
+    import shutil
+    for f in ("latest.zip", "vecnorm.pkl", "levels.json"):
+        if (src / f).exists():
+            shutil.copyfile(src / f, run_dir / f)
+    rec = {"base_name": name, "base_id": base_info(name).get("base_id"), "t": time.time()}
+    write_json(run_dir / "base.json", rec)                 # also switches on map-neutral progress for this run
+    return rec
+
+
+def setup_cars(cfg, run_dir, pnorm):
+    """Which map each car drives. Base run: cars spread over the pool (rotating every pool_rotate_laps laps when
+    there are more maps than cars), each map with its own folder. Map run with a pool: pool_cars cars keep driving
+    pool maps (no forgetting). Returns (specs for CarPool or None, maps for the tester / trackers or None)."""
+    n, pool = cfg["envs"], cfg["map_pool"]
+    if cfg["run_type"] == "base":
+        if not pool:
+            raise SystemExit("Base run: add maps to the map pool first (Settings).")
+        maps = []
+        for e in pool:
+            c = cfgmod.map_cfg(cfg, e, pnorm)
+            d = run_dir / "maps" / c["_slug"]
+            d.mkdir(parents=True, exist_ok=True)
+            write_json(d / "map.json", e)
+            prepare_guide(c, d)
+            maps.append((c, str(d), c["_slug"]))
+        base_info(cfg["base_name"], [m[2] for m in maps])
+        pairs = [(m[0], m[1]) for m in maps]
+        if len(maps) > n:
+            specs = [(cfg, str(run_dir), {"maps": pairs, "start": i, "stride": n, "every": cfg["pool_rotate_laps"]})
+                     for i in range(n)]
+        else:
+            specs = [(maps[i % len(maps)][0], maps[i % len(maps)][1], None) for i in range(n)]
+        say(f"Base run '{cfg['base_name']}': {len(maps)} maps, {n} cars"
+            + (f", each car changes map every {cfg['pool_rotate_laps']} laps" if len(maps) > n else ""))
+        return specs, maps
+    k = min(cfg["pool_cars"], n - 1) if pool else 0
+    if k <= 0:
+        return None, None
+    main = dict(cfg, _pnorm=pnorm)
+    pmaps = []
+    for e in pool:
+        c = cfgmod.map_cfg(cfg, e, pnorm, pool=True)
+        d = run_dir / "pool" / c["_slug"]
+        d.mkdir(parents=True, exist_ok=True)
+        if cfg["base_from"]:                                  # start from the base's line / ghost for that map
+            src = cfgmod.base_dir(cfg["base_from"]) / "maps" / c["_slug"]
+            for f in ("centerline.npy", "centerline.json", "profile.npy", "profile.json"):
+                if (src / f).exists() and not (d / f).exists():
+                    import shutil
+                    shutil.copyfile(src / f, d / f)
+        prepare_guide(c, d)
+        pmaps.append((c, str(d)))
+    specs = [(main, str(run_dir), None)] * (n - k) + [
+        (main, str(run_dir), {"maps": pmaps, "start": j, "stride": k, "every": cfg["pool_rotate_laps"]}) for j in range(k)]
+    say(f"{k} of {n} cars keep driving the {len(pmaps)} pool maps (their laps don't count for this map)")
+    return specs, None
+
+
 def train(cfg):
     import torch
     from stable_baselines3 import PPO
@@ -2142,9 +2269,15 @@ def train(cfg):
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     raise_priority(tick_too=True)
-    prepare_guide(cfg, run_dir)
-    venv = make_pool_vecenv(cfg, str(run_dir))              # a hung car is replaced, not the whole training frozen
-    tracker = SectionTracker(run_dir, cfg, n_sections(run_dir, venv.n_seg))
+    base = cfg["run_type"] == "base"
+    from_base = None if base else start_from_base(cfg, run_dir)
+    pnorm = float(cfg["progress_norm_m"]) if (base or (run_dir / "base.json").exists()) else 0.0
+    specs, maps = setup_cars(cfg, run_dir, pnorm)
+    if not base:
+        cfg = dict(cfg, _pnorm=pnorm)
+        prepare_guide(cfg, run_dir)
+    venv = make_pool_vecenv(cfg, str(run_dir), specs)       # a hung car is replaced, not the whole training frozen
+    tracker = None if base else SectionTracker(run_dir, cfg, n_sections(run_dir, venv.n_seg))
     set_gamma(cfg)
     vn_file = run_dir / "vecnorm.pkl"
     env = None
@@ -2169,7 +2302,7 @@ def train(cfg):
     migrate(run_dir, cfg, env)
 
     model, latest = None, run_dir / "latest.zip"
-    if cfg["resume"] and latest.exists():
+    if (cfg["resume"] or from_base) and latest.exists():
         try:
             model = PPO.load(str(latest), env=env, device="cpu")
             model.target_kl = 0.02
@@ -2180,8 +2313,12 @@ def train(cfg):
             say(f"Cannot resume ({str(e)[:80]}), starting fresh")
     if model is None:
         model = make_model(env)
+    if from_base:
+        write_json(run_dir / "base.json", {**from_base, "base_steps": int(model.num_timesteps)})
+        say(f"Started from base '{from_base['base_name']}' (id {from_base['base_id']}, "
+            f"{model.num_timesteps:,} steps of pool driving)")
     focus_entropy(model)
-    cb = _make_callback(cfg, run_dir, tracker)
+    cb = _make_callback(cfg, run_dir, tracker, maps)
     try:
         model.learn(total_timesteps=10 ** 12, callback=cb, reset_num_timesteps=False)
     except KeyboardInterrupt:
@@ -2198,6 +2335,11 @@ def drive(cfg, model_path=None):
     from stable_baselines3 import PPO
 
     run_dir = cfgmod.run_dir(cfg)
+    if cfg["run_type"] == "base":                 # base run: the champion of the first pool map
+        if not cfg["map_pool"]:
+            raise SystemExit("Base run without pool maps.")
+        cfg = cfgmod.map_cfg(cfg, cfg["map_pool"][0], cfg["progress_norm_m"])
+        run_dir = run_dir / "maps" / cfg["_slug"]
     model = PPO.load(model_path or str(run_dir / "champion.zip"), device="cpu")
     env = TMEnv(cfg, run_dir, shorten=False, role="play")
     say("Driving the champion (the lap is simulated in the background, the game window will not show it) ...")
@@ -2223,6 +2365,53 @@ FIELDS = {
     "vehicle": ["in_water"],
     "wheels": ["icing_percent", "angular_velocity"],
 }
+
+
+def transfer(cfg, map_path, pb_file=""):
+    """Transfer score: drive the base model (no learning) on a map that is NOT in its pool, best of 3 (most likely
+    actions + 2 seeds). Reports the time, or where it fails (checkpoint, position, share of the lap)."""
+    from stable_baselines3 import PPO
+    name = cfg["base_name"]
+    bd = cfgmod.base_dir(name)
+    if not (bd / "latest.zip").exists():
+        raise SystemExit(f"Base '{name}' has no model yet ({bd / 'latest.zip'}).")
+    entry = {"map": map_path, "pb_file": pb_file, "pb_seconds": 0}
+    c = cfgmod.map_cfg(cfg, entry, cfg["progress_norm_m"])
+    slug = c["_slug"]
+    if slug in [cfgmod.map_slug(e["map"]) for e in cfg["map_pool"]]:
+        say(f"Note: {map_path} is in the base's pool, so this is not a transfer test.")
+    d = bd / "transfer" / slug
+    d.mkdir(parents=True, exist_ok=True)
+    prepare_guide(c, d)
+    model = PPO.load(str(bd / "latest.zip"), device="cpu")
+    env = TMEnv(c, d, shorten=False, role="transfer test")
+    if model.observation_space.shape != env.observation_space.shape:
+        env.close()
+        raise SystemExit("The base model uses an older input layout: train the base once with this version first.")
+    say(f"Transfer test: base '{name}' on {map_path} (not trained on it), best of 3 ...")
+    tries = []
+    for sd in (None, 1000, 1001):
+        inf = run_episode(env, model, sd)
+        length = env.dense[2][-1] if env.dense is not None else env.lap_len
+        tries.append({"seed": sd, "finished": bool(inf["finished"]), "ms": int(inf["race_ms"]) if inf["finished"] else None,
+                      "end": inf.get("end", ""), "cp": int(inf.get("cp", 0)), "x": inf.get("x"), "z": inf.get("z"),
+                      "progress": round(min(float(getattr(env, "_s", 0.0)) / max(length, 1.0), 1.0), 3)})
+        t = tries[-1]
+        say(f"  try {len(tries)}: " + (f"finished in {t['ms'] / 1000:.3f} s" if t["finished"] else
+            f"{t['end']} after checkpoint {t['cp']} at x={t['x']} z={t['z']} ({t['progress']:.0%} of the lap)"))
+    env.close()
+    best = min(tries, key=lambda t: (0, t["ms"]) if t["finished"] else (1, -t["progress"]))
+    rec = {"t": time.time(), "map": map_path, "slug": slug, "base_id": base_info(name).get("base_id"),
+           "best": best, "tries": tries}
+    write_json(d / "transfer.json", rec)
+    allr = read_json(bd / "transfers.json")
+    allr[slug] = rec
+    write_json(bd / "transfers.json", allr)
+    with open(bd / "events.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"k": "transfer", "t": round(time.time(), 2), "map": slug, "best": best}) + "\n")
+    say("Transfer score: " + (f"{best['ms'] / 1000:.3f} s" if best["finished"] else
+        f"no finish - best try got {best['progress']:.0%} of the lap ({best['end']} after checkpoint {best['cp']})"))
+    return rec
 
 
 def missing_fields(env):
@@ -2289,7 +2478,8 @@ def selftest(cfg):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench"])
+    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer"])
+    ap.add_argument("--pb", default="", help="transfer: optional PB file of that map (for a target line)")
     ap.add_argument("--map")
     ap.add_argument("--run")
     ap.add_argument("--envs", type=int)
@@ -2303,8 +2493,15 @@ if __name__ == "__main__":
     cfg = cfgmod.coerce(cfg)
     if a.fresh:
         cfg["resume"] = False
-    if not cfg["map"]:
+    if a.cmd == "transfer":
+        if not a.map:
+            raise SystemExit("transfer needs --map <map not in the pool>")
+        transfer(cfg, a.map, a.pb)
+        raise SystemExit(0)
+    if not cfg["map"] and not (cfg["run_type"] == "base" and cfg["map_pool"]):
         raise SystemExit("No map set. Pass --map or set it in the dashboard (Settings).")
+    if cfg["run_type"] == "base" and cfg["algo"] == "iqn":
+        raise SystemExit("Base runs are PPO only: set the algorithm to PPO.")
     if cfg["algo"] == "iqn" and a.cmd in ("train", "drive"):
         import iqn
         {"train": iqn.train, "drive": iqn.drive}[a.cmd](cfg)
