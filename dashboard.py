@@ -66,6 +66,7 @@ class Store:
         self.sess_t0, self.sess_lap0, self.last_t = None, 0, None
         self.prof = None
         self.map_laps, self.map_n, self.map_tests = {}, {}, {}
+        self.notice = None
 
     def refresh(self, path):
         if path != self.path:
@@ -94,6 +95,7 @@ class Store:
             k = e.get("k")
             if k == "start":
                 self.sess_t0, self.sess_lap0 = e["t"], self.n_all
+                self.notice = e.get("notice")
             elif k == "lap":
                 if e.get("pool"):                      # pool cars of a map run: not this map's laps
                     continue
@@ -230,6 +232,23 @@ def hub_state(refresh=False):
             "busy": alive(), "log": log}
 
 
+_RUNS = {"t": 0.0, "v": []}
+
+
+def runs_cached():
+    """Existing runs for the run picker (refreshed every 10 s)."""
+    if time.time() - _RUNS["t"] > 10:
+        _RUNS.update(t=time.time(), v=safe(cfgmod.list_runs))
+    return _RUNS["v"]
+
+
+def tests_can_run(cfg, rd, best):
+    """Champion tests start after the first finished full lap (base: on any pool map)."""
+    if cfg["run_type"] == "base":
+        return any((rd / "maps" / cfgmod.map_slug(e["map"]) / "best_run.json").exists() for e in cfg["map_pool"])
+    return (rd / "best_run.json").exists() or bool(best.get("champion_ms"))
+
+
 def safe(fn, *a):
     try:
         return fn(*a)
@@ -301,6 +320,10 @@ def build_state():
         "recent_avg": sum(last20) / len(last20) if last20 else None,
         "best_lap": min((s for _, s in fin), default=None),
         "next_test_in": max(0, cfg["test_every_laps"] - (S.n_all - last_test_lap)),
+        "tests_wait": not tests_can_run(cfg, rd, best),
+        "hit_ramp": read_json(rd / "hit_ramp.json") or None,
+        "notice": S.notice, "run_warnings": list(cfgmod.RUN_WARNINGS),
+        "runs": runs_cached(), "run_folder": rd.name,
         "tests_total": len(S.tests), "promotions": sum(1 for t in S.tests if t["promoted"]),
         "updates": upd.get("u", 0), "steps": upd.get("steps", 0), "speed": upd.get("speed"),
         "laps": downsample([[n, s] for n, s in fin]),
@@ -454,7 +477,7 @@ def frozen_guard():
             (rd / "status.json").write_text(json.dumps(st), encoding="utf-8")
             time.sleep(5)
             if len(restarts) <= 5:
-                start("train")
+                start("train", ["--new"])          # the same run again: never the "trained run exists" question
             else:
                 with open(rd / "train.log", "a", encoding="utf-8") as f:
                     f.write(time.strftime("%H:%M:%S ") + "Froze more than 5 times in an hour: not restarting.\n")
@@ -559,7 +582,13 @@ class Handler(BaseHTTPRequestHandler):
                 body["github_token"] = cfgmod.load().get("github_token", "")
             cfgmod.save(body)
         elif self.path == "/api/start":
-            code, msg = start("train")
+            cfg = cfgmod.load()
+            others = [] if body.get("new") or alive() else safe(cfgmod.start_conflict, cfg)
+            if others:                                   # never start a trained map from scratch by accident
+                self.send(409, json.dumps({"message": "A trained run for this map exists", "choice": others,
+                                           "run": cfg["run"]}))
+                return
+            code, msg = start("train", ["--new"] if body.get("new") else [])
         elif self.path == "/api/hub/import":
             pid = "".join(c for c in str(body.get("id") or "") if c.isalnum() or c == "-")
             name = "".join(c for c in str(body.get("name") or pid) if c.isalnum() or c in "-_")

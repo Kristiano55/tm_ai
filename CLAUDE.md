@@ -89,12 +89,25 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   issue), "Verify pending packs" for verifiers. Hub jobs log to `runs/_hub/hub.log`.
 - Pack combine (merging packs) is NOT implemented here (the brain-pack prompt was never pushed to this repo).
 
+## Runs never reset by accident
+- Run names: `config.run_key()` ignores spaces, '-', '_' and case; `run_dir()` -> `find_run()` maps the name to an
+  existing folder with the same key (exact name wins, else the most recently trained; colliding folders are kept and
+  `RUN_WARNINGS` is logged + shown on the dashboard).
+- `start_conflict(cfg)`: the chosen run has no model but another run on the same map (UID via `runs/_maps.json`, or
+  path) has one -> CLI `train` refuses (exit 2, lists the runs) unless `--new` or `--run NAME`; dashboard /api/start
+  answers 409 + choice -> modal "Continue <run>" / "Start a new run from scratch" (`--new`). The freeze-guard restart
+  passes `--new` (same run). Settings: run name = combo box (datalist of `list_runs()`: map, champion, steps, last
+  trained); changing the map pre-selects its newest run.
+- Resume: latest.zip, else champion.zip (missing or unloadable latest.zip) with a loud notice; Resume off / layout
+  conversion failed / unloadable model -> "STARTING FROM SCRATCH because ..." in the log, in the start event
+  (`notice`) and as a dashboard banner. IQN: champion.pt when latest.pt is missing.
+
 ## Run folder `runs/<run>/`
 `events.jsonl` (k = start | lap | test | upd | rb | prof | stop; prof = 5-min "where the time goes"), `status.json` (heartbeat), `train.log`, `best.json`
 (champion_ms, first_test_ms, champion_seed), `champion.zip|.pt`, `champion.txt` (TICK input), `best_run.txt/.json`
 (fastest finished full lap of any kind), `last_test.txt`, `play.txt`, `centerline.npy/.json` (reference line),
 `profile.npy/.json` (ghost: arc length -> race tick), `sections.json` (per-section fail outcomes, rate, target mode),
-`sec_best_<k>.npy` (fastest drive through section k, any lap), `hang.txt` (stack dumps of hangs), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
+`sec_best_<k>.npy` (fastest drive through section k, any lap), `hit_ramp.json` (wall-hit ramp factor), `hang.txt` (stack dumps of hangs), `champ_trace.npy`, `champion_actions.json` (for mid-starts),
 `pb_trace.npy/.json` (traced PB), `best_trace.npy`, `latest.zip|.pt`, `vecnorm.pkl` (PPO reward scaling),
 `bench.json` (car-count benchmark), `levels.json` (steering levels + obs layout, for checkpoint conversion), `tester_base.zip` (PPO network layout
   for the test process, rewritten each start), `STOP` / `ROLLBACK` flag files.
@@ -150,6 +163,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; IQN uses
   `iqn_mid_start_p` (0.2) and, with a `pb_file`, starts only along the PB/WR states (to learn the WR route's cut); built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
+- **Champion tests only after the first finished full lap** of the run (`tests_ready()`: best_run.json / champion;
+  base: per map, the tester skips pool maps never finished; IQN too). Dashboard: "Champion tests start after ...".
+- **Wall-hit penalty** (`_hit_penalty`): w_hit x min(1, speed lost / 10 m/s) x ramp factor. `HitRamp` (setting
+  `w_hit_ramp`, default on): finish rate of the last 100 full laps < 30 % -> 25 %, linear to 100 % at 60 %; once 60 %
+  is reached (>= 20 laps) it stays 100 % (`reached`). Per run folder (per map in base runs); event k=hit_ramp on
+  changes; shown in the reward breakdown card.
 - **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible), `test_tries_close` (8) once the
   champion is within `test_close_s` (0.5 s) of the PB (`pb_seconds`, else the traced PB file's time; `test_tries()`);
   the test event logs tries + winning seed, Play champion replays `champion_seed`. Ghost: fastest finished lap (tests

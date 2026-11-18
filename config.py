@@ -62,6 +62,7 @@ DEFAULTS = {
     "github_user": "",         # your GitHub name (pack author / verifier)
     "github_token": "",        # optional, for direct release uploads; empty = the browser does it (nothing stored)
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
+    "w_hit_ramp": True,        # wall-hit penalty ramps in with the finish rate (25 % below 30 % finished, 100 % from 60 %)
     "reward_v": 3,             # reward layout version (old configs are upgraded once)
 }
 
@@ -186,11 +187,125 @@ def save(cfg):
         CONFIG_PATH.write_text(text, encoding="utf-8")
 
 
+def run_key(name):
+    """Run names that differ only in spaces, '-', '_' or case mean the same run: "Summer 2020 - 02",
+    "Summer2020-02" and "summer2020_02" are all "summer202002"."""
+    return "".join(c for c in str(name).lower() if c.isalnum())
+
+
+RUN_WARNINGS = []
+
+
+def find_run(name):
+    """The existing runs/<folder> for this name (by normalised key), or None. If two existing folders share the
+    key, the exact name wins, else the most recently trained one; both are kept and a warning is recorded."""
+    root = ROOT / "runs"
+    key = run_key(name)
+    if not key or not root.exists():
+        return None
+    hits = [d for d in root.iterdir() if d.is_dir() and not d.name.startswith("_") and run_key(d.name) == key]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        msg = (f"Run folders {', '.join(sorted(h.name for h in hits))} all mean the same run name; using "
+               + (name if any(h.name == name for h in hits) else "the most recently trained one")
+               + ". Rename or remove the others to avoid confusion.")
+        if msg not in RUN_WARNINGS:
+            RUN_WARNINGS.append(msg)
+    exact = [h for h in hits if h.name == name]
+    return exact[0] if exact else max(hits, key=_last_trained)
+
+
+def _last_trained(d):
+    ts = [0.0]
+    for f in ("status.json", "latest.zip", "latest.pt", "events.jsonl"):
+        try:
+            ts.append((d / f).stat().st_mtime)
+        except OSError:
+            pass
+    return max(ts)
+
+
 def run_dir(cfg):
-    """runs/<run>/ for a map run, runs/_base/<base_name>/ for a base run."""
-    d = base_dir(cfg["base_name"]) if cfg.get("run_type") == "base" else ROOT / "runs" / cfg["run"]
+    """runs/<run>/ for a map run (an existing folder whose name differs only in spaces / - / _ / case is the same
+    run), runs/_base/<base_name>/ for a base run."""
+    if cfg.get("run_type") == "base":
+        d = base_dir(cfg["base_name"])
+    else:
+        d = find_run(cfg["run"]) or ROOT / "runs" / cfg["run"]
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def has_model(d):
+    return any((Path(d) / f).exists() for f in ("latest.zip", "champion.zip", "latest.pt", "champion.pt"))
+
+
+def run_summary(d):
+    """Name, map, champion time, steps and last training time of a run folder (for the run picker)."""
+    d = Path(d)
+    mi, best = _read(d / "map_info.json"), _read(d / "best.json")
+    steps = 0
+    try:                                                   # the last "upd" event has the step count
+        with open(d / "events.jsonl", "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            for line in reversed(f.read().splitlines()):
+                if b'"upd"' in line:
+                    steps = int(json.loads(line).get("steps", 0))
+                    break
+    except (OSError, ValueError):
+        pass
+    return {"name": d.name, "map": mi.get("path"), "map_name": mi.get("name"), "uid": mi.get("uid"),
+            "champion_ms": best.get("champion_ms"), "steps": steps, "last": round(_last_trained(d)),
+            "has_model": has_model(d)}
+
+
+def _read(p):
+    try:
+        return json.loads(Path(p).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def list_runs():
+    root = ROOT / "runs"
+    if not root.exists():
+        return []
+    out = [run_summary(d) for d in root.iterdir() if d.is_dir() and not d.name.startswith("_")
+           and any((d / f).exists() for f in ("map_info.json", "events.jsonl", "latest.zip", "latest.pt"))]
+    return sorted(out, key=lambda r: -r["last"])
+
+
+def map_uid_for(path):
+    """The map UID of a map file, if any run has driven it (runs/_maps.json, written by the cars)."""
+    for uid, rec in _read(ROOT / "runs" / "_maps.json").items():
+        if str(rec.get("path", "")).lower() == str(path).lower():
+            return uid
+    return None
+
+
+def same_map_runs(cfg):
+    """Other runs with a model on the same map as cfg["map"] (by UID, or by path before the UID is known)."""
+    uid, mp = map_uid_for(cfg["map"]), str(cfg["map"]).lower()
+    mine = find_run(cfg["run"])
+    out = []
+    for r in list_runs():
+        if mine is not None and r["name"] == mine.name:
+            continue
+        if r["has_model"] and ((uid and r["uid"] == uid) or str(r["map"] or "").lower() == mp):
+            out.append(r)
+    return out
+
+
+def start_conflict(cfg):
+    """A new run (no model yet) on a map that already has a trained run: the runs to offer instead, else []."""
+    if cfg.get("run_type") == "base":
+        return []
+    mine = find_run(cfg["run"])
+    if mine is not None and has_model(mine):
+        return []
+    return same_map_runs(cfg)
 
 
 def base_dir(name):

@@ -29,6 +29,7 @@ pre{margin:0;font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap
 label{display:grid;gap:4px;font-size:12px;color:var(--mut)}label.ck{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--tx)}
 input[type=text],input[type=number],input[type=password],select,textarea{background:#101317;border:1px solid var(--line);border-radius:5px;color:var(--tx);padding:9px;font:inherit}
 .hide{display:none}
+.modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center;z-index:9}.modal.hide{display:none}
 table.sec{width:100%;border-collapse:collapse;font-size:13px}table.sec th{text-align:left;color:var(--mut);font-weight:400;font-size:12px;padding:4px 8px;border-bottom:1px solid var(--line)}
 table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--red)}td.ok{color:var(--grn)}td.fb{color:var(--org)}
 .tbar{display:flex;height:16px;border-radius:6px;overflow:hidden;background:#22262c;margin:8px 0}.tbar i{display:block;height:100%}
@@ -41,7 +42,10 @@ table.sec td{padding:5px 8px;border-bottom:1px solid #1d2127}td.bad{color:var(--
   <div class="pill"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
   <button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button>
 </header>
+<datalist id="runList"></datalist>
+<div id="modal" class="modal hide"><div class="card" style="max-width:560px;margin:16px" id="modalBox"></div></div>
 <main id="dash">
+  <div class="card hide" id="banner" style="border-color:var(--org)"></div>
   <div class="row r2">
     <div class="card"><div class="lab">Road to your PB</div>
       <div><span class="big" id="champ">–</span> <span id="vsPb" style="margin-left:10px"></span></div>
@@ -114,7 +118,7 @@ const FIELDS=[['discord_webhook','Discord webhook URL (updates on your phone; em
  ['base_from','Map run: start from this base model (base name; empty = off)','text'],
  ['pool_cars','Map run: cars that keep driving the pool maps (no forgetting; 0 = off)','number'],
  ['github_user','Hub: your GitHub user name (pack author / verifier)','text'],['github_token','Hub: GitHub token for direct uploads (optional; empty = the browser does it, nothing stored)','password'],
- ['hub_index_url','Hub: index URL','text'],['hub_repo','Hub: repository','text'],['maps_folder','Hub: your maps folder (verify / benchmark find maps there)','text'],['hub_benchmark_url','Hub: benchmark.json URL (empty = next to the index)','text'],['map','Map path (.Map.Gbx)','text'],['run','Run name','text'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
+ ['hub_index_url','Hub: index URL','text'],['hub_repo','Hub: repository','text'],['maps_folder','Hub: your maps folder (verify / benchmark find maps there)','text'],['hub_benchmark_url','Hub: benchmark.json URL (empty = next to the index)','text'],['map','Map path (.Map.Gbx)','text'],['run','Run name (pick an existing run or type a new name; spaces, - and _ do not matter)','run'],['envs','Cars (parallel gyms)','number'],['ticks_per_step','Ticks per decision','number'],
  ['max_lap_seconds','Max lap seconds','number'],['pb_seconds','Your PB (seconds, 0 = unset)','number'],['time_limit_min','Time limit (min, 0 = none)','number'],
  ['test_every_laps','Champion test every N laps','number'],['rollback_after','Roll back after N bad tests','number'],['rollback_margin_s','Bad test = slower than champion by (s)','number'],
  ['steer_mode','Steering levels','select'],['cut_behind_s','End a lap when this far behind the ghost (s, 0 = off)','number'],
@@ -133,7 +137,7 @@ let cfgLoaded=false;
 let WMETA=[], LEAN={}, LINES={};
 function fillForm(c,w){ WMETA=w||WMETA;
   const poolTxt=v=>(v||[]).map(e=>[e.map,e.pb_file||'',e.pb_seconds||''].join(' | ').replace(/( \| )+$/,'')).join('\n');
-  const fld=([k,l,t])=>t=='pool'?`<label style="grid-column:1/-1">${l}<textarea id="f_${k}" rows="4">${poolTxt(c[k])}</textarea></label>`:t=='checkbox'?
+  const fld=([k,l,t])=>t=='run'?`<label>${l}<input type="text" list="runList" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}" autocomplete="off"><small id="runInfo"></small></label>`:t=='pool'?`<label style="grid-column:1/-1">${l}<textarea id="f_${k}" rows="4">${poolTxt(c[k])}</textarea></label>`:t=='checkbox'?
     `<label class="ck"><input type="checkbox" id="f_${k}" ${c[k]?'checked':''}> ${l}</label>`:t=='select'?
     `<label>${l}<select id="f_${k}">${OPTS[k].map(([v,n])=>`<option value="${v}" ${c[k]==v?'selected':''}>${n}</option>`).join('')}</select></label>`:
     `<label>${l}<input type="${t}" step="any" id="f_${k}" value="${String(c[k]).replace(/"/g,'&quot;')}"></label>`;
@@ -141,13 +145,36 @@ function fillForm(c,w){ WMETA=w||WMETA;
   $('form').innerHTML=`<h3 class="sec">Training settings</h3><div class="grid">${FIELDS.map(fld).join('')}</div>
     <h3 class="sec">Reward weights</h3><div class="grid">${WMETA.map(wt).join('')}</div>`;
   const iqnUi=()=>{const on=$('f_algo').value=='iqn'; for(const [k] of FIELDS) if(k.startsWith('iqn_')||k=='minirace_s') $('f_'+k).closest('label').classList.toggle('hide',!on)};
-  $('f_algo').onchange=iqnUi; iqnUi() }
+  $('f_algo').onchange=iqnUi; iqnUi();
+  $('f_map').onchange=()=>{const m=$('f_map').value.trim().toLowerCase(), r=RUNS.find(x=>(x.map||'').toLowerCase()==m);   // newest first
+    if(r){$('f_run').value=r.name; runInfo()}};
+  $('f_run').oninput=runInfo; runInfo() }
+let RUNS=[];
+const runKey=n=>String(n).toLowerCase().replace(/[^a-z0-9]/g,'');
+function runLabel(r){ return [r.map_name||'map not recorded yet', r.champion_ms?'champion '+(r.champion_ms/1000).toFixed(3)+' s':'no champion', (r.steps||0).toLocaleString()+' steps', r.last?'trained '+new Date(r.last*1000).toLocaleString():''].filter(Boolean).join(' · ') }
+function runInfo(){ const e=$('runInfo'); if(!e||!$('f_run')) return; const r=RUNS.find(x=>runKey(x.name)==runKey($('f_run').value));
+  e.textContent=r?(r.name!=$('f_run').value.trim()?`= existing run "${r.name}": `:'existing run: ')+runLabel(r):'new run (starts from scratch unless a run of this map exists)' }
 function readPool(txt){ return txt.split('\n').map(l=>l.split('|').map(x=>x.trim())).filter(p=>p[0]).map(p=>({map:p[0],pb_file:p[1]||'',pb_seconds:parseFloat(p[2])||0})) }
 function readForm(){ const o={}; for(const [k,,t] of FIELDS){const e=$('f_'+k); o[k]=t=='checkbox'?e.checked:t=='pool'?readPool(e.value):e.value}
   for(const m of WMETA) o[m.k]=$('f_'+m.k).value; return o }
 async function post(p,b){ const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}); const j=await r.json(); if(r.status>=400) alert(j.message); setTimeout(tick,300) }
 $('bOpen').onclick=e=>{e.preventDefault();post('/api/open')};
-$('bStart').onclick=()=>post('/api/start'); $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
+$('bStart').onclick=()=>startTraining(false);
+async function startTraining(fresh){
+  const r=await fetch('/api/start',{method:'POST',body:JSON.stringify({new:fresh})}); const j=await r.json();
+  if(r.status==409&&j.choice){ showChoice(j); return }
+  if(r.status>=400) alert(j.message); setTimeout(tick,300) }
+function showChoice(j){
+  const esc=t=>String(t??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  $('modalBox').innerHTML=`<h3>A trained run for this map exists</h3><p class="mut">Run "${esc(j.run)}" has no model yet. Starting it would train this map again from zero.</p>`+
+    j.choice.map((r,i)=>`<p><button class="p" data-cont="${i}">Continue "${esc(r.name)}"</button><br><span class="mut">${esc(runLabel(r))}</span></p>`).join('')+
+    `<p><button id="mNew">Start a new run "${esc(j.run)}" from scratch</button> <button id="mCancel">Cancel</button></p>`;
+  $('modal').classList.remove('hide');
+  for(const b of document.querySelectorAll('[data-cont]')) b.onclick=async()=>{ const r=j.choice[+b.dataset.cont];
+    const c=await (await fetch('/api/state')).json(); await fetch('/api/config',{method:'POST',body:JSON.stringify({...c.config,run:r.name})});
+    $('modal').classList.add('hide'); startTraining(false) };
+  $('mNew').onclick=()=>{ $('modal').classList.add('hide'); startTraining(true) };
+  $('mCancel').onclick=()=>$('modal').classList.add('hide') } $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
 $('bReset').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=m.default; $('saved').textContent='Defaults filled in - press Save.'};
 $('bLean').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LEAN[m.k]??0; $('saved').textContent='Lean preset filled in (only the core terms) - press Save.'};
 $('bLs').onclick=()=>{for(const m of WMETA)$('f_'+m.k).value=LINES[m.k]??0; $('saved').textContent='Linesight preset filled in (progress + time only) - press Save.'};
@@ -248,7 +275,7 @@ function drawRb(rb){
     <div style="position:absolute;top:1px;height:10px;border-radius:2px;background:${v<0?'#e5484d':'#39c46a'};${v<0?`right:50%;width:${w}%`:`left:50%;width:${w}%`}"></div></div>
     <span style="text-align:right;color:#c9ced6">${v.toFixed(4)}</span></div>`}).join('');
   const run=ks.filter(k=>!['finish','end','checkpoint'].includes(k)).reduce((a,k)=>a+rb[k],0);
-  $('rbSum').innerHTML=`While driving: <b style="color:${run<0?'#e5484d':'#39c46a'}">${run>=0?'+':''}${run.toFixed(4)}</b> per step`+(run<0?' – negative: stopping can look attractive to the AI':'')}
+  $('rbSum').innerHTML=hitTxt(S_LAST)+`While driving: <b style="color:${run<0?'#e5484d':'#39c46a'}">${run>=0?'+':''}${run.toFixed(4)}</b> per step`+(run<0?' – negative: stopping can look attractive to the AI':'')}
 function drawMap(cv,track,ends){
   const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight; cv.width=w*d; cv.height=h*d;
   const g=cv.getContext('2d'); g.scale(d,d);
@@ -263,7 +290,10 @@ function drawMap(cv,track,ends){
     g.beginPath();g.arc(X(e[0]),Z(e[1]),2.2,0,7);g.fill()} g.globalAlpha=1}
 function movAvg(p,k){ const o=[];let s=0;for(let i=0;i<p.length;i++){s+=p[i][1];if(i>=k)s-=p[i-k][1];o.push([p[i][0],s/Math.min(i+1,k)])}return o }
 
-function render(s){
+let S_LAST=null;
+function hitTxt(s){ const h=s&&s.hit_ramp; if(!h||!s.config.w_hit) return '';
+  return `Wall-hit penalty at <b>${Math.round(h.factor*100)}%</b> ${h.on===false?'(ramp off)':h.reached?'(reached 60% finished: stays at 100%)':`(finish rate ${Math.round(h.rate*100)}% of the last 100 laps; 100% from 60%)`}<br>` }
+function render(s){ S_LAST=s;
   const c=s.config; if(!cfgLoaded){fillForm(c,s.weights);cfgLoaded=true} LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
   drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
@@ -284,7 +314,10 @@ function render(s){
   $('first').textContent=f?`first test ${ms(f)}  ·  ${pct==null?'':Math.round(pct)+'% of the way'}`:''; $('pbTxt').textContent=pb?`your PB ${ms(pb)}`:'set your PB in Settings';
   $('sMin').textContent=Math.round(s.session_min)+' min'; $('sLaps').textContent=`${n0(s.session_laps)} training laps (this session)`;
   $('mode').textContent=c.stop_at_pb&&pb?'Stops at your PB':(c.time_limit_min?`Stops after ${c.time_limit_min} min`:'Trains until you stop it');
-  $('nextTest').textContent=`Next champion test in ${s.next_test_in} training laps`; $('stopBar').style.width=(100-100*s.next_test_in/Math.max(1,c.test_every_laps))+'%';
+  $('nextTest').textContent=s.tests_wait?'Champion tests start after the first finished lap':`Next champion test in ${s.next_test_in} training laps`;
+  RUNS=s.runs||[]; $('runList').innerHTML=RUNS.map(r=>`<option value="${String(r.name).replace(/"/g,'&quot;')}">${runLabel(r).replace(/</g,'&lt;')}</option>`).join(''); runInfo();
+  const bn=[...(s.notice?[s.notice]:[]),...(s.run_warnings||[])]; $('banner').classList.toggle('hide',!bn.length);
+  $('banner').innerHTML=bn.map(t=>`<div style="color:${t.startsWith('STARTING')?'var(--red)':'var(--org)'}">${t.replace(/</g,'&lt;')}</div>`).join(''); $('stopBar').style.width=(100-100*s.next_test_in/Math.max(1,c.test_every_laps))+'%';
   $('kLaps').textContent=n0(s.laps_total); $('kFin').textContent=(s.finished_pct==null?'':`${s.finished_pct}% of full laps finished`)+(s.mid_laps?` · ${n0(s.mid_laps)} mid-track`:'');
   $('kAvg').textContent=sec(s.recent_avg); $('kBest').textContent=sec(s.best_lap);
   $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'')}${(s.best_lap-pb/1000).toFixed(2)} s vs PB`:'';

@@ -398,6 +398,47 @@ def build_guide(run_dir):
 FAIL_ENDS = ("stuck", "off-zone", "far off line", "behind ghost", "timeout")
 
 
+class HitRamp:
+    """Wall-hit penalty ramp-in (setting w_hit_ramp): while the run's full-lap finish rate over the last 100 laps is
+    below 30 % the penalty counts FLOOR (25 %), growing linearly to 100 % at a 60 % finish rate. Once 60 % has been
+    reached it stays at 100 % for good. Written to hit_ramp.json in the run (per map) folder; the cars read it."""
+
+    LO, HI, FLOOR, N = 0.30, 0.60, 0.25, 100
+
+    def __init__(self, run_dir, cfg):
+        self.f, self.on = Path(run_dir) / "hit_ramp.json", bool(cfg.get("w_hit_ramp", True))
+        d = read_json(self.f)
+        self.laps, self.reached = list(d.get("laps", []))[-self.N:], bool(d.get("reached"))
+        self.last, self.t = None, 0.0
+
+    def add(self, info):
+        if info.get("mid") or info.get("pool") or info.get("end") in ("car restarted", "gym lost"):
+            return
+        self.laps = (self.laps + [1 if info.get("finished") else 0])[-self.N:]
+
+    def rate(self):
+        return sum(self.laps) / len(self.laps) if self.laps else 0.0
+
+    def factor(self):
+        if not self.on:
+            return 1.0
+        r = self.rate()
+        if len(self.laps) >= 20 and r >= self.HI:
+            self.reached = True
+        if self.reached:
+            return 1.0
+        return float(self.FLOOR + (1.0 - self.FLOOR) * np.clip((r - self.LO) / (self.HI - self.LO), 0.0, 1.0))
+
+    def update(self, log=None):
+        f = round(self.factor(), 3)
+        if f != self.last or time.time() - self.t > 30:
+            if self.last is not None and f != self.last and log and (f == 1.0 or abs(f - self.last) >= 0.1):
+                log(k="hit_ramp", factor=f, rate=round(self.rate(), 3))
+            self.last, self.t = f, time.time()
+            write_json(self.f, {"factor": f, "rate": round(self.rate(), 3), "reached": self.reached, "on": self.on,
+                                "laps": self.laps, "t": time.time()})
+
+
 class SectionTracker:
     """Per checkpoint section: how often laps that reach it fail there. With a PB/WR target line, a section where
     most laps fail switches its target to the AI's own best route through it ("ai"), and back to the PB/WR route
@@ -558,6 +599,7 @@ class TMEnv(gym.Env):
         self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
         self.cprof, self._cprof_key = None, None
         self.cp_arc, self.off_line, self.far, self.pbuf, self.nbuf = None, 0.0, 0, [], []
+        self.hit_factor, self._ramp_m = 1.0, None
         self.stall, self.cp0, self.seg0, self.sec_wr, self._wr_max = 0, 0, None, [], 0.0
         self.sec_rate, self.sec_mode, self._sec_m, self.pb_dense, self.pb_cut = [], [], None, None, None
 
@@ -940,6 +982,26 @@ class TMEnv(gym.Env):
         save_npy(self.run_dir / "profile.npy", prof)
         write_json(f, {"ms": ms})
 
+    def _hit_penalty(self, w, tf, hit, speed_loss):
+        """Wall hit: costs in proportion to the speed it cost (a glancing touch little, >= 10 m/s lost the full
+        amount), times the run's ramp-in factor (hit_ramp.json: lower while the run rarely finishes)."""
+        if not hit:
+            return 0.0
+        return -w * tf * float(hit) * self.hit_factor * min(1.0, max(0.0, float(speed_loss)) / 10.0)
+
+    def _read_ramp(self):
+        if not self.run_dir:
+            return
+        f = self.run_dir / "hit_ramp.json"
+        try:
+            m = os.path.getmtime(f)
+        except OSError:
+            self.hit_factor = 1.0
+            return
+        if m != self._ramp_m:
+            self._ramp_m = m
+            self.hit_factor = float(read_json(f).get("factor", 1.0))
+
     def _ghost_from_best(self):
         """If the fastest saved run (best_run) beats the current ghost, the ghost follows it on the current line."""
         if self.run_dir is None or self.dense is None or self.guide:
@@ -1186,6 +1248,7 @@ class TMEnv(gym.Env):
         self.cp0, self.sec_wr, self._wr_max = self.taken, [], 0.0
         self.seg0 = 0 if self.start_i is None else None     # section segments only from a checkpoint crossing
         self._read_sections()
+        self._read_ramp()
         self._read_lidar(t, fresh=True)
         return self._obs(t, self._s), {}
 
@@ -1250,7 +1313,7 @@ class TMEnv(gym.Env):
         if W["w_speed"]:
             r["speed"] = W["w_speed"] * tf * speed / 100.0
         if W["w_hit"] and self.extra:
-            r["hit"] = -W["w_hit"] * tf * _f(t.runtime, "wall_hit_this_step")
+            r["hit"] = self._hit_penalty(W["w_hit"], tf, _f(t.runtime, "wall_hit_this_step"), self.prev_speed - speed)
         if W["w_wall"]:                                                          # side rays of the fan
             hit, dist = self._lid
             near = float(np.min(np.concatenate([dist[:4], dist[28:32]])))
@@ -1862,9 +1925,17 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
         if msg is None:
             break
         try:
-            mcfg, R, slug = maps[rr % len(maps)] if maps else (cfg, run_dir, None)
+            if maps:                                     # next pool map that has been finished at least once
+                for _ in range(len(maps)):
+                    mcfg, R, slug = maps[rr % len(maps)]
+                    rr += 1
+                    if (Path(R) / "best_run.json").exists():
+                        break
+                else:
+                    continue
+            else:
+                mcfg, R, slug = cfg, run_dir, None
             R = Path(R)
-            rr += 1
             if maps and cur != slug and env is not None:          # next pool map: one test gym at a time
                 env.close()
                 env = None
@@ -1956,7 +2027,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
         env.close()
 
 
-def _make_callback(cfg, run_dir, tracker=None, maps=None):
+def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
     """maps (base run): [(cfg, folder, slug), ...]: per-map section trackers + stuck hints, round-robin tests."""
     by_slug = {m[2]: m for m in maps or []}
     from stable_baselines3.common.callbacks import BaseCallback
@@ -1981,11 +2052,15 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None):
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
             self.trackers, self.stuckws = {}, {}
+            self.ramps = {}                                  # wall-hit ramp per run folder (per map in base runs)
+            self.finished_once = (run_dir / "best_run.json").exists() or bool(read_json(best_file).get("champion_ms"))
             freeze_guard(run_dir, seconds=max(180.0, 2.0 * time_budget(cfg) + 60.0))
             self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
-            log(k="start", cfg=cfg)
+            log(k="start", cfg=cfg, **({"notice": notice} if notice else {}))
             self.status("running")
             say("Training started: %d cars, %s steering, CPU." % (cfg["envs"], cfg["steer_mode"]))
+            if not self.tests_ready():
+                say("Champion tests start after the first finished lap.")
 
         def status(self, state, reason=""):
             write_json(status_file, {"state": state, "reason": reason, "pid": os.getpid(),
@@ -2045,6 +2120,12 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None):
                         self.laps += 1
                         self.since += 1
                         slug = info.get("map")
+                        if fin and not info.get("mid"):
+                            self.finished_once = True
+                        rd_ = Path(by_slug[slug][1]) if maps and slug in by_slug else run_dir
+                        if rd_ not in self.ramps:
+                            self.ramps[rd_] = HitRamp(rd_, cfg)
+                        self.ramps[rd_].add(info)
                         if maps and slug in by_slug:     # base run: per-map trackers
                             if slug not in self.trackers:
                                 mc, md, _ = by_slug[slug]
@@ -2083,6 +2164,8 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None):
                     return False
                 if not maps:
                     self.check_rollback()
+                for hr in self.ramps.values():
+                    hr.update(log)
                 for tr_ in ([tracker] if tracker is not None else []) + list(self.trackers.values()):
                     try:
                         tr_.update(log)
@@ -2093,9 +2176,15 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None):
                     self.reason = "reached your PB"
                     return False
                 self.status("running")
-            if self.since >= cfg["test_every_laps"] and not self.tests_off:
+            if self.since >= cfg["test_every_laps"] and not self.tests_off and self.tests_ready():
                 self.champion_test()
             return True
+
+        def tests_ready(self):
+            """No champion tests (and so no rollbacks) before the first full lap has been finished in this run."""
+            if maps:
+                return any((Path(m[1]) / "best_run.json").exists() for m in maps)
+            return self.finished_once
 
         def tester_start(self):
             import multiprocessing as mp
@@ -2287,6 +2376,9 @@ def train(cfg):
     from stable_baselines3.common.vec_env import VecNormalize
 
     run_dir = cfgmod.run_dir(cfg)
+    t_start = time.time()
+    for w in cfgmod.RUN_WARNINGS:
+        say("Warning: " + w)
     (run_dir / "STOP").unlink(missing_ok=True)
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
@@ -2323,16 +2415,37 @@ def train(cfg):
         env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA[0])
     migrate(run_dir, cfg, env)
 
-    model, latest = None, run_dir / "latest.zip"
-    if (cfg["resume"] or from_base) and latest.exists():
-        try:
-            model = PPO.load(str(latest), env=env, device="cpu")
-            model.target_kl = 0.02
-            model.gamma = model.rollout_buffer.gamma = GAMMA[0]
-            say(f"Planning horizon {cfg['horizon_s']:.0f} s -> gamma {GAMMA[0]:.4f} at {cfg['ticks_per_step'] * 10} ms")
-            say("Resumed from latest.zip")
-        except Exception as e:
-            say(f"Cannot resume ({str(e)[:80]}), starting fresh")
+    model, latest, champ_zip = None, run_dir / "latest.zip", run_dir / "champion.zip"
+    notice, errs = None, []
+    if not (cfg["resume"] or from_base):
+        if latest.exists() or champ_zip.exists():
+            notice = "STARTING FROM SCRATCH because 'Resume from latest checkpoint' is off (the saved model is ignored)"
+    else:
+        for src in (latest, champ_zip):              # latest.zip, else the champion (missing / corrupt latest.zip)
+            if not src.exists():
+                continue
+            try:
+                model = PPO.load(str(src), env=env, device="cpu")
+                model.target_kl = 0.02
+                model.gamma = model.rollout_buffer.gamma = GAMMA[0]
+                say(f"Planning horizon {cfg['horizon_s']:.0f} s -> gamma {GAMMA[0]:.4f} at {cfg['ticks_per_step'] * 10} ms")
+                if src is latest:
+                    say("Resumed from latest.zip")
+                else:
+                    why = "latest.zip is missing" if not latest.exists() else f"latest.zip could not be loaded ({errs[-1]})"
+                    notice = f"Resumed from champion.zip because {why}"
+                break
+            except Exception as e:
+                errs.append(str(e)[:100])
+        if model is None:
+            unconv = [p.name for p in run_dir.glob("*.unconverted.zip") if p.stat().st_mtime >= t_start - 5]
+            if unconv:
+                notice = ("STARTING FROM SCRATCH because the saved model could not be converted to the new input "
+                          f"layout (moved aside as {', '.join(unconv)})")
+            elif errs:
+                notice = f"STARTING FROM SCRATCH because the saved model could not be loaded ({errs[-1]})"
+    if notice:
+        say("!" * 12 + " " + notice + " " + "!" * 12)
     if model is None:
         model = make_model(env)
     if from_base:
@@ -2340,7 +2453,7 @@ def train(cfg):
         say(f"Started from base '{from_base['base_name']}' (id {from_base['base_id']}, "
             f"{model.num_timesteps:,} steps of pool driving)")
     focus_entropy(model)
-    cb = _make_callback(cfg, run_dir, tracker, maps)
+    cb = _make_callback(cfg, run_dir, tracker, maps, notice)
     try:
         model.learn(total_timesteps=10 ** 12, callback=cb, reset_num_timesteps=False)
     except KeyboardInterrupt:
@@ -2545,6 +2658,8 @@ if __name__ == "__main__":
     ap.add_argument("--envs", type=int)
     ap.add_argument("--model")
     ap.add_argument("--fresh", action="store_true", help="ignore latest.zip")
+    ap.add_argument("--new", action="store_true", help="start this new run from scratch even if another run of the "
+                                                         "same map has a trained model")
     a = ap.parse_args()
     cfg = cfgmod.load()
     for key in ("map", "run", "envs"):
@@ -2560,6 +2675,15 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if not cfg["map"] and not (cfg["run_type"] == "base" and cfg["map_pool"]):
         raise SystemExit("No map set. Pass --map or set it in the dashboard (Settings).")
+    if a.cmd == "train" and not a.new and a.run is None:
+        others = cfgmod.start_conflict(cfg)
+        if others:
+            print(f"Run '{cfg['run']}' has no model yet, but this map already has trained runs:")
+            for r in others:
+                print(f"  {r['name']:30s} champion {r['champion_ms'] / 1000:.3f} s" if r["champion_ms"] else
+                      f"  {r['name']:30s} no champion yet", f" {r['steps']:,} steps")
+            print("Continue one with --run NAME (or pick it in the dashboard), or start fresh with --new.")
+            raise SystemExit(2)
     if cfg["run_type"] == "base" and cfg["algo"] == "iqn":
         raise SystemExit("Base runs are PPO only: set the algorithm to PPO.")
     if cfg["algo"] == "iqn" and a.cmd in ("train", "drive"):

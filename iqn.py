@@ -325,7 +325,20 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 net, tgt = IQNNet(n_in, n_act).to(dev), IQNNet(n_in, n_act).to(dev)
                 opt = torch.optim.Adam(net.parameters(), lr=1e-3, eps=1e-4)
                 tgt.load_state_dict(net.state_dict())
+        elif (cfg["resume"] and (run_dir / "champion.pt").exists() and meta.get("n_in") == n_in
+              and meta.get("n_act") == n_act):
+            try:                                            # latest.pt missing: continue from the champion
+                sd = torch.load(run_dir / "champion.pt", map_location=dev)
+                net.load_state_dict(sd)
+                tgt.load_state_dict(sd)
+                T.say("!" * 12 + " Resumed IQN from champion.pt because latest.pt is missing " + "!" * 12)
+            except Exception as e:
+                T.say("!" * 12 + f" STARTING FROM SCRATCH because champion.pt could not be loaded ({str(e)[:80]}) "
+                      + "!" * 12)
+                tgt.load_state_dict(net.state_dict())
         else:
+            if not cfg["resume"] and (ckpt.exists() or (run_dir / "champion.pt").exists()):
+                T.say("!" * 12 + " STARTING FROM SCRATCH because 'Resume from latest checkpoint' is off " + "!" * 12)
             tgt.load_state_dict(net.state_dict())
         T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act})
         ctr[0], ctr[1], ctr[2] = steps0, max(0, steps0 - WARMUP) * cfg["iqn_reuse"], 0
@@ -501,6 +514,7 @@ def train(cfg):
     rb, rb_steps = {}, 0
     stuckw = T.StuckWatch()
     tracker = T.SectionTracker(run_dir, cfg, T.n_sections(run_dir, pool.n_seg))
+    ramp = T.HitRamp(run_dir, cfg)
 
     def collect(i, o, a, nobs, rew, done, info, rows):
         """One step of car i -> n-step samples (rows to add); log a finished lap."""
@@ -529,6 +543,7 @@ def train(cfg):
             rb_steps += int(info.get("rsteps", 0))
             stuckw.add(info)
             tracker.add(info)
+            ramp.add(info)
         elif len(pend[i]) > N_STEP:
             w = pend[i][:N_STEP]
             rows.append((w[0][0], w[0][1], [x[2] for x in w], N_STEP, pend[i][N_STEP][0], 0, time_cost))
@@ -606,7 +621,7 @@ def train(cfg):
             mt["act"] += w3 - w2
 
             # --- tests, logging, profiling, stop ---
-            if C["since"] >= cfg["test_every_laps"] and not busy.value:
+            if C["since"] >= cfg["test_every_laps"] and not busy.value and (run_dir / "best_run.json").exists():
                 busy.value = 1
                 C["since"] = 0
                 inbox.put({"sd": {k: v.clone() for k, v in act.state_dict().items()}, "lap_n": C["laps"]})
@@ -637,6 +652,7 @@ def train(cfg):
                 ctr_p, st_p, ts_p, last_prof = c, s_, ts, now
             if now - last_chk > 2.0:
                 last_chk = now
+                ramp.update(log)
                 try:
                     tracker.update(log)
                 except Exception as e:
