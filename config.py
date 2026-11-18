@@ -40,6 +40,8 @@ DEFAULTS = {
     "iqn_warm_run": "",
     "sec_fallback": True,           # with a PB/WR target line: sections where most laps fail use the AI's own route             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
     "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
+    "test_tries_close": 8,     # ... and this many once the champion is within test_close_s of your PB
+    "test_close_s": 0.5,
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
     "horizon_s": 20.0,         # how far ahead (seconds) the AI weighs rewards     # ghost reward only counts within this many seconds behind the ghost (live)       # end a lap that falls this far behind the ghost (0 = off)
     "decay_steps": 4000000,    # learning rate + exploration halve every N env steps (0 = off)

@@ -117,6 +117,85 @@ def freeze_guard(run_dir, seconds=180):
     _HANG["guard"].start()
 
 
+# --- surface vocabulary: material / gameplay ids -> fixed one-hot slots, shared by ALL runs -------------------
+N_SURF = 16                                   # slots per vocabulary; slot 16 = "other" (any id beyond the first 16)
+VOCAB_FILE = cfgmod.ROOT / "runs" / "_materials.json"
+_VOCAB = {"material": {}, "gameplay": {}, "m": None}
+
+
+def _vocab_load():
+    try:
+        m = os.path.getmtime(VOCAB_FILE)
+    except OSError:
+        return
+    if m == _VOCAB["m"]:
+        return
+    d = read_json(VOCAB_FILE)
+    for kind in ("material", "gameplay"):
+        _VOCAB[kind] = {int(k): int(v) for k, v in (d.get(kind) or {}).items()}
+    _VOCAB["m"] = m
+
+
+def surface_slot(kind, sid):
+    """Slot (0..16) of a surface id. New ids get the next free slot, in order of first appearance, written to
+    runs/_materials.json under a lock file so every car, run and later model maps an id to the same input."""
+    sid = int(sid)
+    voc = _VOCAB[kind]
+    if sid in voc:
+        return voc[sid]
+    _vocab_load()
+    if sid in _VOCAB[kind]:
+        return _VOCAB[kind][sid]
+    lock = VOCAB_FILE.with_suffix(".lock")
+    try:
+        VOCAB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return N_SURF
+    for _ in range(200):                                   # ~2 s
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > 10:     # stale lock (crashed process)
+                    os.unlink(lock)
+            except OSError:
+                pass
+            time.sleep(0.01)
+    else:
+        return N_SURF                                      # could not lock: "other" this once
+    try:
+        d = read_json(VOCAB_FILE)
+        d.setdefault("material", {})
+        d.setdefault("gameplay", {})
+        cur = {int(k): int(v) for k, v in d[kind].items()}
+        if sid not in cur:
+            cur[sid] = len(cur) if len(cur) < N_SURF else N_SURF
+            d[kind] = {str(k): v for k, v in cur.items()}
+            d["note"] = "Surface ids -> input slots (0-15; 16 = other). Shared by all runs: never edit or reorder."
+            write_json(VOCAB_FILE, d)
+            say(f"New {kind} surface id {sid} -> input slot "
+                + (str(cur[sid] + 1) if cur[sid] < N_SURF else "'other' (all 16 slots taken)"))
+        _VOCAB[kind] = cur
+        _VOCAB["m"] = os.path.getmtime(VOCAB_FILE)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+    return _VOCAB[kind][sid]
+
+
+def onehot_ids(kind, ids, valid=None):
+    """[len(ids) * 17] one-hots; rows where valid is False stay all zero (e.g. a ray that hit nothing)."""
+    out = np.zeros((len(ids), N_SURF + 1), np.float32)
+    for i, sid in enumerate(ids):
+        if valid is None or valid[i]:
+            out[i, surface_slot(kind, sid)] = 1.0
+    return out.ravel()
+
+
 def say(msg):
     print(time.strftime("%H:%M:%S ") + msg, flush=True)
 
@@ -424,8 +503,13 @@ class TMEnv(gym.Env):
     FAR_LINE, FAR_TICKS = 40.0, 800       # end a lap after 8 s continuously further than 40 m off the line
     STALL_TICKS = 400                     # on the line, moving, but no progress along it: 4 s grace
     _ARCS = np.array(LOOK + PREVIEW + tuple(10.0 * k for k in range(1, PATH3D + 1)))
-    N_DIFF = 1                            # how often laps fail in the current section (0..1): last non-lidar input
-    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH + N_DIFF   # non-lidar features
+    N_DIFF = 1                            # how often laps fail in the current section (0..1)
+    WHEELS4 = ("fl", "fr", "rl", "rr")
+    SURF_RAYS = (32, 33, 34, 35, 14, 15, 16, 17, 13, 18)   # 4 downward rays + 6 centre fan rays: surface ahead
+    N_ICE = 11                            # per wheel icing state + blend, front/rear icing grip, any wheel on ice/snow
+    N_SURF_IN = 4 * (N_SURF + 1) * 2 + len(SURF_RAYS) * (N_SURF + 1) + N_ICE   # surface block (last non-lidar inputs)
+    N_BASE = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH + N_DIFF + N_SURF_IN   # non-lidar features
+    DIFF_COL = N_BASE0 + len(EXTRA_NAMES) + N_MEM + N_PATH                       # where the difficulty input sits
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
@@ -681,6 +765,8 @@ class TMEnv(gym.Env):
             sc = self._scan
         hit = np.asarray(sc.hit, dtype=bool)
         self._lid = (hit, np.where(hit, np.asarray(sc.distance, dtype=np.float32), self.ray_range))
+        mat = getattr(sc, "material_id", None)
+        self._lid_mat = np.asarray(mat, dtype=np.int64) if mat is not None else np.zeros(len(hit), np.int64)
         return self._lid
 
     def _read_weights(self):
@@ -830,6 +916,21 @@ class TMEnv(gym.Env):
         save_npy(self.run_dir / "profile.npy", prof)
         write_json(f, {"ms": ms})
 
+    def _ghost_from_best(self):
+        """If the fastest saved run (best_run) beats the current ghost, the ghost follows it on the current line."""
+        if self.run_dir is None or self.dense is None or self.guide:
+            return
+        try:
+            bms, gms = read_json(self.run_dir / "best_run.json").get("ms"), read_json(self.run_dir / "profile.json").get("ms")
+            if bms is None or (gms is not None and bms >= gms):
+                return
+            prof = trace_to_profile(self.dense, np.load(self.run_dir / "best_trace.npy"))
+            if len(prof) >= 5 and prof[-1, 0] >= 0.95 * self.dense[2][-1]:     # the run follows this line to the end
+                save_npy(self.run_dir / "profile.npy", prof)
+                write_json(self.run_dir / "profile.json", {"ms": int(bms)})
+        except Exception:
+            pass
+
     def _limit_ticks(self):
         """Once a champion exists, cut hopeless laps at 1.6x its time: much faster training."""
         if self.shorten and self.champ_ms:
@@ -907,6 +1008,32 @@ class TMEnv(gym.Env):
         clear = float(np.clip((fwd - speed * 1.2) / (speed * 0.8 + 1.0), 0.0, 1.0))
         return straight * clear
 
+    def _surface(self, t):
+        """Surface inputs: per wheel material + gameplay surface (one-hot over the shared vocabulary), material of
+        the road ahead seen by the downward / centre lidar rays, and the ice state. Gameplay + ice need RUNTIME
+        (extra observations); without them those parts are 0."""
+        w, rt = t.wheels, getattr(t, "runtime", None)
+        mats = getattr(w, "material_id", None)
+        out = [onehot_ids("material", mats) if mats is not None else np.zeros(4 * (N_SURF + 1), np.float32)]
+        if self.extra and rt is not None:
+            gp = [int(_f(rt, f"{k}_surface_gameplay_id")) for k in self.WHEELS4]
+            out.append(onehot_ids("gameplay", gp))
+        else:
+            out.append(np.zeros(4 * (N_SURF + 1), np.float32))
+        hit = self._lid[0]
+        rays = [i for i in self.SURF_RAYS if i < len(hit)]
+        ahead = onehot_ids("material", self._lid_mat[rays], hit[rays])
+        out.append(np.concatenate([ahead, np.zeros(len(self.SURF_RAYS) * (N_SURF + 1) - len(ahead), np.float32)]))
+        if self.extra and rt is not None:
+            ice = [float(np.clip(_f(rt, f"{k}_icing_state"), -5, 5)) for k in self.WHEELS4]
+            ice += [float(np.clip(_f(rt, f"{k}_icing_blend"), -5, 5)) for k in self.WHEELS4]
+            ice += [_f(rt, "front_wheels_icing_grip_scale", 1.0) - 1.0, _f(rt, "rear_wheels_icing_grip_scale", 1.0) - 1.0,
+                    float(_f(rt, "is_any_wheel_on_ice_or_snow") > 0.5)]
+            out.append(np.clip(np.asarray(ice, np.float32), -5, 5))
+        else:
+            out.append(np.zeros(self.N_ICE, np.float32))
+        return np.concatenate(out)
+
     def _extras(self, t, q, pos, s):
         """41 extra features (see EXTRA_NAMES). All zero when extra observations are switched off."""
         n = len(EXTRA_NAMES)
@@ -918,11 +1045,11 @@ class TMEnv(gym.Env):
         self._prev_lv = lv
         out = list(np.clip(acc / 20.0, -5.0, 5.0))                                       # acceleration (collisions, traction)
         out += list(np.asarray(w.angular_velocity, dtype=np.float32) / 300.0)             # wheel spin
-        out += [0.0]          # icing: read 1.0 on a summer map in selftest -> disabled until the field is understood
+        out += [0.0]          # old "icing" slot: kept 0 (trained checkpoints expect it); real ice inputs: _surface()
         hit = _f(rt, "wall_hit_this_step")
         out += [_f(rt, "forward_motion_alignment_scale", 1.0), hit, _f(rt, "roof_contact_this_step"),
                 _f(rt, "wetness"), _f(rt, "surface_grip_scale", 1.0), _f(rt, "soft_surface_wheel_count") / 4.0,
-                0.0, _f(v, "in_water")]     # on_ice disabled (same reason as icing)
+                0.0, _f(v, "in_water")]     # old "on_ice" slot: kept 0, see _surface()
         out += [_f(rt, "accel_coef", 1.0) - 1.0, _f(rt, "control_coef", 1.0) - 1.0,
                 _f(rt, "gravity_coef", 1.0) - 1.0, _f(rt, "adherence_coef", 1.0) - 1.0]
         rdir = _f(ef, "reactor_direction")
@@ -975,6 +1102,7 @@ class TMEnv(gym.Env):
         f += list(np.clip(locs[nl + npv:] / 100.0, -5.0, 5.0).ravel())   # the line ahead in 3D, up to 400 m
         f += list(self.pa_old)
         f.append(self._difficulty())                                 # section failure rate (exploration focus)
+        f += list(self._surface(t))                                  # what the wheels are on, what is ahead, ice
         hit, dist = self._lid
         f += list(np.minimum(dist, self.ray_range) / self.ray_range)
         self._last_obs = np.clip(np.nan_to_num(np.asarray(f, dtype=np.float32)), -10, 10)
@@ -1279,11 +1407,14 @@ class CarPool:
     so nobody waits for the slowest car. Per-car order is kept (results of a car arrive in its step order)."""
 
     DEADLINE = float(os.environ.get("TMAI_CAR_DEADLINE", 120))   # a car step taking longer = hung car, replaced
+    # (a reset that builds mid-track starts replays a whole lap: on long maps the deadline grows, see __init__)
 
     def __init__(self, cfg, run_dir, n):
         import multiprocessing as mp
         from multiprocessing.connection import wait
         self._wait, self.cfg, self.run_dir = wait, cfg, str(run_dir)
+        if "TMAI_CAR_DEADLINE" not in os.environ:
+            self.DEADLINE = max(120.0, 3.0 * time_budget(cfg))
         self.ctx = mp.get_context("spawn")
         self.n, self.conns, self.procs = n, [None] * n, [None] * n
         for i in range(n):
@@ -1304,9 +1435,12 @@ class CarPool:
         self.conns[i], self.procs[i] = a, p
 
     def _ready(self, i, timeout=600):
-        c = self.conns[i]
-        if not c.poll(timeout):
-            raise RuntimeError(f"car {i + 1} did not start within {timeout} s")
+        c, t0 = self.conns[i], time.time()
+        timeout = max(timeout, 5.0 * time_budget(self.cfg))
+        while not c.poll(5.0):                     # keep the freeze guard fed while a car starts up
+            watchdog()
+            if time.time() - t0 > timeout:
+                raise RuntimeError(f"car {i + 1} did not start within {timeout:.0f} s")
         m = c.recv()
         if m[0] == "error":
             self.close()
@@ -1555,11 +1689,11 @@ ENT_BOOST = 3.0          # entropy weight in a section where every lap fails: 1 
 
 def focus_entropy(model):
     """More exploration where laps keep failing: each sample's entropy bonus is weighted by
-    1 + ENT_BOOST * (failure rate of its section), read from the observation's last non-lidar input."""
+    1 + ENT_BOOST * (failure rate of its section), read from the observation's difficulty input (DIFF_COL)."""
     pol = model.policy
     if getattr(pol, "_focus", False):
         return
-    orig, col = pol.evaluate_actions, TMEnv.N_BASE - 1
+    orig, col = pol.evaluate_actions, TMEnv.DIFF_COL
 
     def evaluate_actions(obs, actions):
         values, log_prob, entropy = orig(obs, actions)
@@ -1641,6 +1775,28 @@ def migrate(run_dir, cfg, env):
 
 
 # --- champion tests, dashboard events, stop conditions ----------------------------------------
+def pb_ms(cfg, run_dir):
+    """Your PB in ms: the pb_seconds setting, else the traced PB file's time."""
+    if cfg.get("pb_seconds"):
+        return float(cfg["pb_seconds"]) * 1000.0
+    ms = read_json(Path(run_dir) / "pb_trace.json").get("ms") if cfg.get("pb_file") else None
+    return float(ms) if ms else None
+
+
+def test_tries(cfg, run_dir):
+    """Best-of-N for a champion test: test_tries normally, test_tries_close once the champion is within
+    test_close_s of the PB (more seeded laps find the rare faster one; still exactly reproducible)."""
+    champ, pb = read_json(Path(run_dir) / "best.json").get("champion_ms"), pb_ms(cfg, run_dir)
+    if champ and pb and champ - pb <= cfg["test_close_s"] * 1000.0:
+        return max(cfg["test_tries"], cfg["test_tries_close"])
+    return cfg["test_tries"]
+
+
+def time_budget(cfg):
+    """Seconds a lap may take in the worst case (long maps need longer timeouts)."""
+    return float(cfg["max_lap_seconds"])
+
+
 def ppo_test_worker(cfg, run_dir, inbox, busy):
     """Champion tests for PPO in their own process (spawn): best of N laps with the EMA weights it is sent.
     Writes champion.zip/.txt, champ_trace, champion_actions, the reference line; asks for a rollback via ROLLBACK."""
@@ -1674,7 +1830,8 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
                 model = PPO.load(str(run_dir / "tester_base.zip"), device="cpu")
             model.policy.load_state_dict(msg["sd"])
             best_try = None                    # best of N: argmax lap + seeded laps, keep the fastest
-            for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
+            n_try = test_tries(cfg, run_dir)
+            for sd in [None] + [1000 + i for i in range(max(0, n_try - 1))]:
                 inf = run_episode(env, model, sd)
                 tr = {"info": inf, "seed": sd, "hist": list(env.hist), "acts": list(env.acts), "rec": env.g.export()}
                 key = (0, inf["race_ms"]) if inf["finished"] else (1, -inf.get("cp", 0))
@@ -1727,11 +1884,14 @@ def ppo_test_worker(cfg, run_dir, inbox, busy):
                 for f in ("profile.json", "profile.npy"):
                     (run_dir / f).unlink(missing_ok=True)
                 env._offer_profile(ms)
+                env._ghost_from_best()                           # ghost = faster of this lap and the best saved run
                 write_json(line_meta, {"ms": ms, "t": time.time()})
                 say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
             write_json(best_file, best)
-            log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled)
-            say(f"Champion test {tests}: " + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
+            log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled,
+                tries=n_try, seed=tr["seed"])
+            say(f"Champion test {tests} (best of {n_try}): "
+                + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
                 + (" -> NEW CHAMPION" if promoted else "") + (" -> rolling back to champion" if rolled else ""))
         except Exception as e:
             say(f"Champion test failed: {str(e)[:120]}")
@@ -1767,7 +1927,7 @@ def _make_callback(cfg, run_dir, tracker=None):
             self.ema_update(reset=True)
             self.rb, self.rb_steps, self.neg = {}, 0, 0
             self.stuckw = StuckWatch()
-            freeze_guard(run_dir)
+            freeze_guard(run_dir, seconds=max(180.0, 2.0 * time_budget(cfg) + 60.0))
             self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
             log(k="start", cfg=cfg)
             self.status("running")
@@ -1891,11 +2051,20 @@ def _make_callback(cfg, run_dir, tracker=None):
                 self.tests_off = True
                 return
             if self.busy.value:
+                limit = max(cfg["test_tries"], cfg["test_tries_close"]) * (1.3 * time_budget(cfg) + 20.0) + 180.0
+                if time.time() - self.test_t0 > limit:          # a test that long is a hung tester
+                    say(f"Champion test running for {limit / 60:.0f} min: restarting the tester")
+                    try:
+                        self.tester.terminate()
+                    except Exception:
+                        pass
+                    self.tester_start()
                 return
             self.check_rollback()                                # never send a test before a pending rollback
             self.since = 0
             sd = self.ema if getattr(self, "ema", None) is not None else self.model.policy.state_dict()
             self.busy.value = 1
+            self.test_t0 = time.time()
             self.inbox.put({"sd": {k: v.detach().clone() for k, v in sd.items()}, "lap_n": self.laps})
 
         def check_rollback(self):
@@ -2072,10 +2241,29 @@ def missing_fields(env):
 
 
 def selftest(cfg):
+    from collections import Counter
     env = TMEnv(cfg, cfgmod.run_dir(cfg), shorten=False)
     o, _ = env.reset()
+    seen = {"wheel material": Counter(), "wheel gameplay": Counter(), "ray material": Counter()}
+    ice = {}
     for _ in range(40):
         o, r, term, trunc, info = env.step(np.array([10, 0]))              # straight, full gas
+        t = env._last_t
+        for m in getattr(t.wheels, "material_id", []):
+            seen["wheel material"][int(m)] += 1
+        hit = env._lid[0]
+        for i in env.SURF_RAYS:
+            if i < len(hit) and hit[i]:
+                seen["ray material"][int(env._lid_mat[i])] += 1
+        rt = getattr(t, "runtime", None)
+        if rt is not None:
+            for k in env.WHEELS4:
+                seen["wheel gameplay"][int(_f(rt, f"{k}_surface_gameplay_id"))] += 1
+            for name in [f"{k}_icing_{x}" for k in env.WHEELS4 for x in ("state", "blend")] + [
+                    "front_wheels_icing_grip_scale", "rear_wheels_icing_grip_scale", "is_any_wheel_on_ice_or_snow"]:
+                ice[name] = max(ice.get(name, -1e9), _f(rt, name, float("nan")))
+        if term or trunc:
+            break
     print("steering levels:", env.STEER.tolist())
     print("route points:", len(env.route) - 1, "| route length: %.0f m" % env.lap_len,
           "| reference line:", "yes" if env.dense is not None else "not yet")
@@ -2085,6 +2273,15 @@ def selftest(cfg):
     if env.extra:
         print("missing telemetry fields (these always read their default):", missing_fields(env) or "none")
         print("extra observations:", {n: round(float(x), 3) for n, x in zip(EXTRA_NAMES, o[N_BASE0:env.N_BASE])})
+    _vocab_load()
+    for kind, c in seen.items():
+        voc = _VOCAB["gameplay" if "gameplay" in kind else "material"]
+        print(f"{kind} ids seen (id: count -> input slot):",
+              ", ".join(f"{k}: {n} -> {voc.get(k, N_SURF) + 1 if voc.get(k, N_SURF) < N_SURF else 'other'}"
+                        for k, n in sorted(c.items())) or "none")
+    if ice:
+        print("ice raw values (max over the test drive; on a summer map icing_state/blend and is_any_wheel_on_ice"
+              "_or_snow must be 0, grip scales 1):", {k: round(v, 3) for k, v in ice.items()})
     print("lidar min/max m:", np.round((o[env.N_BASE:] * env.ray_range).min(), 1),
           np.round((o[env.N_BASE:] * env.ray_range).max(), 1), "| obs size:", o.shape[0])
     env.close()

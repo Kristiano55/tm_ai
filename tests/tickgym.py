@@ -6,6 +6,12 @@ import numpy as np, os
 # TICKGYM_FAKE_HANG=<file path>: when that file exists, the next car to step deletes it and hangs forever.
 _DET=os.environ.get("TICKGYM_FAKE_DETOUR","")
 _HANG=os.environ.get("TICKGYM_FAKE_HANG","")
+# Surfaces: asphalt (material 16) everywhere except dirt (material 6) for z 600..800; gameplay id 3 ("turbo")
+# for z 300..320, else 0. Ice fields are 0 (a summer map). The 4 downward rays (32..35) hit the road ~2 m below
+# and see the material ~20 m ahead.
+ASPHALT, DIRT = 16, 6
+def _mat(z): return DIRT if 600<=z<800 else ASPHALT
+def _gp(z): return 3 if 300<=z<320 else 0
 def _detour(): return _DET=="1" or (_DET not in ("","0") and os.path.exists(_DET))
 # TICKGYM_FAKE_MS=5: each step waits ~5 ms (random, like a busy TICK server); a raycast ~1 ms. Default 0 = instant.
 import time, random
@@ -47,10 +53,12 @@ class G:
         sp=s.v
         p=_path(s.z); z=p[2]
         return NS(vehicle=NS(speed=sp,linear_velocity=[0,0,sp],angular_velocity=[0,0,0],rotation=[0,0,0,1],position=p,in_water=0),
-          wheels=NS(contact=[1]*4,slipping=[0]*4,angular_velocity=[10]*4,icing_percent=[0]*4),
+          wheels=NS(contact=[1]*4,slipping=[0]*4,angular_velocity=[10]*4,icing_percent=[0]*4,material_id=[_mat(z)]*4),
           drivetrain=NS(steer=0,gear=3),race=NS(checkpoints_taken=int(z//500),race_tick=s.tick,race_time_ms=s.tick*10,entered_off_zone=False),
-          runtime=NS(wall_hit_this_step=0,wetness=0),effects=NS(turbo=0),
-          lidar=NS(hit=[0]*s.n,distance=[0]*s.n) if s.n else None,finished=z>=1000)
+          runtime=NS(wall_hit_this_step=0,wetness=0,**{f"{w}_surface_gameplay_id":float(_gp(z)) for w in ("fl","fr","rl","rr")},
+                     **{f"{w}_icing_{k}":0.0 for w in ("fl","fr","rl","rr") for k in ("state","blend")},
+                     front_wheels_icing_grip_scale=1.0,rear_wheels_icing_grip_scale=1.0,is_any_wheel_on_ice_or_snow=0.0),effects=NS(turbo=0),
+          lidar=s._scan(s.n,z) if s.n else None,finished=z>=1000)
     acc=True
     @property
     def next_tick(s): return s.tick
@@ -64,8 +72,11 @@ class G:
             try: os.remove(_HANG); time.sleep(10**6)
             except FileNotFoundError: pass
         _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),80); s.v=max(s.v,0); s.z+=s.v*ticks/100; return s.tel()
+    def _scan(s,n,z):
+        hit=[1 if 32<=i<36 else 0 for i in range(n)]
+        return NS(hit=hit,distance=[2.0 if h else 0 for h in hit],material_id=[_mat(z+20) if h else 0 for h in hit])
     def raycast(s,rays):
-        _wait(FAKE_MS/5); return NS(hit=[0]*len(rays),distance=[0]*len(rays))
+        _wait(FAKE_MS/5); return s._scan(len(rays),_path(s.z)[2])
     info=NS(max_snapshots_per_session=64)
     def snapshot(s):
         G.snaps=getattr(G,'snaps',{}); i=len(G.snaps)+1; G.snaps[i]=(s.z,s.v,s.tick); return NS(id=i,tick=s.tick)

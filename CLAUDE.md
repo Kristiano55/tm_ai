@@ -47,13 +47,21 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 ## Key design decisions (and why)
 - **Actions:** 21 progressive steering levels (fine near centre) x {gas, coast, brake}; `ticks_per_step` 5 (50 ms)
   default, 3 (30 ms) possible. Per-step costs scale with `tf = ticks/5` so they mean the same per second.
-- **Observations** (~290 + 41 lidar): car-frame velocity/rotation/up, wheels, steer/gear, last actions, route
+- **Observations** (564 non-lidar + 41 lidar): car-frame velocity/rotation/up, wheels, steer/gear, last actions, route
   lookahead, 41 extras (effects/runtime/ghost/line offset), track preview (10 pts), short history (5 steps),
   40-point 3D line preview every 10 m (Linesight), 3 older actions, lidar (32 fan + 4 down + 5 up).
   All route points of a step are interpolated in one batch (`_route_points`, `to_car_frame_many`): ~5x faster obs.
   **New features must be appended at the end of the non-lidar block** so `migrate()` / `widen_columns()` can
   convert old PPO checkpoints (new input weights start at 0 = same behaviour). IQN checkpoints don't convert.
-- **`icing` and `on_ice` inputs are forced to 0**: on a summer map selftest read 1.0 for both (unknown semantics).
+- **Old `icing` / `on_ice` extras slots stay 0** (trained checkpoints have untrained weights there). Real ice inputs
+  are in the surface block: per wheel `{fl,fr,rl,rr}_icing_state` + `_icing_blend`, front/rear icing grip scale - 1,
+  `is_any_wheel_on_ice_or_snow`. selftest prints the raw values (summer map: 0, grip scales 1).
+- **Surface block** (`_surface`, after the difficulty input; `N_SURF_IN` = 317): one-hot per wheel of
+  `wheels.material_id` and of RUNTIME `{w}_surface_gameplay_id` (4x17 each), lidar `material_id` of the 4 down
+  rays + 6 centre fan rays (`SURF_RAYS`, 10x17, zero when no hit), ice (11). Gameplay + ice need extra_obs.
+- **Surface vocabulary** `runs/_materials.json` (shared by ALL runs, later base model / packs): separate
+  "material" and "gameplay" maps id -> slot in order of first appearance, 16 slots + 16 = other; new ids are added
+  under a lock file (`_materials.lock`) and logged. Never reorder or edit it.
 - **Rewards** are a dict per step (`r[...]`), summed; per-term averages are logged (`rb`) for the dashboard's
   reward breakdown. Lessons learned the hard way:
   - Giving up must never pay: stuck/off-zone cost `w_stuck/w_offzone + w_progress * remaining metres` (PPO); with
@@ -77,7 +85,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   fastest route there (line + ghost + VCPs). Back to "pb" when 3 laps drive the whole section within 15 m of the PB
   route (`secs_wr` in lap info), or a periodic "try" (after 10 min, doubling to 1 h; 50 laps, <=50% fail = keep).
   Every switch is logged (event k=section). `sec_fallback` setting turns it off.
-- **Difficulty input** (last non-lidar input, `N_DIFF`): failure rate of the current section. PPO weights each
+- **Difficulty input** (`DIFF_COL`, right before the surface block): failure rate of the current section. PPO weights each
   sample's entropy bonus by `1 + 3 * difficulty` (`focus_entropy`, wraps `policy.evaluate_actions`): more
   exploration only where laps keep failing. Old PPO checkpoints are widened by `migrate()`.
 - **PB guide:** `pb_file` (TICK input text of Kris's PB) is replayed once to trace *where/when* it drove; it becomes
@@ -87,7 +95,10 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; IQN uses
   `iqn_mid_start_p` (0.2) and, with a `pb_file`, starts only along the PB/WR states (to learn the WR route's cut); built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
-- **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible); PPO uses EMA weights and
+- **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible), `test_tries_close` (8) once the
+  champion is within `test_close_s` (0.5 s) of the PB (`pb_seconds`, else the traced PB file's time; `test_tries()`);
+  the test event logs tries + winning seed, Play champion replays `champion_seed`. Ghost: fastest finished lap (tests
+  included); after a line rebuild `_ghost_from_best()` keeps the best saved run if it beats the champion lap; PPO uses EMA weights and
   `target_kl=0.02`; rollback after `rollback_after` bad tests (IQN only if `iqn_rollback`, default off). Both algos test in a spawn process (busy flag,
   restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
 - **PPO is the main algorithm** (Kris, after IQN stalled on Training - 22). IQN code + settings stay; the dashboard
@@ -106,7 +117,10 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 
 ## Freezes
 - tickgym calls time out (gym 20 s, HTTP 60 s); timeouts end the lap like a `TransportError`.
-- `CarPool`: a car not answering within 120 s (`TMAI_CAR_DEADLINE`) is killed and replaced; its lap ends "car restarted".
+- `CarPool`: a car not answering within max(120 s, 3 x max_lap_seconds) (`TMAI_CAR_DEADLINE`) is killed and replaced;
+  its lap ends "car restarted". Car start-up waits feed the watchdog.
+- PPO: freeze guard max(180 s, 2 x max_lap_seconds + 60); a champion test running longer than
+  max tries x (1.3 x max_lap_seconds + 20) + 180 s restarts the tester.
 - `watchdog()` re-arms faulthandler (stacks -> `hang.txt`, kept open). `freeze_guard()` thread in the trainer: 180 s
   without `watchdog()` -> dump all threads, status.json "froze", kill children, exit 3. The dashboard restarts runs
   marked "froze" or with a stale heartbeat (pid from status.json), also runs it didn't start; max 5 per hour.
@@ -124,6 +138,8 @@ The fake car drives straight along z for 1000 m (2 checkpoints); finishing ~13.3
 `TICKGYM_FAKE_DETOUR=<file>` only while that file exists. Section fallback test: trace `pb.txt` ("0 accel 1") with
 `prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
 `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
+Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
+hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).
 `time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.
@@ -141,4 +157,4 @@ Test checkpoint conversion by training with the previous git version first, then
 - Learning-rate warm restart when layout/timing changes (PPO).
 - Cross-map base driver with map pool (parked by Kris).
 - Run comparison view in the dashboard.
-- Fix the ice inputs properly from raw selftest values.
+- Check selftest's raw ice values on a real ice/snow map.
