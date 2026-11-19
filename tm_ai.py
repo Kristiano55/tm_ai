@@ -11,6 +11,8 @@ import argparse
 import faulthandler
 import json
 import os
+import warnings
+warnings.filterwarnings("ignore", message=r".*(get_schedule_fn|constant_fn).*")   # SB3 deprecation noise
 import sys
 import time
 from functools import partial
@@ -247,6 +249,17 @@ def write_json(path, obj):
         pass
 
 
+def atomic_save(path, write, backup=True):
+    """write(tmp_path) then rename over path; the previous file is kept as <name>.prev<ext> (one backup).
+    A crash mid-write never leaves a half-written checkpoint."""
+    path = Path(path)
+    tmp = path.with_name(path.stem + ".tmp" + path.suffix)
+    write(tmp)
+    if backup and path.exists():
+        os.replace(path, path.with_name(path.stem + ".prev" + path.suffix))
+    os.replace(tmp, path)
+
+
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -465,6 +478,9 @@ class SectionTracker:
     difficulty input + target mode) and rebuilds the guide on every switch."""
 
     WINDOW, MIN_N, FAIL, RETRY_S, TRY_N = 200, 50, 0.7, 600.0, 50
+    # hysteresis (a section used to flip PB <-> AI every ~30 s): after a switch the target is kept >= HOLD_S, and
+    # the rate must cross with a margin: to AI above FAIL + MARGIN, back to PB at <= 0.5 - MARGIN / WR_N laps on PB
+    HOLD_S, MARGIN, WR_N, LOG_S = 600.0, 0.1, 5, 600.0
 
     def __init__(self, run_dir, cfg, n_sections):
         self.run_dir, self.cfg = Path(run_dir), cfg
@@ -481,7 +497,7 @@ class SectionTracker:
         self.since = list(d.get("since", [0.0] * n))
         self.retry = list(d.get("retry", [self.RETRY_S] * n))
         self.wr = [0] * n
-        self.last_write = 0.0
+        self.last_write, self.last_log = 0.0, [0.0] * n
         if not self.on and "ai" in d.get("mode", []):          # fallback switched off: back to the PB/WR line
             self.write()
             if self.guide:
@@ -512,9 +528,12 @@ class SectionTracker:
 
     def _set(self, k, mode, why, log):
         old, self.mode[k] = self.mode[k], mode
-        self.out[k], self.wr[k], self.since[k] = [], 0, time.time()
+        now = time.time()
+        self.out[k], self.wr[k], self.since[k] = [], 0, now
         tgt = {"pb": "your PB/WR route", "try": "your PB/WR route (trial)", "ai": "the AI's own best route"}[mode]
-        say(f"Section {k + 1} (checkpoint {k} -> {k + 1}): target is now {tgt} - {why}")
+        if now - self.last_log[k] >= self.LOG_S:              # at most one line per section per 10 min
+            self.last_log[k] = now
+            say(f"Section {k + 1} (checkpoint {k} -> {k + 1}): target is now {tgt} - {why}")
         if log:
             log(k="section", sec=k, mode=mode, old=old, why=why)
 
@@ -523,10 +542,12 @@ class SectionTracker:
         changed, now = False, time.time()
         for k in range(self.n if self.on else 0):
             r, m, n_out = self.rate(k), self.mode[k], len(self.out[k])
-            if m == "pb" and r is not None and n_out >= self.MIN_N and r > self.FAIL and self._ai_route(k):
+            if now - float(self.since[k] or 0.0) < self.HOLD_S:     # just switched: keep the target for now
+                continue
+            if m == "pb" and r is not None and n_out >= self.MIN_N and r > self.FAIL + self.MARGIN and self._ai_route(k):
                 self._set(k, "ai", f"{r:.0%} of the laps reaching it fail there", log)
                 changed = True
-            elif m == "ai" and self.wr[k] >= 3:
+            elif m == "ai" and self.wr[k] >= self.WR_N:
                 self._set(k, "pb", "the AI got through on the PB/WR route", log)
                 self.retry[k] = self.RETRY_S
                 changed = True
@@ -534,7 +555,7 @@ class SectionTracker:
                 self._set(k, "try", f"periodic retry after {self.retry[k] / 60:.0f} min", log)
                 changed = True
             elif m == "try" and n_out >= self.TRY_N:
-                if r is not None and r <= 0.5:
+                if r is not None and r <= 0.5 - self.MARGIN:
                     self._set(k, "pb", f"retry worked ({r:.0%} fail)", log)
                     self.retry[k] = self.RETRY_S
                 else:
@@ -732,7 +753,10 @@ class TMEnv(gym.Env):
                     self._starts_from_record(rec, limit)
             self.fails = np.zeros(len(self.starts))
             self._starts_line = "unset"
-            if self.starts:
+            mk = self.run_dir / "starts_logged.json"          # log once per rebuild, not once per car
+            if self.starts and (self.role != "training" or read_json(mk).get("m") != m):
+                if self.role == "training":
+                    write_json(mk, {"m": m})
                 say(f"[{self.role}] {len(self.starts)} mid-track start points built "
                     + ("(along your PB/WR)" if pb_only else "(champion lap + your PB)"))
         except Exception:                       # snapshots unsupported / limit reached: train without
@@ -1729,7 +1753,7 @@ class CarPool:
         self.first_obs = [None] * n
         self.sent = [None] * n                       # when each car got its action (None = not stepping)
         self.prof = np.zeros(5)                      # summed seconds: tick, obs, env, waited for action; + steps
-        self.replaced = 0
+        self.replaced, self.fails = 0, {}
         self.cov = Coverage(cfg, run_dir) if coverage and cfg.get("run_type") != "base" else None   # base runs: no coverage
         self.cov_sent = [-1] * n
         for i in range(n):
@@ -1744,7 +1768,7 @@ class CarPool:
         b.close()
         self.conns[i], self.procs[i] = a, p
 
-    def _ready(self, i, timeout=600):
+    def _ready(self, i, timeout=600, close_on_error=True):
         c, t0 = self.conns[i], time.time()
         timeout = max(timeout, 5.0 * time_budget(self.cfg))
         while not c.poll(5.0):                     # keep the freeze guard fed while a car starts up
@@ -1753,27 +1777,60 @@ class CarPool:
                 raise RuntimeError(f"car {i + 1} did not start within {timeout:.0f} s")
         m = c.recv()
         if m[0] == "error":
-            self.close()
+            if close_on_error:
+                self.close()
             raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
         self.dim, self.nvec, self.n_seg = m[2], m[3], m[4]
         self.analog = bool(m[5]) if len(m) > 5 else False
         return m[1]
 
-    def replace(self, i):
+    def replace(self, i, quiet=False):
         """Kill a hung car and start a fresh one in its place; returns the new car's first observation."""
-        say(f"Car {i + 1} did not answer for {self.DEADLINE:.0f} s: replacing it with a fresh one.")
+        if not quiet:
+            say(f"Car {i + 1} did not answer for {self.DEADLINE:.0f} s: replacing it with a fresh one.")
         try:
             self.procs[i].terminate()
             self.procs[i].join(timeout=10)
         except Exception:
             pass
-        self._spawn(i)
-        obs = self._ready(i)
+        while True:                                # a fresh car can fail to start too (TICK timeout): retry
+            self._spawn(i)
+            try:
+                obs = self._ready(i, close_on_error=False)
+                break
+            except RuntimeError as e:
+                now = time.time()
+                f = [t for t in self.fails.get(i, []) if now - t < self.FAIL_WINDOW] + [now]
+                self.fails[i] = f
+                if len(f) >= self.FAIL_MAX:
+                    self.close()
+                    raise RuntimeError(f"car {i + 1} failed {len(f)} times in {self.FAIL_WINDOW / 60:.0f} min "
+                                       f"(last: {e})")
+                say(f"Replacement car {i + 1} did not start ({str(e)[:80]}); trying again.")
+                try:
+                    self.procs[i].terminate()
+                except Exception:
+                    pass
+                time.sleep(5)
         self.idx = {id(c): j for j, c in enumerate(self.conns)}
         self.sent[i] = None
         self.cov_sent[i] = -1
         self.replaced += 1
         return obs
+
+    FAIL_MAX, FAIL_WINDOW = 3, 300.0                  # the same car failing 3 times in 5 min stops the run
+
+    def _car_failed(self, i, why):
+        now = time.time()
+        f = [t for t in self.fails.get(i, []) if now - t < self.FAIL_WINDOW] + [now]
+        self.fails[i] = f
+        if len(f) >= self.FAIL_MAX:
+            self.close()
+            raise RuntimeError(f"car {i + 1} failed {len(f)} times in {self.FAIL_WINDOW / 60:.0f} min (last: {why})")
+        say(f"Car {i + 1} failed ({why}): replacing it with a fresh one, training goes on.")
+        obs = self.replace(i, quiet=True)
+        return (i, obs, 0.0, True, {"end": "car restarted", "finished": False, "race_ms": 0, "cp": 0, "cp0": 0,
+                                    "TimeLimit.truncated": True})
 
     def hung(self):
         """Results for cars stuck past the deadline: (car, fresh obs, 0 reward, done, info) after replacing them."""
@@ -1800,10 +1857,11 @@ class CarPool:
             i = self.idx[id(c)]
             try:
                 m = c.recv()
-            except EOFError:
-                raise RuntimeError(f"car {i + 1} stopped unexpectedly")
-            if m[0] == "error":
-                raise RuntimeError(f"car {i + 1}: {m[1]}")
+            except (EOFError, OSError):
+                m = ("error", "the car process stopped unexpectedly")
+            if m[0] == "error":                       # e.g. TransportError timeout: replace the car, keep training
+                out.append(self._car_failed(i, m[1]))
+                continue
             _, obs, r, done, info, tm = m
             self.sent[i] = None
             if done and self.cov is not None and info.get("cov") and not info.get("pool"):
@@ -2237,7 +2295,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
                 bad = 0
             ca = R / "champion_actions.json"
             if fin and (promoted or not ca.exists()):          # route for the mid-track starts
-                write_json(ca, {"ms": ms, "acts": env.acts})
+                write_json(ca, {"ms": ms, "acts": env.acts, "ticks": env.ticks})
             if fin and not (R / "champ_trace.npy").exists():
                 save_npy(R / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
             line_ms = read_json(line_meta).get("ms") or best.get("first_test_ms")   # old runs: line from the first test
@@ -2276,7 +2334,6 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
     """maps (base run): [(cfg, folder, slug), ...]: per-map section trackers + stuck hints, round-robin tests."""
     by_slug = {m[2]: m for m in maps or []}
     from stable_baselines3.common.callbacks import BaseCallback
-    from stable_baselines3.common.utils import get_schedule_fn
 
     events, best_file = run_dir / "events.jsonl", run_dir / "best.json"
     status_file, line_file = run_dir / "status.json", run_dir / "centerline.npy"
@@ -2340,7 +2397,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
             ds = cfg["decay_steps"]
             if ds:                                         # exploit more as training goes on
                 f = 0.5 ** (self.model.num_timesteps / ds)
-                self.model.lr_schedule = get_schedule_fn(max(3e-4 * f, 3e-5))
+                self.model.lr_schedule = __import__('ppo_ext').ConstLR(max(3e-4 * f, 3e-5))
                 self.model.ent_coef = max(0.005 * f, 0.0005)
             pol = self.model.policy
             if hasattr(pol, "steer_std"):                  # analog steering: exploration std decays with it
@@ -2515,7 +2572,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
             flag.unlink(missing_ok=True)
 
         def save_all(self):
-            self.model.save(run_dir / "latest")
+            atomic_save(run_dir / "latest.zip", lambda p: self.model.save(str(p)))
             if self.model.sil is not None:
                 try:
                     self.model.sil.save(str(run_dir / "sil.npz"))      # the run's own laps; never exported in packs
@@ -2667,6 +2724,7 @@ def train(cfg):
         say("Warning: " + w)
     (run_dir / "STOP").unlink(missing_ok=True)
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
+    (run_dir / "starts_logged.json").unlink(missing_ok=True)   # mid-start log: once per rebuild
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     raise_priority(tick_too=True)
     base = cfg["run_type"] == "base"
@@ -2764,6 +2822,44 @@ def train(cfg):
         env.close()
 
 
+def replay_champion(cfg, run_dir, env):
+    """Play champion = the champion test's own lap, replayed from its recorded actions (champion_actions.json).
+    Re-driving it with the network does NOT reproduce the time: its inputs (ghost, target line, section rates)
+    have changed since the test and IQN samples its quantiles at random. Returns res or None (no recording)."""
+    run_dir = Path(run_dir)
+    ca, champ = read_json(run_dir / "champion_actions.json"), read_json(run_dir / "best.json").get("champion_ms")
+    acts = ca.get("acts") or []
+    if not acts:
+        return None
+    ticks = int(ca.get("ticks") or cfg["ticks_per_step"])
+    if ca.get("ms") and champ and int(ca["ms"]) != int(champ):
+        say(f"Warning: champion_actions.json is from a {int(ca['ms']) / 1000:.3f} s lap, the champion is "
+            f"{champ / 1000:.3f} s")
+    env.g.reset(seed=0)
+    t = None
+    for steer, mode in acts:
+        t = env.g.step(ticks, steer=int(steer), accelerate=int(mode) in GAS, brake=int(mode) in BRAKE)
+        if t.finished:
+            break
+    res = {"t": time.time(), "finished": bool(t is not None and t.finished), "end": "finished", "ms": None,
+           "file": None, "champion_ms": champ, "source": "champion_actions.json"}
+    if not res["finished"]:
+        res["end"] = "no finish"
+        say("Warning: replaying the champion's recorded actions did not finish (ticks per step changed?)")
+        return res
+    rec = env.g.export()
+    InputText.write(str(run_dir / "play.txt"), rec.actions)
+    res.update(ms=int(rec.finish_ms), file=str(run_dir / "play.txt"))
+    say(f"Champion play finished in {rec.finish_ms / 1000:.3f} s -> {run_dir / 'play.txt'} (load it in TICK to watch it)")
+    check_play(res["ms"], champ)
+    return res
+
+
+def check_play(ms, champ):
+    if ms is not None and champ and abs(ms - champ) > 10:
+        say(f"Warning: play ({ms / 1000:.3f} s) differs from the champion ({champ / 1000:.3f} s) by more than 0.01 s")
+
+
 def drive(cfg, model_path=None):
     from stable_baselines3 import PPO
 
@@ -2773,8 +2869,15 @@ def drive(cfg, model_path=None):
             raise SystemExit("Base run without pool maps.")
         cfg = cfgmod.map_cfg(cfg, cfg["map_pool"][0], cfg["progress_norm_m"])
         run_dir = run_dir / "maps" / cfg["_slug"]
-    model = PPO.load(model_path or str(run_dir / "champion.zip"), device="cpu")
     env = TMEnv(cfg, run_dir, shorten=False, role="play")
+    if not model_path:
+        res = replay_champion(cfg, run_dir, env)
+        if res is not None:
+            write_json(run_dir / "play_result.json", res)
+            env.close()
+            return
+        say("No recorded champion lap (champion_actions.json): driving the champion network instead.")
+    model = PPO.load(model_path or str(run_dir / "champion.zip"), device="cpu")
     say("Driving the champion (the lap is simulated in the background, the game window will not show it) ...")
     info = run_episode(env, model, read_json(run_dir / "best.json").get("champion_seed"))
     res = {"t": time.time(), "finished": bool(info["finished"]), "end": info["end"], "ms": None, "file": None}

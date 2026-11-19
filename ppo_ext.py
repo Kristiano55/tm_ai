@@ -225,6 +225,16 @@ class SILBuffer:
             return False
 
 
+class ConstLR:
+    """Constant learning rate (picklable; replaces SB3's deprecated get_schedule_fn / constant_fn)."""
+
+    def __init__(self, v):
+        self.v = float(v)
+
+    def __call__(self, _progress):
+        return self.v
+
+
 class TMPPO(PPO):
     sil_weight, aux_weight = 0.1, 0.05
     sil, aux_rows, ret_scale, ret_clip = None, None, 1.0, 10.0
@@ -254,7 +264,7 @@ class TMPPO(PPO):
                 mse = (out[:, 2] - yy[:, 2]) ** 2
                 la = ((bce * mm[:, :2]).sum() + (mse * mm[:, 2]).sum()) / mm.sum().clamp(min=1.0)
                 loss = loss + self.aux_weight * la
-                aux_l.append(float(la))
+                aux_l.append(la.detach().item())
             if self.sil_weight > 0 and self.sil is not None:
                 s = self.sil.sample(SIL_BATCH, self.gamma, self.ret_scale, self.ret_clip)
                 if s is not None:
@@ -263,7 +273,7 @@ class TMPPO(PPO):
                     adv = (ret.float() - values.flatten()).clamp(min=0.0)          # only where R > V(s)
                     ls = -(logp * adv.detach()).mean() + 0.5 * 0.01 * (adv ** 2).mean()
                     loss = loss + self.sil_weight * ls
-                    sil_l.append(float(ls))
+                    sil_l.append(ls.detach().item())
                     sil_frac.append(float((adv > 0).float().mean()))
             if isinstance(loss, float):
                 break

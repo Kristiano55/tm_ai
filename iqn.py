@@ -141,6 +141,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
             best_try = None
             for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
                 rng = np.random.default_rng(sd)
+                torch.manual_seed(0 if sd is None else sd)        # IQN quantiles are sampled: reproducible tries
                 obs, _ = env.reset()
                 done, info = False, {}
                 while not done:
@@ -165,7 +166,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
                 promoted, bad = True, 0
                 best["champion_ms"], best["champion_seed"] = ms, tr["seed"]
                 champ = ms
-                torch.save(msg["sd"], run_dir / "champion.pt")
+                T.atomic_save(run_dir / "champion.pt", lambda p: torch.save(msg["sd"], p))
                 T.InputText.write(str(run_dir / "champion.txt"), rec.actions)
                 T.save_npy(run_dir / "champ_trace.npy", np.asarray(tr["hist"], dtype=np.float64))
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
@@ -177,7 +178,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
                 bad = 0
             ca = run_dir / "champion_actions.json"
             if fin and (promoted or not ca.exists()):
-                T.write_json(ca, {"ms": ms, "acts": tr["acts"]})
+                T.write_json(ca, {"ms": ms, "acts": tr["acts"], "ticks": env.ticks})
             if fin and not (run_dir / "champ_trace.npy").exists():
                 T.save_npy(run_dir / "champ_trace.npy", np.asarray(tr["hist"], dtype=np.float64))
             line_ms = T.read_json(line_meta).get("ms") or best.get("first_test_ms")
@@ -226,6 +227,14 @@ def pick_device(cfg):
     ok = torch.cuda.is_available()
     if want == "cuda" and not ok:
         T.say("IQN: 'cuda' was chosen but PyTorch sees no GPU (CPU-only PyTorch?); learning on the CPU")
+    if ok:
+        try:                                         # busy / out of memory / broken driver: use the CPU instead
+            x = torch.ones(256, 256, device="cuda")
+            float((x @ x).sum())
+            del x
+        except Exception as e:
+            T.say(f"IQN: the GPU can't be used right now ({type(e).__name__}: {str(e)[:100]}); learning on the CPU")
+            ok = False
     return "cuda" if ok else "cpu"
 
 
@@ -235,14 +244,10 @@ def _attach(name):
     try:
         return shared_memory.SharedMemory(name=name, track=False)            # Python 3.13+
     except TypeError:
-        shm = shared_memory.SharedMemory(name=name)
-        if os.name != "nt":                      # POSIX: don't let this process's exit delete the block
-            try:
-                from multiprocessing import resource_tracker
-                resource_tracker.unregister(shm._name, "shared_memory")
-            except Exception:
-                pass
-        return shm
+        # Python <= 3.12: attaching registers the name with the resource tracker that spawn children SHARE with the
+        # main process (a set, so it's a no-op). Unregistering here removed the main process's entry and its
+        # unlink() later made the tracker print "KeyError: '/psm_...'" tracebacks. The owner unlinks once.
+        return shared_memory.SharedMemory(name=name)
 
 
 class SharedReplay(Replay):
@@ -267,13 +272,17 @@ class SharedReplay(Replay):
     def close(self):
         for f in ("o", "o2", "a", "r", "k", "end", "c", "ctr"):
             setattr(self, f, None)
-        for shm in self.shms:
+        shms, self.shms = self.shms, []            # idempotent: unlink exactly once
+        for shm in shms:
             try:
                 shm.close()
-                if self.owner:
-                    shm.unlink()
             except Exception:
                 pass
+            if self.owner:
+                try:
+                    shm.unlink()
+                except Exception:
+                    pass
 
 
 def flat_size(net):
@@ -301,30 +310,50 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
     T.raise_priority()
     run_dir = Path(run_dir)
     try:
-        dev = pick_device(cfg)
+        dev = cfg.get("_iqn_dev") or pick_device(cfg)
         torch.set_num_threads(2)
         n_in = dim + 1
-        net, tgt = IQNNet(n_in, n_act).to(dev), IQNNet(n_in, n_act).to(dev)
+        try:
+            net, tgt = IQNNet(n_in, n_act).to(dev), IQNNet(n_in, n_act).to(dev)
+        except Exception as e:                           # GPU out of memory / busy: learn on the CPU
+            if dev == "cpu":
+                raise
+            T.say(f"IQN: could not put the network on the GPU ({type(e).__name__}: {str(e)[:100]}); learning on the CPU")
+            dev = "cpu"
+            net, tgt = IQNNet(n_in, n_act), IQNNet(n_in, n_act)
         opt = torch.optim.Adam(net.parameters(), lr=1e-3, eps=1e-4)
         ckpt = run_dir / "latest.pt"
         meta = T.read_json(run_dir / "iqn.json")
         steps0 = 0
         if cfg["resume"] and ckpt.exists() and meta and (meta.get("n_in"), meta.get("n_act")) != (n_in, n_act):
             ckpt.replace(run_dir / "latest.old_layout.pt")      # never load under a wrong layout, never lose it
+            if (run_dir / "latest.prev.pt").exists():
+                (run_dir / "latest.prev.pt").replace(run_dir / "latest.prev.old_layout.pt")
             T.say("IQN: the input layout changed; old latest.pt moved to latest.old_layout.pt, starting fresh")
-        if cfg["resume"] and ckpt.exists() and meta.get("n_in") == n_in and meta.get("n_act") == n_act:
-            try:
-                d = torch.load(ckpt, map_location=dev)
-                net.load_state_dict(d["net"])
-                tgt.load_state_dict(d["tgt"])
-                opt.load_state_dict(d["opt"])
-                steps0 = int(d.get("steps", 0))
-                T.say(f"Resumed IQN from latest.pt ({steps0:,} steps)")
-            except Exception as e:
-                T.say(f"Cannot resume IQN ({str(e)[:80]}), starting fresh")
-                net, tgt = IQNNet(n_in, n_act).to(dev), IQNNet(n_in, n_act).to(dev)
-                opt = torch.optim.Adam(net.parameters(), lr=1e-3, eps=1e-4)
-                tgt.load_state_dict(net.state_dict())
+        prev = run_dir / "latest.prev.pt"
+        if cfg["resume"] and (ckpt.exists() or prev.exists()) and meta.get("n_in") == n_in and meta.get("n_act") == n_act:
+            errs = []
+            for src in (ckpt, prev):                     # latest.pt, else its backup; never start fresh silently
+                if not src.exists():
+                    continue
+                try:
+                    d = torch.load(src, map_location=dev)
+                    net.load_state_dict(d["net"])
+                    tgt.load_state_dict(d["tgt"])
+                    opt.load_state_dict(d["opt"])
+                    steps0 = int(d.get("steps", 0))
+                    T.say(f"Resumed IQN from {src.name} ({steps0:,} steps)" + (
+                        f" because latest.pt could not be loaded ({errs[0]})" if errs else ""))
+                    if errs and ckpt.exists():             # keep the broken file for a look, never as the backup
+                        ckpt.replace(run_dir / "latest.corrupt.pt")
+                    break
+                except Exception as e:
+                    errs.append(f"{src.name}: {type(e).__name__}: {str(e)[:150] or repr(e)}")
+                    T.say(f"IQN: could not load {errs[-1]}")
+            else:
+                raise RuntimeError("cannot resume IQN, the saved checkpoints could not be loaded (" + "; ".join(errs)
+                                   + "). Nothing was overwritten. Fix or move the files aside (or turn off "
+                                   "'Resume') to start fresh.")
         elif (cfg["resume"] and (run_dir / "champion.pt").exists() and meta.get("n_in") == n_in
               and meta.get("n_act") == n_act):
             try:                                            # latest.pt missing: continue from the champion
@@ -351,8 +380,11 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 ctr[3] += 1
 
         def save():
-            torch.save({"net": net.state_dict(), "tgt": tgt.state_dict(), "opt": opt.state_dict(),
-                        "steps": int(ctr[0])}, ckpt)
+            d = {"net": net.state_dict(), "tgt": tgt.state_dict(), "opt": opt.state_dict(), "steps": int(ctr[0])}
+            try:
+                T.atomic_save(ckpt, lambda p: torch.save(d, p))      # tmp + rename, previous kept as latest.prev.pt
+            except Exception as e:
+                T.say(f"IQN: saving latest.pt failed ({type(e).__name__}: {e})")
 
         publish()
         ready_evt.set()
@@ -424,7 +456,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 stats[3] += time.perf_counter() - b0
         save()
         buf.close()
-    except Exception:
+    except Exception as e:
+        T.say("!" * 12 + f" IQN learner stopped: {type(e).__name__}: {e} " + "!" * 12)
         errq.put(traceback.format_exc()[-1500:])
         ready_evt.set()
 
@@ -434,6 +467,7 @@ def train(cfg):
     run_dir = cfgmod.run_dir(cfg)
     (run_dir / "STOP").unlink(missing_ok=True)
     (run_dir / "ROLLBACK").unlink(missing_ok=True)
+    (run_dir / "starts_logged.json").unlink(missing_ok=True)   # mid-start log: once per rebuild
     torch.set_num_threads(1)                                  # driving: tiny batches, one thread is fastest
     T.raise_priority(tick_too=True)
     T.prepare_guide(cfg, run_dir)
@@ -475,7 +509,7 @@ def train(cfg):
     stop_evt, ready_evt, errq = ctx.Event(), ctx.Event(), ctx.Queue()
     device = pick_device(cfg)
     learner = ctx.Process(target=learner_proc, daemon=True,
-                          args=(cfg, str(run_dir), dim, n_act, H, time_cost, buf.names, rlock, ctr, stats, wbuf, wlock,
+                          args=(dict(cfg, _iqn_dev=device), str(run_dir), dim, n_act, H, time_cost, buf.names, rlock, ctr, stats, wbuf, wlock,
                                 stop_evt, ready_evt, errq))
     learner.start()
     while not ready_evt.wait(1.0):
@@ -707,12 +741,19 @@ def train(cfg):
 def drive(cfg):
     """Play champion for IQN: the same best-of-N lap the champion test kept (same weights + same seed)."""
     run_dir = cfgmod.run_dir(cfg)
+    env = T.TMEnv(cfg, run_dir, shorten=False, role="play")
+    res = T.replay_champion(cfg, run_dir, env)            # exact: the test's own lap
+    if res is not None:
+        T.write_json(run_dir / "play_result.json", res)
+        env.close()
+        return
+    T.say("No recorded champion lap (champion_actions.json): driving the champion network instead.")
     meta = T.read_json(run_dir / "iqn.json")
     net = IQNNet(meta["n_in"], meta["n_act"])
     net.load_state_dict(torch.load(run_dir / "champion.pt", map_location="cpu"))
-    env = T.TMEnv(cfg, run_dir, shorten=False, role="play")
     sd = T.read_json(run_dir / "best.json").get("champion_seed")
     rng = np.random.default_rng(sd)
+    torch.manual_seed(0 if sd is None else sd)
     T.say("Driving the champion (simulated in the background; load play.txt in TICK to watch) ...")
     obs, _ = env.reset()
     done, info = False, {}

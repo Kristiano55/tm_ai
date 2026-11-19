@@ -6,6 +6,9 @@ import numpy as np, os
 # TICKGYM_FAKE_HANG=<file path>: when that file exists, the next car to step deletes it and hangs forever.
 _DET=os.environ.get("TICKGYM_FAKE_DETOUR","")
 _HANG=os.environ.get("TICKGYM_FAKE_HANG","")
+# TICKGYM_FAKE_FAIL=<file path>: when that file exists, the next car to reset deletes it and raises TransportError
+# (like "the connection failed: timed out"); the file content = how many resets in a row fail (2 kills a car)
+_FAIL=os.environ.get("TICKGYM_FAKE_FAIL","")
 # Surfaces: asphalt (material 16) everywhere except dirt (material 6) for z 600..800; gameplay id 3 ("turbo")
 # for z 300..320, else 0. Ice fields are 0 (a summer map). The 4 downward rays (32..35) hit the road ~2 m below
 # and see the material ~20 m ahead.
@@ -75,7 +78,15 @@ class G:
     acc=True
     @property
     def next_tick(s): return s.tick
-    def reset(s,seed=0): s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];return s.tel()
+    def reset(s,seed=0):
+        if _FAIL and os.path.exists(_FAIL):          # file content = how many resets fail in a row (default 1)
+            try:
+                n=int(open(_FAIL).read().strip() or 1)
+                if n>1: open(_FAIL,"w").write(str(n-1))
+                else: os.remove(_FAIL)
+            except (OSError,ValueError): pass
+            else: raise TransportError("the connection failed: timed out")
+        s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];return s.tel()
     def step(s,ticks,actions=(),steer=None,accelerate=None,brake=None):
         for a in actions:
             if a.kind=='accel': s.acc=bool(a.value)

@@ -196,7 +196,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   failing (>=50 laps) and an AI route exists (`sec_best_<k>` or best lap) -> mode "ai": `build_guide` uses the AI's
   fastest route there (line + ghost + VCPs). Back to "pb" when 3 laps drive the whole section within 15 m of the PB
   route (`secs_wr` in lap info), or a periodic "try" (after 10 min, doubling to 1 h; 50 laps, <=50% fail = keep).
-  Every switch is logged (event k=section). `sec_fallback` setting turns it off.
+  Every switch is an event (k=section). Hysteresis: after a switch the target is kept >= 10 min (`HOLD_S`), to AI
+  needs > 80 % fail, back to PB needs 5 laps on the PB route or a retry with <= 40 % fail; at most one log line per
+  section per 10 min. `sec_fallback` setting turns it off.
 - **Difficulty input** (`DIFF_COL`, right before the surface block): failure rate of the current section. PPO weights each
   sample's entropy bonus by `1 + 3 * difficulty` (`focus_entropy`, wraps `policy.evaluate_actions`): more
   exploration only where laps keep failing. Old PPO checkpoints are widened by `migrate()`.
@@ -232,8 +234,25 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   scan is expensive: measure with bench, which compares both).
 - PPO uses `make_pool_vecenv` (lock-step VecEnv on `CarPool`, PPO's rollouts need lock-step) instead of SubprocVecEnv.
 
+## Checkpoints + play
+- `atomic_save()`: tmp + rename, previous file kept as `<name>.prev.<ext>` (PPO latest.zip, IQN latest.pt +
+  champion.pt). IQN resume: latest.pt, else latest.prev.pt (broken latest.pt -> latest.corrupt.pt), the real
+  exception is logged; both broken -> the learner stops with a clear message (never starts fresh silently).
+- Play champion (PPO + IQN, `replay_champion`): replays `champion_actions.json` (the test's own lap, now with
+  `ticks`) -> play.txt; warns if play differs from champion_ms by > 0.01 s. Re-driving the network did not reproduce
+  the time (27.7 vs 20.6 s): its inputs (ghost, line, section rates) changed since the test and IQN samples its
+  quantiles with unseeded torch.rand (tests + network fallback now `torch.manual_seed`). Network drive only when no
+  recording exists (or `--model`).
+- IQN device: `pick_device` test-allocates on the GPU; unavailable/busy/OOM -> CPU with one message (main process
+  decides, learner gets `_iqn_dev`; falls back again if moving the net to the GPU fails).
+- Log hygiene: mid-start build logged once per rebuild (`starts_logged.json`, cleared at train start); shared
+  replay unlinked exactly once and child processes no longer unregister it (Python 3.12 resource_tracker KeyError);
+  SB3 schedule deprecation warnings filtered, PPO lr decay uses `ppo_ext.ConstLR`.
+
 ## Freezes
 - tickgym calls time out (gym 20 s, HTTP 60 s); timeouts end the lap like a `TransportError`.
+- `CarPool`: a car whose process fails (e.g. `TransportError: timed out`, EOF) is replaced like a hung one, its
+  lap ends "car restarted"; replacement start-ups are retried; the same car failing 3 times in 5 min stops the run.
 - `CarPool`: a car not answering within max(120 s, 3 x max_lap_seconds) (`TMAI_CAR_DEADLINE`) is killed and replaced;
   its lap ends "car restarted". Car start-up waits feed the watchdog.
 - PPO: freeze guard max(180 s, 2 x max_lap_seconds + 60); a champion test running longer than
@@ -257,7 +276,8 @@ Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, o
 `prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
 `TICKGYM_FAKE_CORNER=1`: z 400..460 caps speed at 35 m/s unless gas AND brake are held (60). The fake brake now
 slows the car when held without gas (random IQN driving rarely finishes in 1 min there; with the old fake it does).
-`TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
+`TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
+a car, 100 = keeps failing -> run stops after 3). `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
 Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
 hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).
 `time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:
