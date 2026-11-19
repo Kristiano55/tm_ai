@@ -180,6 +180,17 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
     lap after 8 s continuously > 40 m off. `StuckWatch` logs a hint when >80% of the last 200 laps end stuck at one spot.
   - Laps are cut only against the AI's **own champion** pace (`champ_trace`), never before a champion exists.
   - A dense positive "while driving" reward is required for PPO; dashboard warns when it goes negative.
+- **Novelty -> speed focus** (`Coverage` in tm_ai.py, owned by `CarPool` in the main process, so PPO + IQN; not in
+  base runs / pool cars / tests / bench): line cut into `cov_len` (25) m stretches; a lap counts stretch k only if it
+  drove through all of it (lap info `cov` = [k0, k1) from its start progress, mid-starts included; failing inside a
+  stretch doesn't count it). known = 1 - exp(-passes / `cov_passes` (100)). Cars get {known, wks} with their next action
+  (tuple message) when it changed; saved `coverage.json` (passes, median speed per stretch, section modes). A section's
+  stretches reset when its route swaps PB <-> AI (sections.json). Rewards (live): `novel` = progress x (w_novel (0.5) x
+  (1 - known) - w_known (0.4, max 0.5) x wks x known), only on forward progress; `focus` = ghost x w_focus (1.5) x known.
+  `wks` < 1 where progress x (1 - w_known) at the AI's median speed there would not beat 1.1 x time cost (logged once
+  per stretch). Give-up cost keeps the base progress weight. IQN: applied at collection time (replay stores summed
+  rewards). `reward_v` 4: configs from before get 0 for missing w_novel/w_known/w_focus/w_air/w_speed/w_hit (same
+  rewards on resume); new defaults: w_air 0.02, w_speed 0.03, w_hit 0.3, ghost 10.
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
   every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
   failing (>=50 laps) and an AI route exists (`sec_best_<k>` or best lap) -> mode "ai": `build_guide` uses the AI's

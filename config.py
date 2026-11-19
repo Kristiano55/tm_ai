@@ -67,7 +67,9 @@ DEFAULTS = {
     "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
     "aux_weight": 0.05,        # PPO: auxiliary heads (wall hit soon, time to next CP, wheels grounded), training only
     "w_hit_ramp": True,        # wall-hit penalty ramps in with the finish rate (25 % below 30 % finished, 100 % from 60 %)
-    "reward_v": 3,             # reward layout version (old configs are upgraded once)
+    "cov_len": 25.0,           # coverage stretch length in m (novelty -> speed focus); at start
+    "cov_passes": 100.0,       # passes after which a stretch is 63 % "known"; at start
+    "reward_v": 4,             # reward layout version (old configs are upgraded once)
 }
 
 
@@ -95,13 +97,19 @@ WEIGHTS = {
     "w_wall": (0.0, "Wall-scrape penalty", "near a wall at speed; can discourage tight racing lines"),
     "w_air": (0.0, "Airtime penalty", "per step with no wheel on the ground"),
     "w_speed": (0.0, "Speed reward", "per step, proportional to speed (direct speed incentive)"),
+    "w_novel": (0.5, "Novelty bonus", "extra progress pay on stretches the AI rarely gets through: x (1 + this x (1 - known))"),
+    "w_known": (0.4, "Known-stretch cut", "less progress pay where the AI knows the stretch well: x (1 - this x known); max 0.5"),
+    "w_focus": (1.5, "Speed focus", "extra ghost reward on well-known stretches: time gained x (1 + this x known)"),
 }
+NEW_IN_V4 = {"w_novel": 0.0, "w_known": 0.0, "w_focus": 0.0, "w_air": 0.0, "w_speed": 0.0, "w_hit": 0.0,
+             "ghost_weight": 10.0}     # values for configs from before reward_v 4 that don't have the key
 
 # "Lean" preset: only the terms that define the task; everything else off. This is also the default (recommended
 # for PPO); "Reset weights to defaults" fills it in.
 LEAN = {k: 0.0 for k in WEIGHTS}
 LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
-            w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05)
+            w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05,
+            w_air=0.02, w_speed=0.03, w_hit=0.3, w_novel=0.5, w_known=0.4, w_focus=1.5)
 WEIGHTS = {k: (LEAN[k], label, hint) for k, (_, label, hint) in WEIGHTS.items()}
 DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 
@@ -128,6 +136,15 @@ def load():
             save(cfg)
         except OSError:
             pass
+    if on_disk is not None and v < 4:     # v4: novelty/speed-focus weights; old configs keep their behaviour (0)
+        for k, d in NEW_IN_V4.items():
+            if k not in on_disk:
+                cfg[k] = d
+        cfg["reward_v"] = 4
+        try:
+            save(cfg)
+        except OSError:
+            pass
     return coerce(cfg)
 
 
@@ -150,6 +167,9 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    out["w_known"] = min(max(out["w_known"], 0.0), 0.5)
+    out["cov_len"] = max(5.0, out["cov_len"])
+    out["cov_passes"] = max(1.0, out["cov_passes"])
     pool = []
     for e in out["map_pool"] if isinstance(out["map_pool"], list) else []:
         if isinstance(e, str):

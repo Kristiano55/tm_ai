@@ -210,7 +210,11 @@ const I={step:1}, F={
  w_release:['Pointless release','','w',{group:'Driving style',more:1}], w_coast:['Coast','','w',{group:'Driving style',more:1}],
  w_brake:['Brake','','w',{group:'Driving style',more:1}], w_steer_smooth:['Smooth steering','','w',{group:'Driving style',more:1}],
  w_slip:['Slip','','w',{group:'Driving style',more:1}], w_air:['Airtime','','w',{group:'Driving style',more:1}],
- w_speed:['Speed','','w',{group:'Driving style',more:1}], w_wall:['Wall scrape','','w',{group:'Driving style',more:1}],
+ w_speed:['Speed','','w',{group:'Driving style',more:1}],
+ w_novel:['Novelty bonus','','w',{group:'Novelty & speed focus'}], w_known:['Known-stretch cut','','w',{group:'Novelty & speed focus',min:0,max:0.5}],
+ w_focus:['Speed focus','','w',{group:'Novelty & speed focus'}],
+ cov_len:['Stretch length (m)','Track is cut into stretches of this length; each counts how often laps got all the way through it. At start.','number',{group:'Novelty & speed focus',more:1,min:5,max:200,step:1}],
+ cov_passes:['Passes to know a stretch','After this many full passes a stretch is 63 % known (less progress pay, more ghost-time pay). At start.','number',{group:'Novelty & speed focus',more:1,min:1,step:1}], w_wall:['Wall scrape','','w',{group:'Driving style',more:1}],
  test_every_laps:['Test every N laps','Champion test after this many training laps (only after the first finished lap).','number',{min:1,max:100000,...I}],
  test_tries:['Tries','Champion test = best of N laps (most likely actions + seeded ones).','number',{min:1,max:20,...I}],
  test_tries_close:['Tries near PB','Best of N once the champion is within the margin below of your PB.','number',{min:1,max:50,...I}],
@@ -263,7 +267,7 @@ const SECTIONS=[
  ['run','Run & map',['run','run_type','map','pb_seconds','pb_file','resume','base_from']],
  ['cars','Cars & speed',['envs','ticks_per_step','time_limit_min','max_lap_seconds','lidar_every']],
  ['rew','Rewards',['w_progress','w_time','w_finish','w_finish_time','w_checkpoint','ghost_weight','ghost_window_s','w_guide','vcp_every_s','w_vcp','w_vsplit',
-   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall']],
+   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall','w_novel','w_known','w_focus','cov_len','cov_passes']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
  ['line','Track & line',['line_refresh_s','mid_start_p','mid_start_every_s','sec_fallback','cut_behind_s']],
  ['learn','Learning (PPO)',['horizon_s','decay_steps','analog_steer','gas_brake','sil_weight','aux_weight']],
@@ -287,7 +291,7 @@ function fieldHtml(m,c){
   if(m.type=='checkbox') return `<div class="fld ck" data-k="${m.k}"><div class="fr"><input type="checkbox" id="${id}" ${v?'checked':''}>${head}</div></div>`;
   if(m.type=='select') ctl=`<select id="${id}">${o.opts.map(([a,b])=>`<option value="${a}" ${v==a?'selected':''}>${esc(b)}</option>`).join('')}</select>`;
   else if(m.type=='pool') ctl=`<div class="tw"><table class="sec pool" id="poolT"></table></div><button type="button" class="sm" id="poolAdd" style="margin-top:6px">+ Add map</button>`;
-  else if(m.type=='number'||m.type=='w') ctl=`<input type="number" id="${id}" value="${esc(v)}" step="${o.step??'any'}" ${o.min!=null?`min="${o.min}"`:''} ${o.max!=null?`max="${o.max}"`:''} inputmode="decimal" ${m.type=='w'?'min="-1000" max="1000"':''}>`;
+  else if(m.type=='number'||m.type=='w') ctl=`<input type="number" id="${id}" value="${esc(v)}" step="${o.step??'any'}" ${o.min!=null?`min="${o.min}"`:''} ${o.max!=null?`max="${o.max}"`:''} inputmode="decimal" ${m.type=='w'&&o.max==null?'min="-1000" max="1000"':''}>`;
   else ctl=`<input type="${m.type=='password'?'password':'text'}" id="${id}" value="${esc(v)}" autocomplete="off" ${m.type=='run'?'list="runList"':''}>`;
   return `<div class="fld${o.wide?' wide':''}" data-k="${m.k}">${head}${ctl}<div class="err" id="e_${m.k}"></div>${m.type=='run'?'<small class="mut" id="runInfo"></small>':''}</div>`;
 }
@@ -338,7 +342,7 @@ function valOf(k){ const m=meta(k), e=$('f_'+k); if(m.type=='pool') return readP
 function readForm(){ const o={}; for(const k in DEF) o[k]=(meta(k).type=='pool'||$('f_'+k))?valOf(k):BASE[k]; return o }
 function norm(k,v){ const d=DEF[k]; if(typeof d=='number') return v===''||v==null?'':Number(v); if(typeof d=='boolean') return !!v; if(Array.isArray(d)) return JSON.stringify(v||[]); return String(v??'') }
 function validate(k){ const m=meta(k), e=$('f_'+k); if(!e||!(m.type=='number'||m.type=='w')) return '';
-  const s=e.value.trim(), x=Number(s), o=m.o, lo=m.type=='w'?-1000:o.min, hi=m.type=='w'?1000:o.max;
+  const s=e.value.trim(), x=Number(s), o=m.o, lo=m.type=='w'?(o.min??-1000):o.min, hi=m.type=='w'?(o.max??1000):o.max;
   let msg=''; if(s===''||!isFinite(x)) msg='Enter a number'; else if(lo!=null&&x<lo) msg=`At least ${lo}`; else if(hi!=null&&x>hi) msg=`At most ${hi}`;
   else if(o.step===1&&!Number.isInteger(x)) msg='Whole number';
   e.classList.toggle('bad',!!msg); e.setAttribute('aria-invalid',msg?'true':'false'); $('e_'+k).textContent=msg; return msg }

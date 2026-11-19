@@ -621,6 +621,12 @@ class TMEnv(gym.Env):
         self.hit_factor, self._ramp_m = 1.0, None
         self.stall, self.cp0, self.seg0, self.sec_wr, self._wr_max = 0, 0, None, [], 0.0
         self.sec_rate, self.sec_mode, self._sec_m, self.pb_dense, self.pb_cut = [], [], None, None, None
+        # coverage (novelty -> speed focus): per cov_len-m stretch of the line, how well the AI knows it (0..1),
+        # sent by the main process (Coverage in CarPool). Training cars of map runs only.
+        self.cov_on = role == "training" and not self.pool_car and not self.slug
+        self.cov_len = max(5.0, float(cfg.get("cov_len", 25)))
+        self.cov_known, self.cov_wks = np.zeros(0), np.zeros(0)
+        self.cov_s0, self.cov_max, self.cov_spd = 0.0, 0.0, {}
 
         self.session = Client(timeout=60).open_map(cfg["map"])
         mi = getattr(getattr(self.session, "info", None), "map", None)
@@ -1267,6 +1273,7 @@ class TMEnv(gym.Env):
             self.pscale = float(np.clip(self.pnorm / max(length, 1.0), 0.2, 5.0))
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
+        self.cov_spd = {}
         if self.starts and self.np_random.random() < self.mid_p:
             try:
                 i = self._pick_start()
@@ -1288,6 +1295,7 @@ class TMEnv(gym.Env):
         self.di = 0
         self._s = self._global_progress(pos, self.taken) if self.start_i is not None else self._progress(pos, 0)
         self.phi = self._phi(self._s, tick)
+        self.cov_s0 = self.cov_max = float(self._s)
         self.vcp_i = int(np.searchsorted(self.vcp_s, self._s, side="right"))
         self.hist = [[*pos, tick, self.taken]]
         self.cp0, self.sec_wr, self._wr_max = self.taken, [], 0.0
@@ -1323,6 +1331,9 @@ class TMEnv(gym.Env):
         dp = s - self._s                      # _s = progress already paid; a skipped stretch is paid at
         dp = min(dp, 10.0) if dp >= 0 else max(dp, -10.0)   # <= 10 m per step, a backward jump costs once
         r["progress"] = W["w_progress"] * dp * self.pscale
+        kn, ck = self._known(self._s)
+        if kn is not None and dp > 0 and (W["w_novel"] or W["w_known"]):    # new stretch pays more, known less
+            r["novel"] = r["progress"] * (W["w_novel"] * (1.0 - kn) - min(W["w_known"], 0.5) * self._wks(ck) * kn)
         tf = self.tf
         r["time"] = -W["w_time"] * tf
         r["steer"] = -W["w_steer_smooth"] * abs(steer / 127.0 - self.pa[0])
@@ -1339,6 +1350,8 @@ class TMEnv(gym.Env):
             # behind, losing more time costs nothing extra, so ending the lap early can never pay off
             lo = -max(self.ghost_window, 0.1)
             r["ghost"] = float(np.clip(W["ghost_weight"] * (max(phi, lo) - max(self.phi, lo)), -5.0, 5.0))
+            if kn is not None and W["w_focus"]:                              # known stretch: time gained counts more
+                r["focus"] = r["ghost"] * W["w_focus"] * kn
         self.phi = phi
         if self.guide and W["w_guide"] and self.dense is not None:            # pulled toward the target line,
             off = pos - self._route_point(s)                                     # but only while slower than it
@@ -1366,6 +1379,11 @@ class TMEnv(gym.Env):
             r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed = speed
         self._s = self._s + dp if s >= self._s else s
+        if self.cov_on:
+            self.cov_max = max(self.cov_max, self._s)
+            a = self.cov_spd.setdefault(ck, [0.0, 0])
+            a[0] += speed
+            a[1] += 1
         self.pa_old = np.concatenate([self.pa[4:8], self.pa_old[:8]])
         self.pa = np.concatenate([[steer / 127.0], MODE_VEC[mode], self.pa[:4]])
         prev_taken = self.hist[-1][4] if self.hist else taken
@@ -1440,8 +1458,36 @@ class TMEnv(gym.Env):
                        float(np.any(np.asarray(t.wheels.contact, dtype=bool))), tick, taken)
         if terminated or truncated:
             info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
+            if self.cov_on:
+                info["cov"] = self._cov_info(length, bool(t.finished))
             info["tm"], self.tm = self.tm, {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}
         return obs, float(reward), terminated, truncated, info
+
+    # --- coverage (novelty -> speed focus) ---------------------------------------------------------------
+    def _known(self, s):
+        """(known 0..1 or None when coverage is off, stretch index) at progress s."""
+        k = int(max(s, 0.0) // self.cov_len)
+        if not self.cov_on:
+            return None, k
+        return (float(self.cov_known[k]) if k < len(self.cov_known) else 0.0), k
+
+    def _wks(self, k):
+        """w_known scale of stretch k (< 1 where the reduced progress pay would not beat the time cost)."""
+        return float(self.cov_wks[k]) if k < len(self.cov_wks) else 1.0
+
+    def set_cov(self, d):
+        self.cov_known = np.asarray(d.get("known", []), dtype=np.float64)
+        self.cov_wks = np.asarray(d.get("wks", []), dtype=np.float64)
+
+    def _cov_info(self, length, finished):
+        """Stretches this lap drove through completely: [k0, k1). A lap failing inside a stretch doesn't count it."""
+        L = self.cov_len
+        k0 = int(np.ceil(self.cov_s0 / L - 1e-9))
+        k1 = int(np.ceil(length / L)) if finished else int(self.cov_max // L)
+        spd = {int(k): round(a[0] / a[1], 2) for k, a in self.cov_spd.items() if a[1] and k0 <= k < k1}
+        cpa = [round(float(x), 1) for x in self.cp_arc] if self.cp_arc is not None else []
+        return {"k0": k0, "k1": max(k0, k1), "spd": spd, "cp_arc": cpa, "ps": round(self.pscale, 4),
+                "n": int(np.ceil(length / L))}
 
     def close(self):
         try:
@@ -1524,6 +1570,9 @@ def car_worker(cfg, run_dir, conn, rot=None):
             waited = time.perf_counter() - w0
             if msg is None:
                 break
+            if isinstance(msg, tuple):                 # (action, coverage update from the main process)
+                msg, cov = msg
+                env.set_cov(cov)
             tm0 = dict(env.tm)
             obs, r, term, trunc, info = env.step(msg)
             done = term or trunc
@@ -1551,6 +1600,113 @@ def car_worker(cfg, run_dir, conn, rot=None):
             pass
 
 
+class Coverage:
+    """How well the AI knows each cov_len-m stretch of the target line (main process; saved as coverage.json).
+    passes = laps that drove through the whole stretch; known = 1 - exp(-passes / cov_passes).
+    A section's stretches reset when its target route swaps (PB <-> AI, sections.json)."""
+
+    def __init__(self, cfg, run_dir):
+        self.cfg, self.dir = cfg, Path(run_dir)
+        self.file = self.dir / "coverage.json"
+        self.L, self.tau = max(5.0, float(cfg.get("cov_len", 25))), max(1.0, float(cfg.get("cov_passes", 100)))
+        d = read_json(self.file)
+        if d and abs(float(d.get("len", 0)) - self.L) > 1e-6:
+            say(f"Coverage: stretch length changed ({d.get('len')} -> {self.L:g} m), starting a new count.")
+            d = {}
+        self.passes = list(d.get("passes", []))
+        self.spd = {int(k): list(v) for k, v in (d.get("spd") or {}).items()}
+        self.modes, self.cp_arc = list(d.get("modes", [])), list(d.get("cp_arc", []))
+        self.capped = set(int(x) for x in d.get("capped", []))
+        self.ps, self.ver, self._sec_m, self._saved = 1.0, 0, None, time.time()
+        self._payload = None
+
+    def known(self):
+        return 1.0 - np.exp(-np.asarray(self.passes, np.float64) / self.tau)
+
+    def wks(self):
+        """Per stretch: scale for w_known so that on a fully known stretch, progress pay at the AI's own median speed
+        there still beats the time cost (with 10 % margin). Logged once per stretch."""
+        W = read_json(cfgmod.CONFIG_PATH)
+        def w(k):
+            try:
+                return float(W.get(k, self.cfg.get(k, 0.0)))
+            except (TypeError, ValueError):
+                return float(self.cfg.get(k, 0.0))
+        wp, wt, wk = w("w_progress"), w("w_time"), min(w("w_known"), 0.5)
+        ticks = self.cfg["ticks_per_step"]
+        out = np.ones(len(self.passes))
+        if wk <= 0:
+            return out
+        for k, v in self.spd.items():
+            if k >= len(out) or not v:
+                continue
+            pay = wp * self.ps * float(np.median(v)) * ticks / 100.0        # progress pay per step at median speed
+            need = 1.1 * wt * ticks / 5.0
+            if pay * (1.0 - wk) < need:
+                out[k] = float(np.clip((1.0 - need / pay) / wk, 0.0, 1.0)) if pay > 0 else 0.0
+                if k not in self.capped:
+                    self.capped.add(k)
+                    say(f"Coverage: stretch {k} ({k * self.L:.0f}-{(k + 1) * self.L:.0f} m) is slow for the AI "
+                        f"({np.median(v):.0f} m/s): known-stretch progress cut limited to {wk * out[k]:.2f} there "
+                        "(so it never makes driving there pay less than the time cost).")
+        return out
+
+    def payload(self):
+        if self._payload is None:
+            self._payload = {"known": self.known().round(4).tolist(), "wks": self.wks().round(4).tolist()}
+        return self._payload
+
+    def _check_sections(self):
+        """Reset the stretches of a section whose target route swapped (PB <-> AI)."""
+        f = self.dir / "sections.json"
+        try:
+            m = os.path.getmtime(f)
+        except OSError:
+            return
+        if m == self._sec_m:
+            return
+        self._sec_m = m
+        modes = ["ai" if x == "ai" else "pb" for x in read_json(f).get("mode", [])]
+        if self.modes and self.cp_arc:
+            bounds = [0.0] + list(self.cp_arc) + [1e12]
+            for k, (a, b) in enumerate(zip(self.modes, modes)):
+                if a != b and k + 1 < len(bounds):
+                    lo, hi = int(bounds[k] // self.L), int(np.ceil(bounds[k + 1] / self.L))
+                    for j in range(lo, min(hi, len(self.passes))):
+                        self.passes[j] = 0
+                        self.spd.pop(j, None)
+                        self.capped.discard(j)
+                    say(f"Coverage: section {k + 1} now follows the {'AI' if b == 'ai' else 'PB'} route, "
+                        "its stretches count as new again.")
+        self.modes = modes
+
+    def add(self, c):
+        """One finished training lap's coverage info from a car (TMEnv._cov_info)."""
+        n = int(c.get("n", 0))
+        if n > len(self.passes):
+            self.passes += [0] * (n - len(self.passes))
+        if c.get("cp_arc"):
+            self.cp_arc = list(c["cp_arc"])
+        self.ps = float(c.get("ps", self.ps) or 1.0)
+        self._check_sections()
+        for k in range(int(c["k0"]), min(int(c["k1"]), len(self.passes))):
+            self.passes[k] += 1
+        for k, v in (c.get("spd") or {}).items():
+            self.spd[int(k)] = (self.spd.get(int(k), []) + [float(v)])[-21:]
+        self.ver += 1
+        self._payload = None
+        if time.time() - self._saved > 30:
+            self.save()
+
+    def save(self):
+        try:
+            write_json(self.file, {"len": self.L, "passes": self.passes, "spd": {str(k): v for k, v in self.spd.items()},
+                                   "modes": self.modes, "cp_arc": self.cp_arc, "capped": sorted(self.capped)})
+            self._saved = time.time()
+        except Exception:
+            pass
+
+
 class CarPool:
     """Cars in their own processes, NOT in lock-step: each car gets its next action as soon as its own step is back,
     so nobody waits for the slowest car. Per-car order is kept (results of a car arrive in its step order)."""
@@ -1558,7 +1714,7 @@ class CarPool:
     DEADLINE = float(os.environ.get("TMAI_CAR_DEADLINE", 120))   # a car step taking longer = hung car, replaced
     # (a reset that builds mid-track starts replays a whole lap: on long maps the deadline grows, see __init__)
 
-    def __init__(self, cfg, run_dir, n, specs=None):
+    def __init__(self, cfg, run_dir, n, specs=None, coverage=True):
         """specs: per car (cfg, run_dir, rot) to give cars their own maps (base runs, pool cars); None = all alike."""
         import multiprocessing as mp
         from multiprocessing.connection import wait
@@ -1574,6 +1730,8 @@ class CarPool:
         self.sent = [None] * n                       # when each car got its action (None = not stepping)
         self.prof = np.zeros(5)                      # summed seconds: tick, obs, env, waited for action; + steps
         self.replaced = 0
+        self.cov = Coverage(cfg, run_dir) if coverage and cfg.get("run_type") != "base" else None   # base runs: no coverage
+        self.cov_sent = [-1] * n
         for i in range(n):
             self.first_obs[i] = self._ready(i)
         self.idx = {id(c): i for i, c in enumerate(self.conns)}
@@ -1613,6 +1771,7 @@ class CarPool:
         obs = self._ready(i)
         self.idx = {id(c): j for j, c in enumerate(self.conns)}
         self.sent[i] = None
+        self.cov_sent[i] = -1
         self.replaced += 1
         return obs
 
@@ -1628,6 +1787,10 @@ class CarPool:
 
     def send(self, i, action):
         self.sent[i] = time.time()
+        if self.cov is not None and self.cov_sent[i] != self.cov.ver:      # coverage changed: send it along
+            self.cov_sent[i] = self.cov.ver
+            self.conns[i].send((np.asarray(action), self.cov.payload()))
+            return
         self.conns[i].send(np.asarray(action))
 
     def poll(self, timeout=1.0):
@@ -1643,6 +1806,11 @@ class CarPool:
                 raise RuntimeError(f"car {i + 1}: {m[1]}")
             _, obs, r, done, info, tm = m
             self.sent[i] = None
+            if done and self.cov is not None and info.get("cov") and not info.get("pool"):
+                try:
+                    self.cov.add(info["cov"])
+                except Exception as e:                                       # never stops training
+                    say(f"Coverage update failed: {str(e)[:80]}")
             self.prof[:4] += tm
             self.prof[4] += 1
             out.append((i, obs, r, done, info))
@@ -1653,6 +1821,8 @@ class CarPool:
         return p
 
     def close(self):
+        if self.cov is not None:
+            self.cov.save()
         for c in self.conns:
             try:
                 c.send(None)
@@ -1759,7 +1929,7 @@ def bench(cfg):
     results, rng = [], np.random.default_rng(0)
 
     def run(n, lidar_every):
-        pool = CarPool(dict(cfg, mid_start_p=0.0, iqn_mid_start_p=0.0, lidar_every=lidar_every), run_dir, n)
+        pool = CarPool(dict(cfg, mid_start_p=0.0, iqn_mid_start_p=0.0, lidar_every=lidar_every), run_dir, n, coverage=False)
         try:
             for i in range(n):
                 pool.send(i, [rng.uniform(-0.2, 0.2) if pool.analog else rng.integers(8, 13), 0])
