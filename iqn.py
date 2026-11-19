@@ -91,8 +91,29 @@ class Replay:
                 self.end[idx], self.c[idx])
 
 
+NM = [3]              # throttle modes of this IQN run (4 with iqn_gas_brake); set by layout_cfg()
+
+
 def act_index(k):
-    return np.array([k // 3, k % 3])
+    return np.array([k // NM[0], k % NM[0]])
+
+
+def layout_cfg(cfg, run_dir, quiet=False):
+    """Steering levels + throttle modes of this IQN run. IQN checkpoints don't convert, so an existing run keeps its
+    saved layout (iqn.json; older ones: 21 levels x 3 modes) and iqn_steer_levels / iqn_gas_brake apply to new runs."""
+    want = (int(cfg.get("iqn_steer_levels", 21)), 4 if cfg.get("iqn_gas_brake") else 3)
+    meta = T.read_json(Path(run_dir) / "iqn.json")
+    have = None
+    if cfg.get("resume", True) and meta.get("n_act") and ((Path(run_dir) / "latest.pt").exists()
+                                                            or (Path(run_dir) / "latest.prev.pt").exists()
+                                                            or (Path(run_dir) / "champion.pt").exists()):
+        have = (int(meta["levels"]), int(meta["modes"])) if meta.get("levels") else (21, 3)
+    lv, nm = have or want
+    if have and have != want and not quiet:
+        T.say(f"IQN: this run keeps its layout ({lv} steering levels, {nm} throttle modes); the IQN steering levels / "
+              "gas+brake settings only apply to new IQN runs (IQN checkpoints can't be converted).")
+    NM[0] = nm
+    return dict(cfg, _iqn_levels=lv, _iqn_modes=nm)
 
 
 def with_tau(obs, tau_frac):
@@ -115,6 +136,7 @@ def choose(net, obs, eps, beps, rng, seed_noise=None):
 
 # --- champion tests in their own process -----------------------------------------------------------
 def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
+    NM[0] = int(cfg.get("_iqn_modes") or 3)
     torch.set_num_threads(1)
     T.raise_priority()
     run_dir = Path(run_dir)
@@ -369,7 +391,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
             if not cfg["resume"] and (ckpt.exists() or (run_dir / "champion.pt").exists()):
                 T.say("!" * 12 + " STARTING FROM SCRATCH because 'Resume from latest checkpoint' is off " + "!" * 12)
             tgt.load_state_dict(net.state_dict())
-        T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act})
+        T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act, "levels": int(cfg.get("_iqn_levels") or 21),
+                                            "modes": int(cfg.get("_iqn_modes") or 3)})
         ctr[0], ctr[1], ctr[2] = steps0, max(0, steps0 - WARMUP) * cfg["iqn_reuse"], 0
         buf = SharedReplay(cfg["iqn_buffer"], dim, names=rnames)
         wnp = np.frombuffer(wbuf, dtype=np.float32)
@@ -488,9 +511,11 @@ def train(cfg):
     if n_env + 3 > (os.cpu_count() or 1):
         T.say(f"Warning: {n_env} cars + learner + tester need ~{n_env + 3} CPU threads, this PC has "
               f"{os.cpu_count()}: fewer cars may run faster (try 'python tm_ai.py bench').")
-    if cfg.get("gas_brake", True) or cfg.get("sil_weight", 0) or cfg.get("aux_weight", 0):
-        T.say("IQN: gas+brake, self-imitation, the value-net-only inputs and the aux heads are PPO features; "
-              "IQN keeps its 3 throttle modes and inputs.")
+    if cfg.get("sil_weight", 0) or cfg.get("aux_weight", 0):
+        T.say("IQN: self-imitation, the value-net-only inputs and the aux heads are PPO features; IQN skips them.")
+    cfg = layout_cfg(cfg, run_dir)
+    T.say(f"IQN: {cfg['_iqn_levels']} steering levels x {cfg['_iqn_modes']} throttle modes"
+          + (" (gas+brake on)" if cfg["_iqn_modes"] == 4 else ""))
     pool = T.CarPool(cfg, run_dir, n_env)                     # cars in their own processes, not in lock-step
     dim, nvec = pool.dim, pool.nvec
     n_act = int(nvec[0] * nvec[1])
@@ -574,7 +599,8 @@ def train(cfg):
             C["since"] += 1
             fin = bool(info.get("finished"))
             log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
-                end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"))
+                end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"),
+                **({"ast": info["ast"]} if info.get("ast") else {}))
             for kk, vv in (info.get("rb") or {}).items():
                 rb[kk] = rb.get(kk, 0.0) + vv
             rb_steps += int(info.get("rsteps", 0))
@@ -741,6 +767,7 @@ def train(cfg):
 def drive(cfg):
     """Play champion for IQN: the same best-of-N lap the champion test kept (same weights + same seed)."""
     run_dir = cfgmod.run_dir(cfg)
+    cfg = layout_cfg(cfg, run_dir, quiet=True)
     env = T.TMEnv(cfg, run_dir, shorten=False, role="play")
     res = T.replay_champion(cfg, run_dir, env)            # exact: the test's own lap
     if res is not None:

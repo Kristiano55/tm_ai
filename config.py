@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
+import os as _os
+CONFIG_PATH = Path(_os.environ["TMAI_CONFIG"]) if _os.environ.get("TMAI_CONFIG") else ROOT / "config.json"   # diagnose trials
 
 DEFAULTS = {
     "map": "",                 # full path to the .Map.Gbx
@@ -62,6 +63,8 @@ DEFAULTS = {
     "github_user": "",         # your GitHub name (pack author / verifier)
     "github_token": "",        # optional, for direct release uploads; empty = the browser does it (nothing stored)
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
+    "iqn_gas_brake": False,    # IQN: 4th throttle mode gas + brake (new IQN runs only: IQN checkpoints don't convert)
+    "iqn_steer_levels": 21,    # IQN: 21 / 31 / 41 steering levels (new IQN runs only)
     "analog_steer": True,      # PPO: steering is one analog value -127..127 instead of 21 levels (IQN keeps levels)
     "gas_brake": True,         # PPO: 4th throttle mode = gas + brake held together (IQN keeps 3 modes)
     "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
@@ -167,6 +170,7 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
     out["w_known"] = min(max(out["w_known"], 0.0), 0.5)
     out["cov_len"] = max(5.0, out["cov_len"])
     out["cov_passes"] = max(1.0, out["cov_passes"])

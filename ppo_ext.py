@@ -80,8 +80,14 @@ class AnalogPolicy(PrivPolicy):
     so old runs convert by plain copy: steer mean u = atanh(sum softmax(level logits / T) * level / 127) + steer_res,
     steer_res starts at 0 (= the old argmax). Learnable log_std, capped by the exploration decay."""
 
-    def __init__(self, *a, steer_levels=None, **k):
+    def __init__(self, *a, steer_levels=None, steer_t=STEER_T, steer_hard=False, **k):
         self.steer_levels = list(steer_levels or [])
+        self.steer_t = float(steer_t)       # softmax temperature of the level expectation (new runs 1.0)
+        # steer_hard (runs converted from levels since this version): the mean's value is the argmax level exactly
+        # (= the old policy's steering, even where its level logits are nearly tied), gradients flow through the soft
+        # expectation (straight-through). Analog runs converted earlier keep the soft 0.01 version (steer_hard off).
+        self.steer_hard = bool(steer_hard)
+        super().__init__(*a, **k)
         super().__init__(*a, **k)
 
     def _build(self, lr_schedule):
@@ -101,7 +107,11 @@ class AnalogPolicy(PrivPolicy):
     def _get_action_dist_from_latent(self, latent_pi):
         out = self.action_net(latent_pi)
         n_lv = len(self.steer_levels)
-        e = (th.softmax(out[..., :n_lv] / STEER_T, -1) * self.lv).sum(-1).clamp(-A_MAX, A_MAX)
+        lg = out[..., :n_lv]
+        e = (th.softmax(lg / self.steer_t, -1) * self.lv).sum(-1)
+        if self.steer_hard:
+            e = self.lv[lg.argmax(-1)] + (e - e.detach())
+        e = e.clamp(-A_MAX, A_MAX)
         mu = th.atanh(e) + self.steer_res(latent_pi)[..., 0]
         return HybridDist(out[..., n_lv:], mu, self.log_std)
 
@@ -111,6 +121,8 @@ class AnalogPolicy(PrivPolicy):
     def _get_constructor_parameters(self):
         d = super()._get_constructor_parameters()
         d["steer_levels"] = self.steer_levels
+        d["steer_t"] = self.steer_t
+        d["steer_hard"] = self.steer_hard
         return d
 
     def steer_std(self):

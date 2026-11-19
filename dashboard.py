@@ -283,13 +283,13 @@ def build_state():
     fresh = status.get("state") == "running" and now - status.get("heartbeat", 0) < 150
     running = train_alive or fresh
     playing = alive() and PROC["kind"] == "play"
-    benching = alive() and PROC["kind"] in ("bench", "transfer")
+    benching = alive() and PROC["kind"] in ("bench", "transfer", "diagnose")
     if running:
         state, reason = "running", ""
     elif playing:
         state, reason = "playing", "champion is driving"
     elif benching:
-        state, reason = "benchmarking", ("testing car counts" if PROC["kind"] == "bench" else "transfer test") + " (see the log)"
+        state, reason = "benchmarking", ({"bench": "testing car counts", "diagnose": "PPO diagnosis trials"}.get(PROC["kind"], "transfer test")) + " (see the log)"
     elif status.get("state") == "running":
         state, reason = "stopped", "stopped unexpectedly"
     else:
@@ -521,7 +521,7 @@ def start(kind, extra=()):
         return 400, f"Base '{cfg['base_name']}' has no model yet."
     rd = cfgmod.run_dir(cfg)
     logf = open(rd / "train.log", "a", encoding="utf-8")
-    cmd = {"train": "train", "bench": "bench", "transfer": "transfer", "hub": "hub"}.get(kind, "drive")
+    cmd = {"train": "train", "bench": "bench", "transfer": "transfer", "hub": "hub", "diagnose": "diagnose"}.get(kind, "drive")
     PROC["p"] = subprocess.Popen([sys.executable, "-u", "tm_ai.py", cmd, *extra],
                                  cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
     PROC["kind"], PROC["t0"] = kind, time.time()
@@ -531,7 +531,7 @@ def start(kind, extra=()):
 def stop():
     cfg = cfgmod.load()
     rd = cfgmod.run_dir(cfg)
-    if PROC["kind"] in ("play", "bench", "transfer", "hub") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
+    if PROC["kind"] in ("play", "bench", "transfer", "hub", "diagnose") or not (alive() or read_json(rd / "status.json").get("state") == "running"):
         kill_proc()
         return
     (rd / "STOP").write_text("stop")                       # graceful: saves the model first
@@ -608,6 +608,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, msg = start("transfer", ["--map", m] + (["--pb", str(body["pb"])] if body.get("pb") else []))
         elif self.path == "/api/bench":
             code, msg = start("bench")
+        elif self.path == "/api/diagnose":
+            code, msg = start("diagnose")
         elif self.path == "/api/play":
             code, msg = start("play")
         elif self.path == "/api/stop":

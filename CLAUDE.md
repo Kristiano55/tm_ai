@@ -135,6 +135,25 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   level indices converted on load). `run_episode` drives the way the model was trained; VecNormalize.load gets the
   current action space; IQN warm start maps an analog champion to the nearest level; packs store `analog` +
   `steer_levels` in model.json.
+- **Neutral fresh start** (`make_model(fresh=True)`, new PPO runs only): throttle logits biased `MODE_BIAS`
+  (gas 64 %, coast 23 %, brake 9 %, gas+brake 3 %; before: uniform = brake held half the time -> crawl -> "stuck"),
+  analog steer level logits exactly 0 (mean = straight) at `steer_t` 1.0 (before: near-random logits / 0.01 = jumps
+  between random levels, often full lock). Conversions from levels use `steer_hard` (value = the old argmax level
+  exactly, soft-expectation gradient at T 0.1): first actions identical even where old logits are nearly tied.
+  Analog runs converted earlier keep soft T 0.01 (`steer_t`/`steer_hard` are policy kwargs; packs store them).
+- **Tick-rate change:** levels.json stores `ticks` (else the last start event's cfg); a different ticks_per_step on
+  resume resets VecNormalize's return stats (logged). The negative-driving warning names the 3 biggest costs.
+- **Lap action stats** (`info["ast"]`, lap events `ast`): share per throttle mode, mean |steer|/127, full-lock share,
+  mean speed, furthest progress m.
+- **`python tm_ai.py diagnose [map] [--pb file] [--min 4]`** (dashboard "Diagnose PPO"): fresh PPO trials
+  `runs/diag_a..e` (deleted before each), novelty weights 0 for a-d: a levels+3 modes, b analog+3, c levels+gas+brake,
+  d analog+gas+brake, e = best of a-d + novelty defaults. Each trial: own config file via `TMAI_CONFIG` (config.py
+  CONFIG_PATH override, inherited by cars), subprocess `train --new --run diag_x`, STOP after the trial time (counted
+  from the first event). Report table + verdict (feature "breaks" = worse in both A/B pairs) -> `runs/_diag/diagnose.json`,
+  trial logs `runs/_diag/diag_x.log`. `TMAI_DIAG_S` = trial seconds (tests).
+- **IQN layout:** `iqn_gas_brake` (false) 4th mode, `iqn_steer_levels` 21/31/41 (`steer_levels(n)`, same curve; 21 =
+  the old set). New IQN runs only: `iqn.layout_cfg` keeps an existing run's layout from iqn.json (`levels`, `modes`;
+  older files = 21 x 3), passes `_iqn_levels`/`_iqn_modes` to the cars; `iqn.NM` = modes for `act_index`.
 - **Actions (analog_steer off / IQN):** 21 progressive steering levels (fine near centre) x {gas, coast, brake, gas+brake} (`gas_brake`,
   PPO only; IQN keeps 3). `GAS`/`BRAKE` mode sets + `MODE_VEC` (last-action inputs: gas+brake = [1,0,1], layout
   unchanged) everywhere (steps, mid-start replays). Conversion: new logit = brake logit - 3 (same argmax); `ticks_per_step` 5 (50 ms)
@@ -276,7 +295,7 @@ Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, o
 `prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
 `TICKGYM_FAKE_CORNER=1`: z 400..460 caps speed at 35 m/s unless gas AND brake are held (60). The fake brake now
 slows the car when held without gas (random IQN driving rarely finishes in 1 min there; with the old fake it does).
-`TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
+Diagnose test: `TMAI_DIAG_S=25 python tm_ai.py diagnose` (~3 min for 5 trials). `TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
 a car, 100 = keeps failing -> run stops after 3). `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
 Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
 hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).

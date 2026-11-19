@@ -51,7 +51,8 @@ def _policy_arrays(zip_path):
     lv = list(getattr(m.policy, "steer_levels", None) or T.STEER_LEVELS["progressive"].tolist())
     nvec = [len(lv), T.n_modes_of(m.action_space)] if analog else [int(x) for x in m.action_space.nvec]
     meta = {"obs_dim": int(m.observation_space.shape[0]), "nvec": nvec, "analog": analog,
-            "steer_levels": [int(x) for x in lv],
+            "steer_levels": [int(x) for x in lv], "steer_t": float(getattr(m.policy, "steer_t", 0.01)),
+            "steer_hard": bool(getattr(m.policy, "steer_hard", False)),
             "net_arch": {"pi": [256, 256], "vf": [256, 256]}, "keys": list(sd.keys()),
             "num_timesteps": int(m.num_timesteps)}
     return arrays, meta
@@ -224,7 +225,7 @@ def build_model(man, files):
         raise pc.PackError("observation size does not match this version")
     analog = bool(mm.get("analog"))
     env = DummyVecEnv([_SpacesEnv(mm["obs_dim"], mm["nvec"], analog).cls])
-    model = T.make_model(env, mm.get("steer_levels"))
+    model = T.make_model(env, mm.get("steer_levels"), steer_t=mm.get("steer_t"), steer_hard=bool(mm.get("steer_hard")))
     sd = model.policy.state_dict()
     with np.load(io.BytesIO(files["model.npz"]), allow_pickle=False) as z:
         arrays = {k.replace("__", "."): z[k] for k in z.files}

@@ -146,7 +146,8 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
     <div class="tbar" id="tBar"></div><div class="lg" id="tLeg"></div>
     <div class="mut" id="tTxt" style="margin-top:6px">no summary yet (first one after 5 minutes of training)</div>
     <div class="flex" style="margin-top:10px"><span class="mut" id="bTxt">Benchmark: 6/8/10/12 cars for ~30 s each (no learning), suggests the fastest car count.</span>
-    <button id="bBench">Benchmark cars</button></div></div>
+    <button id="bBench">Benchmark cars</button>
+    <button id="bDiag" title="Short A/B PPO trials on this map (steering levels vs analog, gas+brake on/off, then novelty) to find what stops learning. About 22 minutes, no training.">Diagnose PPO</button></div></div>
   </section>
 
   <section class="grp" aria-label="Log"><div class="gh">Log</div>
@@ -255,6 +256,8 @@ const I={step:1}, F={
  iqn_eps_end_steps:['... at step','Step count of the final random share.','number',{min:0,max:1e10,...I,iqn:1}],
  iqn_warm_run:['Warm start run','Fill the replay memory from this PPO run\'s champion first. Empty = off.','text',{iqn:1}],
  iqn_mid_start_p:['PB/WR starts','Share of IQN laps that start along your PB/WR.','number',{min:0,max:1,step:'any',iqn:1}],
+ iqn_gas_brake:['Gas + brake mode (IQN)','IQN: a 4th throttle choice, gas and brake together. NEW IQN runs only: an existing IQN run keeps its layout (IQN checkpoints can\'t be converted).','checkbox',{iqn:1}],
+ iqn_steer_levels:['Steering levels (IQN)','IQN: 21, 31 or 41 steering levels (finer = more choices to learn). NEW IQN runs only. Analog steering is PPO-only.','select',{iqn:1,opts:[[21,'21 (default)'],[31,'31'],[41,'41']]}],
  iqn_rollback:['Rollback','IQN: roll back to the champion after bad tests.','checkbox',{iqn:1}],
  iqn_device:['Learner device','Auto = GPU if PyTorch has CUDA, else CPU.','select',{iqn:1,opts:[['auto','Auto'],['cpu','CPU'],['cuda','GPU (CUDA)']]}],
  analog_steer:['Analog steering','PPO: steer anywhere from -127 to 127 (like a pad) instead of 21 fixed levels. Old runs convert and drive the same at first. Off = the 21 levels. IQN always uses levels.','checkbox'],
@@ -274,7 +277,7 @@ const SECTIONS=[
  ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
  ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
  ['note','Notifications',['discord_webhook','discord_every_min']],
- ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_rollback','iqn_device','reward_v']],
+ ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_rollback','iqn_device','reward_v']],
 ];
 let DEF={}, BASE={}, WMETA=[], LEAN={}, LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
 const meta=k=>{const f=F[k]||[k,'','text'];return {k,label:f[0],hint:f[1],type:f[2],o:f[3]||{}}};
@@ -397,7 +400,7 @@ function showChoice(j){
     const c=await (await fetch('/api/state')).json(); await fetch('/api/config',{method:'POST',body:JSON.stringify({...c.config,run:r.name})});
     $('modal').classList.add('hide'); startTraining(false) };
   $('mNew').onclick=()=>{ $('modal').classList.add('hide'); startTraining(true) };
-  $('mCancel').onclick=()=>$('modal').classList.add('hide') } $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
+  $('mCancel').onclick=()=>$('modal').classList.add('hide') } $('bTr').onclick=()=>{const m=prompt('Map path for the transfer test (a map NOT in the pool):'); if(m) post('/api/transfer',{map:m})}; $('bDiag').onclick=()=>{if(confirm('Run the PPO diagnosis on the current map now (5 trials of 4 min, about 22 minutes; training stops meanwhile)? The report goes to the log and runs/_diag/diagnose.json.'))post('/api/diagnose')}; $('bBench').onclick=()=>{if(confirm('Run the car benchmark now (about 3 minutes, no training)?'))post('/api/bench')}; $('bStop').onclick=()=>post('/api/stop'); $('bPlay').onclick=()=>post('/api/play');
 const VIEWS={n1:'dash',n2:'set',n3:'hubv'}; let VIEW='n1', PENDING=null;
 function show(n){ VIEW=n; for(const m in VIEWS){$(m).className=m==n?'on':''; $(m).setAttribute('aria-current',m==n?'page':'false'); $(VIEWS[m]).classList.toggle('hide',m!=n)}
   $('saveBar').classList.toggle('hide',n!='n2'); if(n=='n3') loadHub(false); if(n!='n2') tick() }

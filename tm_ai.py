@@ -50,6 +50,14 @@ STEER_LEVELS = {
 }
 
 
+def steer_levels(n, mode="progressive"):
+    """n steering levels (odd: 21, 31, 41) on the same curve as the 21-level sets (n = 21 gives them exactly)."""
+    half = (int(n) - 1) // 2
+    base = STEER_LEVELS[mode][11:].astype(np.float64)              # the 10 positive levels
+    pos = np.round(np.interp(np.linspace(1, 10, half), np.arange(1, 11), base)).astype(int)
+    return np.concatenate([-pos[::-1], [0], pos])
+
+
 _HANG = {"file": None, "pet": time.time(), "guard": None}
 
 
@@ -612,9 +620,11 @@ class TMEnv(gym.Env):
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
-        self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
         self.iqn = cfg.get("algo") == "iqn"          # IQN charges failure itself: no give-up penalty here
+        self.STEER = STEER_LEVELS[cfg["steer_mode"]]
+        if self.iqn and int(cfg.get("_iqn_levels") or 21) != len(self.STEER):     # finer IQN steering (new runs)
+            self.STEER = steer_levels(int(cfg["_iqn_levels"]), cfg["steer_mode"])
         self.slug, self.pool_car = cfg.get("_slug") or None, bool(cfg.get("_pool"))   # base / pool map tags
         self.pnorm, self.pscale = float(cfg.get("_pnorm") or 0.0), 1.0     # map-neutral progress (base runs)
         self.cut_behind = float(cfg["cut_behind_s"])
@@ -681,7 +691,7 @@ class TMEnv(gym.Env):
         self.ticks = cfg["ticks_per_step"]
         self.max_ticks = int(cfg["max_lap_seconds"] * 100)
         # throttle: gas / coast / brake (+ gas+brake with gas_brake; PPO only, IQN keeps 3 modes)
-        self.n_modes = 4 if (cfg.get("gas_brake", True) and not self.iqn) else 3
+        self.n_modes = (int(cfg.get("_iqn_modes") or 3) if self.iqn else (4 if cfg.get("gas_brake", True) else 3))
         # analog steering (PPO): action [steer -1..1, mode]; else [steer level, mode]
         self.analog = bool(cfg.get("analog_steer", True)) and not self.iqn
         self.nvec = [len(self.STEER), self.n_modes]
@@ -1298,6 +1308,7 @@ class TMEnv(gym.Env):
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
         self.cov_spd = {}
+        self.ast = np.zeros(9)      # this lap: steps per throttle mode (4), sum |steer|/127, full-lock steps, speed, n, max m
         if self.starts and self.np_random.random() < self.mid_p:
             try:
                 i = self._pick_start()
@@ -1403,6 +1414,13 @@ class TMEnv(gym.Env):
             r["wall"] = -W["w_wall"] * tf * speed / 100.0 * max(0.0, 1.0 - near / 2.0)
         self.prev_speed = speed
         self._s = self._s + dp if s >= self._s else s
+        a = self.ast
+        a[mode] += 1
+        a[4] += abs(steer) / 127.0
+        a[5] += abs(steer) >= 127
+        a[6] += speed
+        a[7] += 1
+        a[8] = max(a[8], self._s)
         if self.cov_on:
             self.cov_max = max(self.cov_max, self._s)
             a = self.cov_spd.setdefault(ck, [0.0, 0])
@@ -1482,6 +1500,9 @@ class TMEnv(gym.Env):
                        float(np.any(np.asarray(t.wheels.contact, dtype=bool))), tick, taken)
         if terminated or truncated:
             info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
+            a, n = self.ast, max(self.ast[7], 1)
+            info["ast"] = {"m": [round(float(x) / n, 3) for x in a[:self.n_modes]], "sa": round(float(a[4] / n), 3),
+                           "fl": round(float(a[5] / n), 3), "v": round(float(a[6] / n), 1), "s": round(float(a[8]), 1)}
             if self.cov_on:
                 info["cov"] = self._cov_info(length, bool(t.finished))
             info["tm"], self.tm = self.tm, {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}
@@ -2058,18 +2079,40 @@ def set_gamma(cfg):
     return GAMMA[0]
 
 
-def make_model(env, levels=None):
+MODE_BIAS = (1.0, 0.0, -1.0, -2.0)      # fresh runs: gas ~64 %, coast 23 %, brake 9 %, gas+brake 3 % (3 modes: 69/25/6)
+
+
+def make_model(env, levels=None, fresh=False, steer_t=None, steer_hard=None):
+    """fresh=True: a brand-new run (not a conversion target): start NEUTRAL. With uniform throttle logits a new car
+    held brake half the time (brake + gas+brake) and crawled into "stuck"; with analog steering the near-random level
+    logits at temperature 0.01 made the steer mean jump between random levels (often full lock). So: throttle logits
+    biased to gas, analog steer logits exactly equal (mean 0 = straight) at a smooth temperature of 1."""
     from ppo_ext import TMPPO, PrivPolicy, AnalogPolicy
+    import torch
     if isinstance(env.action_space, spaces.Box):         # analog steering: the level logits feed the steer mean
         lv = list(levels if levels is not None else STEER_LEVELS["progressive"].tolist())
-        return TMPPO(AnalogPolicy, env, device="cpu", verbose=0,
-                     n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
-                     learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,
-                     policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]), steer_levels=[int(x) for x in lv]))
-    return TMPPO(PrivPolicy, env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
-               n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
-               learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
-               policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
+        t = float(steer_t if steer_t is not None else (1.0 if fresh else 0.1))
+        hard = bool(steer_hard if steer_hard is not None else not fresh)     # conversion target: exact old argmax
+        m = TMPPO(AnalogPolicy, env, device="cpu", verbose=0,
+                  n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
+                  learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,
+                  policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]), steer_levels=[int(x) for x in lv],
+                                     steer_t=t, steer_hard=hard))
+    else:
+        lv = list(range(int(env.action_space.nvec[0])))
+        m = TMPPO(PrivPolicy, env, device="cpu", verbose=0,                 # MLP policy -> CPU is the right device
+                  n_steps=512, batch_size=512, n_epochs=10, gamma=GAMMA[0], gae_lambda=0.95,
+                  learning_rate=3e-4, ent_coef=0.005, target_kl=0.02,    # target_kl: no destructive updates
+                  policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])))
+    if fresh:
+        an, n = m.policy.action_net, len(lv)
+        with torch.no_grad():
+            if isinstance(env.action_space, spaces.Box):
+                an.weight[:n] = 0.0                       # all level logits equal -> steer mean 0 for every input
+                an.bias[:n] = 0.0
+            nm = an.bias.shape[0] - n
+            an.bias[n:] = torch.tensor(MODE_BIAS[:nm], dtype=an.bias.dtype)
+    return m
 
 
 ENT_BOOST = 3.0          # entropy weight in a section where every lap fails: 1 + 3 = 4x the normal exploration
@@ -2143,6 +2186,24 @@ def transfer_policy(old, new, old_levels, new_levels, old_base=N_BASE0, new_base
     new.num_timesteps, new._n_updates = old.num_timesteps, old._n_updates
 
 
+def saved_ticks(run_dir):
+    """ticks_per_step the run's checkpoints were trained with: levels.json, else the last start event."""
+    t = read_json(Path(run_dir) / "levels.json").get("ticks")
+    if t:
+        return int(t)
+    try:
+        last = None
+        with open(Path(run_dir) / "events.jsonl", "rb") as f:
+            for line in f:
+                if b'"k": "start"' in line[:40]:
+                    last = line
+        if last:
+            return int(json.loads(last)["cfg"]["ticks_per_step"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
 def n_modes_of(space):
     return int(space.high[1]) + 1 if isinstance(space, spaces.Box) else int(space.nvec[1])
 
@@ -2168,7 +2229,10 @@ def migrate(run_dir, cfg, env):
             if not p.exists():
                 continue
             try:
-                old, new = PPO.load(str(p), device="cpu"), make_model(env, new_levels)
+                old = PPO.load(str(p), device="cpu")
+                op = old.policy                            # analog -> analog keeps its steer settings; levels -> hard
+                new = make_model(env, new_levels, steer_t=getattr(op, "steer_t", None),
+                                 steer_hard=getattr(op, "steer_hard", None) if hasattr(op, "steer_t") else True)
                 transfer_policy(old, new, old_levels, new_levels, old_base, new_base)
                 new.save(str(run_dir / name))
                 say(f"Converted {name}.zip to the current layout (steering {len(old_levels)}->{len(new_levels)}, "
@@ -2178,7 +2242,7 @@ def migrate(run_dir, cfg, env):
                 p.replace(run_dir / f"{name}.unconverted.zip")
                 say(f"Could not convert {name}.zip ({str(e)[:80]}); moved aside, starting fresh.")
     write_json(lv_file, {"steer": new_levels.tolist(), "obs_base": new_base, "modes": new_modes, "obs_dim": new_dim,
-                         "policy": tag})
+                         "policy": tag, "ticks": int(cfg["ticks_per_step"])})
 
 
 # --- champion tests, dashboard events, stop conditions ----------------------------------------
@@ -2424,8 +2488,12 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 if running < 0:
                     self.neg += 1
                     if self.neg in (3, 20, 100):
+                        worst = sorted(((v, k) for k, v in per.items() if k not in ("finish", "end", "checkpoint")
+                                        and v < 0))[:3]
                         say(f"Warning: driving earns {running:+.4f} per step on average (before finish/checkpoint "
-                            "bonuses). Stopping can look attractive; lower penalties or raise Progress.")
+                            f"bonuses; at {cfg['ticks_per_step'] * 10} ms per step). Biggest costs: "
+                            + ", ".join(f"{k} {v:+.4f}" for v, k in worst)
+                            + ". Stopping can look attractive; lower penalties or raise Progress.")
                 else:
                     self.neg = 0
                 self.rb, self.rb_steps = {}, 0
@@ -2452,6 +2520,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                     fin, pool_lap = bool(info.get("finished")), bool(info.get("pool"))
                     log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                         end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"),
+                        **({"ast": info["ast"]} if info.get("ast") else {}),
                         **({"map": info["map"]} if info.get("map") else {}), **({"pool": 1} if pool_lap else {}))
                     if not pool_lap:                     # pool cars of a map run: no effect on this map's stats
                         self.laps += 1
@@ -2758,6 +2827,16 @@ def train(cfg):
                 say(f"Could not load vecnorm.pkl ({str(e)[:60]}), relearning reward scale")
     if env is None:
         env = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA[0])
+    else:
+        old_ticks = saved_ticks(run_dir)
+        if old_ticks and old_ticks != int(cfg["ticks_per_step"]):
+            # the reward scale (running return variance) was learned at another decision interval: per-step rewards
+            # and the number of steps per second both changed, so start the scale fresh (it relearns in minutes)
+            from stable_baselines3.common.running_mean_std import RunningMeanStd
+            env.ret_rms = RunningMeanStd(shape=())
+            env.returns = np.zeros(env.num_envs)
+            say(f"Decision interval changed ({old_ticks * 10} -> {cfg['ticks_per_step'] * 10} ms): "
+                "reward scaling (vecnorm.pkl) reset, relearning it.")
     migrate(run_dir, cfg, env)
     analog = isinstance(env.action_space, spaces.Box)
 
@@ -2793,7 +2872,7 @@ def train(cfg):
     if notice:
         say("!" * 12 + " " + notice + " " + "!" * 12)
     if model is None:
-        model = make_model(env, STEER_LEVELS[cfg["steer_mode"]])
+        model = make_model(env, STEER_LEVELS[cfg["steer_mode"]], fresh=True)
     model.sil_weight, model.aux_weight = float(cfg["sil_weight"]), float(cfg["aux_weight"])
     model.ticks_per_step = cfg["ticks_per_step"]
     if model.sil_weight > 0:
@@ -3012,6 +3091,163 @@ def selftest(cfg):
     env.close()
 
 
+# --- diagnose: short A/B PPO trials on the real game ------------------------------------------------------
+DIAG_TRIALS = [("a", "21 levels, 3 modes", dict(analog_steer=False, gas_brake=False)),
+               ("b", "analog, 3 modes", dict(analog_steer=True, gas_brake=False)),
+               ("c", "21 levels, gas+brake", dict(analog_steer=False, gas_brake=True)),
+               ("d", "analog, gas+brake", dict(analog_steer=True, gas_brake=True))]
+DIAG_FAIL = ("stuck", "far off line", "off-zone")
+
+
+def diag_metrics(run_dir, n_modes):
+    """Summary of one trial from its events.jsonl."""
+    laps, run = [], []
+    try:
+        with open(Path(run_dir) / "events.jsonl", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("k") == "lap" and not e.get("pool"):
+                    laps.append(e)
+                elif e.get("k") == "rb":
+                    run.append(sum(v for k, v in e["r"].items() if k not in ("finish", "end", "checkpoint")))
+    except OSError:
+        pass
+    ast = [e["ast"] for e in laps if e.get("ast")]
+    stuck = [e for e in laps if e.get("end") in DIAG_FAIL]
+    spots = {}
+    for e in stuck:
+        if e.get("x") is not None:
+            k = (int(e.get("cp", 0)), int(round(e["x"] / 30.0)) * 30, int(round(e["z"] / 30.0)) * 30)
+            spots[k] = spots.get(k, 0) + 1
+    top = max(spots.items(), key=lambda kv: kv[1]) if spots else None
+    prog = [a["s"] for a in ast]
+    late = prog[len(prog) // 2:] or prog
+    fin = [e["ms"] for e in laps if e.get("ms") and not e.get("mid")]
+    modes = np.mean([a["m"] + [0.0] * (n_modes - len(a["m"])) for a in ast], axis=0) if ast else np.zeros(n_modes)
+    names = ["gas", "coast", "brake", "gas+brake"][:n_modes]
+    return {
+        "laps": len(laps), "driving_earns_per_step": round(float(np.mean(run)), 4) if run else None,
+        "driving_earns_last": round(float(np.mean(run[-5:])), 4) if run else None,
+        "stuck_share": round(len(stuck) / len(laps), 3) if laps else None,
+        "stuck_spot": ({"cp": top[0][0], "x": top[0][1], "z": top[0][2], "share_of_stuck": round(top[1] / len(stuck), 3)}
+                       if top else None),
+        "mean_speed_ms": round(float(np.mean([a["v"] for a in ast])), 1) if ast else None,
+        "furthest_m": round(float(max(prog)), 1) if prog else None,
+        "progress_p90_late_m": round(float(np.percentile(late, 90)), 1) if late else None,
+        "throttle_share": {n: round(float(x), 3) for n, x in zip(names, modes)},
+        "steer_mean_abs": round(float(np.mean([a["sa"] for a in ast])) * 127, 1) if ast else None,
+        "steer_full_lock_share": round(float(np.mean([a["fl"] for a in ast])), 3) if ast else None,
+        "best_lap_s": round(min(fin) / 1000.0, 3) if fin else None,
+        "finished_laps": len(fin)}
+
+
+def _diag_score(m):
+    return (1 if m.get("best_lap_s") else 0, -(m.get("best_lap_s") or 0.0), m.get("progress_p90_late_m") or 0.0)
+
+
+def _diag_worse(w, wo):
+    """True if the trial WITH a feature (w) learned clearly worse than the one without (wo)."""
+    pw, po = w.get("progress_p90_late_m") or 0.0, wo.get("progress_p90_late_m") or 0.0
+    if wo.get("best_lap_s") and not w.get("best_lap_s"):
+        return True
+    if w.get("best_lap_s") and wo.get("best_lap_s"):
+        return w["best_lap_s"] > wo["best_lap_s"] + 0.5
+    return pw < 0.75 * po or (w.get("stuck_share") or 0) - (wo.get("stuck_share") or 0) > 0.2
+
+
+def diag_verdict(res):
+    t, out = {k: v["metrics"] for k, v in res.items()}, []
+    if all(k in t for k in "abcd"):
+        for name, pairs in (("analog steering", (("b", "a"), ("d", "c"))), ("gas+brake", (("c", "a"), ("d", "b")))):
+            bad = [_diag_worse(t[w], t[wo]) for w, wo in pairs]
+            out.append(f"{name}: " + ("BREAKS learning here (worse in both comparisons)" if all(bad) else
+                                      "probably hurts (worse in one comparison)" if any(bad) else "no harm seen"))
+    if "e" in t and res["e"].get("from") in t:
+        out.append("novelty rewards: " + ("hurt learning" if _diag_worse(t["e"], t[res["e"]["from"]]) else "no harm seen"))
+    return out
+
+
+def diagnose(cfg, map_path, pb="", minutes=4.0):
+    """Short PPO trials from the same fresh start (runs diag_a .. diag_e), report -> runs/_diag/diagnose.json."""
+    import subprocess
+    root = cfgmod.ROOT
+    ddir = root / "runs" / "_diag"
+    ddir.mkdir(parents=True, exist_ok=True)
+    base = dict(cfg)
+    if map_path and map_path != cfg["map"]:
+        base.update(map=map_path, pb_file=pb or "", pb_seconds=0.0)
+    elif pb:
+        base["pb_file"] = pb
+    base.update(algo="ppo", run_type="map", time_limit_min=0, stop_at_pb=False, resume=True,
+                w_novel=0.0, w_known=0.0, w_focus=0.0, reward_v=4)
+    secs = float(os.environ.get("TMAI_DIAG_S") or minutes * 60.0)
+    say(f"Diagnose: {len(DIAG_TRIALS) + 1} PPO trials of {secs / 60:.1f} min on {base['map']} "
+        f"({base['envs']} cars, {base['ticks_per_step'] * 10} ms per step) ...")
+    res = {}
+
+    def trial(key, label, over):
+        name = f"diag_{key}"
+        rd = root / "runs" / name
+        if rd.exists():
+            import shutil
+            shutil.rmtree(rd, ignore_errors=True)               # same fresh start for every trial
+        c = cfgmod.coerce(dict(base, run=name, **over))
+        cpath = ddir / f"config_{key}.json"
+        cpath.write_text(json.dumps(c, indent=1), encoding="utf-8")
+        say(f"Diagnose trial {key} ({label}) ...")
+        env = dict(os.environ, TMAI_CONFIG=str(cpath))
+        with open(ddir / f"{name}.log", "w", encoding="utf-8") as logf:
+            p = subprocess.Popen([sys.executable, "-u", str(Path(__file__).resolve()), "train", "--new", "--run", name],
+                                 cwd=str(root), env=env, stdout=logf, stderr=subprocess.STDOUT)
+            t0 = None
+            while p.poll() is None:
+                time.sleep(1.0)
+                if t0 is None and (rd / "events.jsonl").exists():
+                    t0 = time.time()                            # count from the training start, not the start-up
+                if t0 is not None and time.time() - t0 > secs:
+                    (rd / "STOP").write_text("diagnose")
+                    try:
+                        p.wait(timeout=180)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                    break
+        m = diag_metrics(rd, 4 if c["gas_brake"] else 3)
+        res[key] = {"label": label, "settings": over, "metrics": m}
+        say(f"  {key} {label}: earns/step {m['driving_earns_per_step']}, stuck {m['stuck_share']}, "
+            f"speed {m['mean_speed_ms']} m/s, furthest {m['furthest_m']} m, best {m['best_lap_s']}")
+
+    for key, label, over in DIAG_TRIALS:
+        trial(key, label, over)
+    best = max("abcd", key=lambda k: _diag_score(res[k]["metrics"]))
+    nov = {k: cfgmod.WEIGHTS[k][0] for k in ("w_novel", "w_known", "w_focus")}
+    trial("e", f"{res[best]['label']} + novelty defaults", dict(res[best]["settings"], **nov))
+    res["e"]["from"] = best
+    verdict = diag_verdict(res)
+    report = {"t": time.time(), "map": base["map"], "pb_file": base.get("pb_file"), "minutes": round(secs / 60, 2),
+              "ticks_per_step": base["ticks_per_step"], "cars": base["envs"], "trials": res, "best": best,
+              "verdict": verdict}
+    write_json(ddir / "diagnose.json", report)
+    print("\n" + "=" * 100)
+    hdr = f"{'trial':26s}{'earns/step':>11s}{'stuck':>7s}{'speed':>7s}{'furthest':>9s}{'|steer|':>8s}{'lock':>6s}  throttle share{'':22s}best"
+    print(hdr)
+    for k, r in res.items():
+        m = r["metrics"]
+        thr = " ".join(f"{n[:4]} {v:.0%}" for n, v in m["throttle_share"].items())
+        print(f"{k + ' ' + r['label']:26.26s}{str(m['driving_earns_per_step']):>11s}{str(m['stuck_share']):>7s}"
+              f"{str(m['mean_speed_ms']):>7s}{str(m['furthest_m']):>9s}{str(m['steer_mean_abs']):>8s}"
+              f"{str(m['steer_full_lock_share']):>6s}  {thr:36s}{m['best_lap_s']}")
+        if m.get("stuck_spot"):
+            sp = m["stuck_spot"]
+            print(f"{'':26s}most stuck laps: after CP {sp['cp']} near x {sp['x']}, z {sp['z']} "
+                  f"({sp['share_of_stuck']:.0%} of the stuck laps)")
+    print("Verdict: " + " | ".join(verdict) + f" | best of a-d: {best}")
+    print(f"Report: {ddir / 'diagnose.json'}")
+    say("Diagnose finished: " + " | ".join(verdict))
+
+
 def pack_cli(argv):
     """publish / verify / benchmark / export / import / hub: brain packs and the public hub (hub.py, packs.py)."""
     import hub
@@ -3052,7 +3288,9 @@ if __name__ == "__main__":
         pack_cli(sys.argv[1:])
         raise SystemExit(0)
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer"])
+    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer", "diagnose"])
+    ap.add_argument("diag_map", nargs="?", default=None, help="diagnose: map path (default: the configured map)")
+    ap.add_argument("--min", type=float, default=4.0, help="diagnose: minutes per trial")
     ap.add_argument("--pb", default="", help="transfer: optional PB file of that map (for a target line)")
     ap.add_argument("--map")
     ap.add_argument("--run")
@@ -3069,6 +3307,9 @@ if __name__ == "__main__":
     cfg = cfgmod.coerce(cfg)
     if a.fresh:
         cfg["resume"] = False
+    if a.cmd == "diagnose":
+        diagnose(cfg, a.diag_map or a.map or cfg["map"], a.pb, a.min)
+        raise SystemExit(0)
     if a.cmd == "transfer":
         if not a.map:
             raise SystemExit("transfer needs --map <map not in the pool>")
@@ -3089,7 +3330,7 @@ if __name__ == "__main__":
         raise SystemExit("Base runs are PPO only: set the algorithm to PPO.")
     if cfg["algo"] == "iqn" and a.cmd in ("train", "drive"):
         if cfg.get("analog_steer"):
-            say("Analog steering is PPO-only: IQN drives with the 21 steering levels.")
+            say("Analog steering is PPO-only: IQN drives with steering levels (setting: Steering levels (IQN)).")
         import iqn
         {"train": iqn.train, "drive": iqn.drive}[a.cmd](cfg)
     else:
