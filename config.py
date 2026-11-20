@@ -1,16 +1,16 @@
 """Shared settings. The dashboard edits config.json, tm_ai.py reads it."""
 import json
+import os as _os
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-import os as _os
 CONFIG_PATH = Path(_os.environ["TMAI_CONFIG"]) if _os.environ.get("TMAI_CONFIG") else ROOT / "config.json"   # diagnose trials
 
 DEFAULTS = {
     "map": "",                 # full path to the .Map.Gbx
     "run": "calm",             # run name -> runs/<run>/
-    "envs": 8,                 # parallel cars (gyms); one more is used for champion tests
+    "envs": max(1, min(8, (_os.cpu_count() or 12) - 4)),   # parallel cars: 8 on 12 threads (+ learner, tester)
     "ticks_per_step": 5,       # 5 ticks = 50 ms per decision
     "max_lap_seconds": 90,     # hard time limit per training lap
     "pb_seconds": 0.0,         # your personal best (0 = unset)

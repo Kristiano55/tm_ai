@@ -41,7 +41,8 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - `train_ppo.py` — PPO (SB3): `make_model`, `migrate`/`transfer_policy`, **champion tests in a separate spawn process**
   (`ppo_test_worker`, fed EMA weights by the callback; rollback via `ROLLBACK` file), `_make_callback`,
   `prepare_guide`, base runs, `train`, `run_episode`, `replay_champion`, `drive`, `transfer`.
-- `cli.py` — `selftest`, `diagnose`, `pack_cli`, `main()`.
+- `cli.py` — `selftest`, `check`, `diagnose` (+ shared `run_trial`), `pack_cli`, `main()`.
+- `boot.py` — light entry points of the spawned car / IQN learner processes (report import errors such as 1455).
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
   epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
@@ -161,6 +162,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   resume resets VecNormalize's return stats (logged). The negative-driving warning names the 3 biggest costs.
 - **Lap action stats** (`info["ast"]`, lap events `ast`): share per throttle mode, mean |steer|/127, full-lock share,
   mean speed, furthest progress m.
+- **`python tm_ai.py check [map] [--pb file]`** (~3 min, real game): PASS / FAIL per line -> `runs/_check/check.json`
+  (exit 1 if anything failed): car accelerates, forward speed, up vector, lidar hits, route/checkpoints (+ dropped start
+  block), wheel surface ids (+ INFO: missing telemetry fields), determinism (a scripted drive twice = same finish /
+  tick / position), Play champion = champion time +-0.01 s (`replay_champion` of this map's run with a recorded
+  champion; SKIP if none), then 120 s fresh PPO (`run_trial` -> runs/check_fresh): laps past checkpoint 1, driving
+  reward > 0 (+ break-even speed). `TMAI_CHECK_S` = training seconds (tests: 20).
 - **`python tm_ai.py diagnose [map] [--pb file] [--min 4]`** (dashboard "Diagnose PPO"): fresh PPO trials
   `runs/diag_a..d` (deleted before each): a levels+3 modes, b analog+3, c levels+gas+brake, d analog+gas+brake. Each trial: own config file via `TMAI_CONFIG` (config.py
   CONFIG_PATH override, inherited by cars), subprocess `train --new --run diag_x`, STOP after the trial time (counted
@@ -231,6 +238,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
     between the last taken and next checkpoint (`cp_arc`, waypoints mapped onto the line); > `NEAR_LINE` 15 m off,
     the line is re-acquired anywhere in that section. Progress already paid is `_s`: a skipped stretch is paid out at
     <= 10 m per step when the car rejoins further on, a backward jump costs once (-10 m max).
+  - **IQN lap cuts:** the stall rule (on the line, moving, no progress for 4 s) and "far off line" do NOT end IQN laps
+    (they cut mini-races short); the car keeps paying the time cost each step. Standing still / < 3 m driven in 2 s
+    still ends the lap "stuck" for both algorithms.
   - **Stuck rule:** "<2 m along the line in 2 s" only if the car was within 15 m of the line the whole 2 s, and then
     only after 4 more seconds (`STALL_TICKS`) if the car still moves (line over a gap/wall it can't take); otherwise
     stuck = < 3 m actually driven in 2 s (sum of movements). Speed < 1.5 m/s for 2 s as before. "far off line" ends a
@@ -324,6 +334,13 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 
 ## Freezes
 - tickgym calls time out (gym 20 s, HTTP 60 s); timeouts end the lap like a `TransportError`.
+- **Out of memory (Windows error 1455, paging file too small; also MemoryError):** cars and the IQN learner are started
+  through `boot.py` (imports torch/tickgym inside a try, so an import that dies on 1455 is reported as text);
+  `tm_ai.py` skips its imports when re-imported as `__mp_main__`. `is_low_memory` on a car / learner error ->
+  `LowMemory` -> status "out of memory ...", one message (`LOW_MEM_MSG`: raise Windows virtual memory or use fewer
+  cars), exit code 4, no retries. Fake: `TICKGYM_FAKE_FAIL` file containing `1455`.
+- **Cars default:** `envs` = min(8, CPU threads - 4) (8 on a 12-thread Ryzen 5 5600). IQN warns in the 5-min profile
+  when the achieved reuse < 80 % of `iqn_reuse` (learner can't keep up) and suggests a car count.
 - `CarPool`: a car whose process fails (e.g. `TransportError: timed out`, EOF) is replaced like a hung one, its
   lap ends "car restarted"; replacement start-ups are retried; the same car failing 3 times in 5 min stops the run.
 - `CarPool`: a car not answering within max(120 s, 3 x max_lap_seconds) (`TMAI_CAR_DEADLINE`) is killed and replaced;

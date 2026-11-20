@@ -263,6 +263,20 @@ def atomic_save(path, write, backup=True):
     os.replace(tmp, path)
 
 
+LOW_MEM_MSG = ("Windows ran out of virtual memory (error 1455: the paging file is too small). Raise Windows virtual "
+               "memory (System > About > Advanced system settings > Performance > Settings > Advanced > Virtual "
+               "memory) or use fewer cars.")
+
+
+class LowMemory(RuntimeError):
+    """Out of (virtual) memory: the run stops cleanly with LOW_MEM_MSG instead of crashing."""
+
+
+def is_low_memory(text):
+    t = str(text).lower()
+    return "1455" in t or "paging file" in t or "memoryerror" in t
+
+
 def run_rewards(run_dir):
     """The run's frozen reward weights (rewards.json in its folder or a parent folder up to runs/: base maps, pool
     maps and transfer tests share their run's file), or None = the weights in Settings."""

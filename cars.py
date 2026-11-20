@@ -109,7 +109,8 @@ class CarPool:
     def _spawn(self, i):
         a, b = self.ctx.Pipe()
         c_cfg, c_dir, rot = self.specs[i]
-        p = self.ctx.Process(target=car_worker, args=(c_cfg, str(c_dir), b, rot), daemon=True)
+        import boot
+        p = self.ctx.Process(target=boot.car, args=(c_cfg, str(c_dir), b, rot), daemon=True)
         p.start()
         b.close()
         self.conns[i], self.procs[i] = a, p
@@ -123,6 +124,9 @@ class CarPool:
                 raise RuntimeError(f"car {i + 1} did not start within {timeout:.0f} s")
         m = c.recv()
         if m[0] == "error":
+            if is_low_memory(m[1]):
+                self.close()
+                raise LowMemory(LOW_MEM_MSG)
             if close_on_error:
                 self.close()
             raise RuntimeError(f"car {i + 1} could not start: {m[1]}")
@@ -144,6 +148,8 @@ class CarPool:
             try:
                 obs = self._ready(i, close_on_error=False)
                 break
+            except LowMemory:
+                raise
             except RuntimeError as e:
                 now = time.time()
                 f = [t for t in self.fails.get(i, []) if now - t < self.FAIL_WINDOW] + [now]
@@ -167,6 +173,9 @@ class CarPool:
     FAIL_MAX, FAIL_WINDOW = 3, 300.0                  # the same car failing 3 times in 5 min stops the run
 
     def _car_failed(self, i, why):
+        if is_low_memory(why):                       # more cars would only make it worse: stop cleanly
+            self.close()
+            raise LowMemory(LOW_MEM_MSG)
         now = time.time()
         f = [t for t in self.fails.get(i, []) if now - t < self.FAIL_WINDOW] + [now]
         self.fails[i] = f

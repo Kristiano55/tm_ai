@@ -973,12 +973,15 @@ class TMEnv(gym.Env):
                 self.stall = self.stall + self.ticks if moved >= 3.0 else self.STALL_TICKS
             else:
                 self.stall = 0
-            no_progress = full and (moved < 3.0 or self.stall >= self.STALL_TICKS)   # distance actually driven
+            # IQN learns mini-races: a stall on the line / a long way off the line does NOT end its lap (that would
+            # cut the mini-race short); the car keeps paying the time cost every step. Standing still is still stuck.
+            stall_cut = self.stall >= self.STALL_TICKS and not self.iqn
+            no_progress = full and (moved < 3.0 or stall_cut)   # distance actually driven
             self.far = self.far + self.ticks if self.off_line > self.FAR_LINE else 0
             if self.slow >= 200 or no_progress:                                 # stuck
                 terminated, end = True, "stuck"
                 r["end"] = -(W["w_stuck"] + give_up)
-            elif self.far >= self.FAR_TICKS:                                    # lost, far off the line
+            elif self.far >= self.FAR_TICKS and not self.iqn:                  # lost, far off the line (PPO)
                 terminated, end = True, "far off line"
                 r["end"] = -(W["w_stuck"] + give_up)
             elif (self.role == "training" and self.cut_behind and tick > 500

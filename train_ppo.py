@@ -879,6 +879,10 @@ def train(cfg):
         model.learn(total_timesteps=10 ** 12, callback=cb, reset_num_timesteps=False)
     except KeyboardInterrupt:
         write_json(run_dir / "status.json", {"state": "stopped", "reason": "stopped by user", "heartbeat": time.time()})
+    except LowMemory:
+        write_json(run_dir / "status.json", {"state": "stopped", "heartbeat": time.time(),
+                                             "reason": "out of memory: raise Windows virtual memory or use fewer cars"})
+        raise
     except Exception as e:
         write_json(run_dir / "status.json", {"state": "stopped", "reason": f"crashed: {str(e)[:120]}",
                                              "heartbeat": time.time()})

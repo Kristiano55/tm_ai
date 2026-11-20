@@ -598,7 +598,8 @@ def train(cfg):
     wnp = np.frombuffer(wbuf, dtype=np.float32)
     stop_evt, ready_evt, errq = ctx.Event(), ctx.Event(), ctx.Queue()
     device = pick_device(cfg)
-    learner = ctx.Process(target=learner_proc, daemon=True,
+    import boot
+    learner = ctx.Process(target=boot.learner, daemon=True,
                           args=(dict(cfg, _iqn_dev=device), str(run_dir), dim, n_act, H, time_cost, buf.names, rlock, ctr, stats, wbuf, wlock,
                                 stop_evt, ready_evt, errq))
     learner.start()
@@ -609,6 +610,8 @@ def train(cfg):
         msg = errq.get() if not errq.empty() else "learner process ended"
         pool.close()
         buf.close()
+        if T.is_low_memory(msg):
+            raise T.LowMemory(T.LOW_MEM_MSG)
         raise RuntimeError("IQN learner could not start:\n" + msg)
     wver = 0
 
@@ -782,6 +785,12 @@ def train(cfg):
                 rec["cars"] = n_env
                 log(**rec)
                 T.say(T.prof_line(rec))
+                tgt_r = float(cfg["iqn_reuse"])
+                if int(c[0]) > WARMUP and lrn["reuse"] < 0.8 * tgt_r:      # learner can't keep up with the cars
+                    sug = max(1, int(n_env * lrn["reuse"] / tgt_r))
+                    T.say(f"Warning: the learner can't keep up: achieved reuse x{lrn['reuse']:g} of x{tgt_r:g} "
+                          f"(learner busy {lrn['busy']}%). Use fewer cars (about {sug}) or a lower reuse; more cars "
+                          "only add experiences it never learns from.")
                 mt = {k: 0.0 for k in mt}
                 ctr_p, st_p, ts_p, last_prof = c, s_, ts, now
             if now - last_chk > 2.0:
@@ -792,7 +801,10 @@ def train(cfg):
                 except Exception as e:
                     T.say(f"Section tracking error: {str(e)[:100]}")
                 if not learner.is_alive():
-                    raise RuntimeError("IQN learner stopped: " + (errq.get() if not errq.empty() else "unknown"))
+                    em = errq.get() if not errq.empty() else "unknown"
+                    if T.is_low_memory(em):
+                        raise T.LowMemory(T.LOW_MEM_MSG)
+                    raise RuntimeError("IQN learner stopped: " + em)
                 if not tester.is_alive():                             # tester died: start a new one
                     T.say("Champion tester stopped unexpectedly, restarting it")
                     start_tester()
@@ -809,6 +821,9 @@ def train(cfg):
                 status("running")
     except KeyboardInterrupt:
         reason = "stopped by user"
+    except T.LowMemory:
+        reason = "out of memory: raise Windows virtual memory or use fewer cars"
+        raise
     except Exception as e:
         reason = f"crashed: {str(e)[:120]}"
         raise

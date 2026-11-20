@@ -83,6 +83,8 @@ class G:
     def next_tick(s): return s.tick
     def reset(s,seed=0):
         if _FAIL and os.path.exists(_FAIL):          # file content = how many resets fail in a row (default 1)
+            if open(_FAIL).read().strip()=="1455":   # Windows out of virtual memory (paging file too small)
+                raise OSError("[WinError 1455] The paging file is too small for this operation to complete")
             try:
                 n=int(open(_FAIL).read().strip() or 1)
                 if n>1: open(_FAIL,"w").write(str(n-1))

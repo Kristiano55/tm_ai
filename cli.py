@@ -179,9 +179,158 @@ def diag_verdict(res):
     return out
 
 
-def diagnose(cfg, map_path, pb="", minutes=4.0):
-    """Short PPO trials from the same fresh start (runs diag_a .. diag_e), report -> runs/_diag/diagnose.json."""
+def _champion_run(cfg, map_path):
+    """The run folder whose champion lap to replay for this map: the configured run if it is this map, else the most
+    recently trained run of the map with a recorded champion lap."""
+    if str(cfg["map"]).lower() == str(map_path).lower():
+        rd = cfgmod.run_dir(cfg)
+        if (rd / "champion_actions.json").exists():
+            return rd
+    uid = cfgmod.map_uid_for(map_path)
+    for r in cfgmod.list_runs():
+        if (uid and r.get("uid") == uid) or str(r.get("map") or "").lower() == str(map_path).lower():
+            rd = cfgmod.ROOT / "runs" / r["name"]
+            if (rd / "champion_actions.json").exists():
+                return rd
+    return None
+
+
+def check(cfg, map_path, pb=""):
+    """`python tm_ai.py check <map>` (~3 min on the real game): the things that broke real runs before, PASS / FAIL per
+    line -> runs/_check/check.json. 1 telemetry/inputs look sane, 2 determinism (same inputs twice = same result),
+    3 Play champion = champion time (+-0.01 s), 4 fresh laps get past checkpoint 1, 5 driving reward > 0."""
+    ddir = cfgmod.ROOT / "runs" / "_check"
+    ddir.mkdir(parents=True, exist_ok=True)
+    mcfg = dict(cfg)
+    if map_path and str(map_path) != str(cfg["map"]):
+        mcfg.update(map=map_path, pb_file=pb or "", pb_seconds=0.0)
+    elif pb:
+        mcfg["pb_file"] = pb
+    mcfg.update(algo="ppo", run_type="map", mid_start_p=0.0, iqn_mid_start_p=0.0)
+    res = []
+
+    def line(name, ok, detail):
+        st = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+        res.append({"check": name, "result": st, "detail": detail})
+        print(f"{st:4s}  {name:34s} {detail}", flush=True)
+
+    say(f"Check: {mcfg['map']} ({mcfg['ticks_per_step'] * 10} ms per step) ...")
+    env = None
+    try:
+        env = TMEnv(mcfg, None, shorten=False, role="check")
+        o, _ = env.reset()
+        act = np.array([0.0, 0]) if env.analog else np.array([len(env.STEER) // 2, 0])      # straight, full gas
+        mats = 0
+        for _ in range(40):
+            o, r, term, trunc, info = env.step(act)
+            mats += int(np.count_nonzero(np.asarray(getattr(env._last_t.wheels, "material_id", []))))
+            if term or trunc:
+                break
+        t = env._last_t
+        speed = float(t.vehicle.speed)
+        line("car accelerates at full gas", speed > 5.0, f"{speed:.1f} m/s after {info['tick'] / 100:.1f} s")
+        line("forward speed in car frame", float(o[3]) > 0.0, f"local velocity z {float(o[3]) * 100:.1f} m/s (> 0)")
+        line("up vector", float(o[8]) > 0.8, f"world up in car frame y {float(o[8]):.2f} (~1)")
+        line("lidar sees something", bool(np.any(env._lid[0])), f"{int(np.sum(env._lid[0]))} of {len(env._lid[0])} rays hit")
+        line("route / checkpoints", env.lap_len > 0 and len(env.route) > 1,
+             f"{len(env.route) - 1} targets, {env.lap_len:.0f} m"
+             + (f", start block dropped: {len(env.dropped_wp)}" if env.dropped_wp else ""))
+        line("wheel surface ids", mats > 0, f"{mats} wheel samples with a material id")
+        if env.extra:
+            miss = missing_fields(env)
+            print(f"INFO  {'telemetry fields missing':34s} {', '.join(miss) if miss else 'none'}")
+        # 2 determinism: the same inputs twice must give the same race
+        def drive():
+            g = env.g
+            g.reset(seed=0)
+            tt = None
+            for i in range(int(min(60.0, mcfg["max_lap_seconds"]) * 100 / env.ticks)):
+                st = int(round(40 * np.sin(i / 15.0)))
+                tt = g.step(env.ticks, steer=st, accelerate=True, brake=(i % 37 == 0))
+                if tt.finished:
+                    break
+            return (bool(tt.finished), int(tt.race.race_time_ms), int(tt.race.race_tick),
+                    tuple(round(float(x), 3) for x in np.asarray(tt.vehicle.position, dtype=np.float64)))
+        a, b = drive(), drive()
+        line("determinism (same inputs twice)", a == b,
+             f"{'finished ' + str(a[1] / 1000) + ' s' if a[0] else 'tick ' + str(a[2])}, position {a[3]}"
+             + ("" if a == b else f" vs {b}"))
+        # 3 play champion
+        rd = _champion_run(cfg, mcfg["map"])
+        if rd is None:
+            line("Play champion = champion time", None, "no run of this map has a recorded champion lap yet")
+        else:
+            pr = replay_champion(cfg, rd, env)
+            champ = read_json(rd / "best.json").get("champion_ms")
+            ok = bool(pr and pr.get("ms") is not None and champ and abs(pr["ms"] - champ) <= 10)
+            line("Play champion = champion time", ok, f"run {rd.name}: play {(pr or {}).get('ms')} ms vs champion "
+                 f"{champ} ms")
+    except Exception as e:
+        line("game connection", False, f"{type(e).__name__}: {str(e)[:150]}")
+    finally:
+        if env is not None:
+            env.close()
+    # 4 + 5: a short fresh PPO run on this map
+    secs = float(os.environ.get("TMAI_CHECK_S") or 120)
+    base = dict(mcfg, time_limit_min=0, stop_at_pb=False, resume=True, reward_v=5, mid_start_p=cfg["mid_start_p"])
+    say(f"Check: {secs:.0f} s of fresh PPO training (run check_fresh) ...")
+    rd, c = run_trial(base, "check_fresh", {}, secs, ddir, "config_check.json")
+    m = diag_metrics(rd, 4 if c["gas_brake"] else 3)
+    laps = []
+    try:
+        laps = [json.loads(x) for x in open(rd / "events.jsonl", encoding="utf-8")]
+    except (OSError, ValueError):
+        pass
+    laps = [e for e in laps if e.get("k") == "lap" and not e.get("mid")]
+    past = sum(1 for e in laps if int(e.get("cp") or 0) >= 1 or e.get("ms"))
+    line("fresh laps pass checkpoint 1", past > 0 if laps else False,
+         f"{past} of {len(laps)} laps" + (f"; most stuck laps after CP {m['stuck_spot']['cp']} near x "
+                                          f"{m['stuck_spot']['x']} z {m['stuck_spot']['z']}" if m.get("stuck_spot") else ""))
+    de = m.get("driving_earns_per_step")
+    line("driving reward > 0", de is not None and de > 0,
+         f"{de} per step (progress beats the time cost from {break_even(c, rd):.0f} m/s; mean speed "
+         f"{m.get('mean_speed_ms')} m/s)")
+    n_fail = sum(1 for r in res if r["result"] == "FAIL")
+    write_json(ddir / "check.json", {"t": time.time(), "map": mcfg["map"], "ticks_per_step": mcfg["ticks_per_step"],
+                                    "results": res, "fresh_metrics": m, "failed": n_fail})
+    print(("ALL PASSED" if not n_fail else f"{n_fail} FAILED") + f"   -> {ddir / 'check.json'}")
+    return n_fail
+
+
+def run_trial(base, name, over, secs, ddir, cfg_name):
+    """A fresh PPO run runs/<name> (deleted first) in a subprocess with its own config file (TMAI_CONFIG); STOP after
+    `secs` of training (counted from its first event). Log -> ddir/<name>.log. Returns (run folder, its config)."""
+    import shutil
     import subprocess
+    root = cfgmod.ROOT
+    rd = root / "runs" / name
+    if rd.exists():
+        shutil.rmtree(rd, ignore_errors=True)                   # same fresh start every time
+    c = cfgmod.coerce(dict(base, run=name, **over))
+    cpath = ddir / cfg_name
+    cpath.write_text(json.dumps(c, indent=1), encoding="utf-8")
+    env = dict(os.environ, TMAI_CONFIG=str(cpath))
+    with open(ddir / f"{name}.log", "w", encoding="utf-8") as logf:
+        entry = str(Path(__file__).resolve().with_name("tm_ai.py"))
+        p = subprocess.Popen([sys.executable, "-u", entry, "train", "--new", "--run", name],
+                             cwd=str(root), env=env, stdout=logf, stderr=subprocess.STDOUT)
+        t0 = None
+        while p.poll() is None:
+            time.sleep(1.0)
+            if t0 is None and (rd / "events.jsonl").exists():
+                t0 = time.time()                                # count from the training start, not the start-up
+            if t0 is not None and time.time() - t0 > secs:
+                (rd / "STOP").write_text("trial over")
+                try:
+                    p.wait(timeout=180)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                break
+    return rd, c
+
+
+def diagnose(cfg, map_path, pb="", minutes=4.0):
+    """Short PPO trials from the same fresh start (runs diag_a .. diag_d), report -> runs/_diag/diagnose.json."""
     root = cfgmod.ROOT
     ddir = root / "runs" / "_diag"
     ddir.mkdir(parents=True, exist_ok=True)
@@ -198,31 +347,8 @@ def diagnose(cfg, map_path, pb="", minutes=4.0):
 
     def trial(key, label, over):
         name = f"diag_{key}"
-        rd = root / "runs" / name
-        if rd.exists():
-            import shutil
-            shutil.rmtree(rd, ignore_errors=True)               # same fresh start for every trial
-        c = cfgmod.coerce(dict(base, run=name, **over))
-        cpath = ddir / f"config_{key}.json"
-        cpath.write_text(json.dumps(c, indent=1), encoding="utf-8")
         say(f"Diagnose trial {key} ({label}) ...")
-        env = dict(os.environ, TMAI_CONFIG=str(cpath))
-        with open(ddir / f"{name}.log", "w", encoding="utf-8") as logf:
-            entry = str(Path(__file__).resolve().with_name("tm_ai.py"))
-            p = subprocess.Popen([sys.executable, "-u", entry, "train", "--new", "--run", name],
-                                 cwd=str(root), env=env, stdout=logf, stderr=subprocess.STDOUT)
-            t0 = None
-            while p.poll() is None:
-                time.sleep(1.0)
-                if t0 is None and (rd / "events.jsonl").exists():
-                    t0 = time.time()                            # count from the training start, not the start-up
-                if t0 is not None and time.time() - t0 > secs:
-                    (rd / "STOP").write_text("diagnose")
-                    try:
-                        p.wait(timeout=180)
-                    except subprocess.TimeoutExpired:
-                        p.kill()
-                    break
+        rd, c = run_trial(base, name, over, secs, ddir, f"config_{key}.json")
         m = diag_metrics(rd, 4 if c["gas_brake"] else 3)
         res[key] = {"label": label, "settings": over, "metrics": m}
         say(f"  {key} {label}: earns/step {m['driving_earns_per_step']}, stuck {m['stuck_share']}, "
@@ -290,12 +416,28 @@ def pack_cli(argv):
 
 
 def main():
+    """Every command; out of (virtual) memory -> one clear message and a clean stop (exit code 4)."""
+    try:
+        _main()
+    except (LowMemory, MemoryError) as e:
+        say("!" * 12 + " " + LOW_MEM_MSG + " " + "!" * 12)
+        if not isinstance(e, LowMemory):
+            say(f"({type(e).__name__}: {str(e)[:100]})")
+        raise SystemExit(4)
+    except OSError as e:
+        if is_low_memory(e):
+            say("!" * 12 + " " + LOW_MEM_MSG + " " + "!" * 12)
+            raise SystemExit(4)
+        raise
+
+
+def _main():
     if len(sys.argv) > 1 and sys.argv[1] in ("hub", "publish", "verify", "benchmark", "export", "import"):
         pack_cli(sys.argv[1:])
         raise SystemExit(0)
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer", "diagnose"])
-    ap.add_argument("diag_map", nargs="?", default=None, help="diagnose: map path (default: the configured map)")
+    ap.add_argument("cmd", choices=["selftest", "train", "drive", "bench", "transfer", "diagnose", "check"])
+    ap.add_argument("diag_map", nargs="?", default=None, help="diagnose / check: map path (default: the configured map)")
     ap.add_argument("--min", type=float, default=4.0, help="diagnose: minutes per trial")
     ap.add_argument("--pb", default="", help="transfer: optional PB file of that map (for a target line)")
     ap.add_argument("--map")
@@ -313,6 +455,8 @@ def main():
     cfg = cfgmod.coerce(cfg)
     if a.fresh:
         cfg["resume"] = False
+    if a.cmd == "check":
+        raise SystemExit(1 if check(cfg, a.diag_map or a.map or cfg["map"], a.pb) else 0)
     if a.cmd == "diagnose":
         diagnose(cfg, a.diag_map or a.map or cfg["map"], a.pb, a.min)
         raise SystemExit(0)
