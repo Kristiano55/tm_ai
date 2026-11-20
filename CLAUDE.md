@@ -20,12 +20,26 @@ Gyms can `snapshot()` / `restore()`, cast lidar rays, read telemetry, and `expor
 Nothing is shown in the game window: laps are simulated; results are saved as TICK input files (`*.txt`).
 
 ## Files
-- `tm_ai.py` — environment (`TMEnv`, gymnasium), observations, rewards, reference line / ghost / PB guide,
-  mid-track starts, `CarPool` (asynchronous cars: each car process steps as soon as its own action arrives, pipes +
-  `connection.wait`), `bench`, profiling (`prof_summary`), `raise_priority` (psutil, Windows only), PPO training (SB3) with **champion tests in a separate spawn process** (`ppo_test_worker`, fed
-  EMA weights by the callback; rollback via `ROLLBACK` file), `selftest`, `drive`. CLI:
-  `python tm_ai.py selftest|train|drive|bench|transfer` (settings from `config.json`); packs/hub:
-  `tm_ai.py export|import|publish|verify|benchmark <target>` and `tm_ai.py hub list|search|import|refresh|verify-pending`. Dispatches to `iqn.py` when `algo == "iqn"`.
+- `tm_ai.py` — thin entry point: `python tm_ai.py selftest|train|drive|bench|transfer|diagnose` (settings from
+  `config.json`), packs/hub `tm_ai.py export|import|publish|verify|benchmark <target>` and `tm_ai.py hub
+  list|search|import|refresh|verify-pending`. Re-exports every module below, so `import tm_ai as T` (iqn, packs, hub,
+  tests) and the dashboard's commands work unchanged. Dispatches to `iqn.py` when `algo == "iqn"`.
+  Import order (no cycles): common <- rewards <- env <- cars <- train_ppo <- cli <- tm_ai (each `from x import *`).
+- `common.py` — shared helpers + constants: telemetry groups, EXTRA_NAMES, steering levels / `action_space` /
+  `steer_value`, GAS/BRAKE/MODE_VEC, watchdog + `freeze_guard`, surface vocabulary, `say` / JSON / npy / `atomic_save`,
+  line geometry (`make_line`, `line_progress`, `trace_to_profile`), `trace_record`, `map_targets`, `build_guide`,
+  FAIL_ENDS, `raise_priority`, `time_budget`.
+- `rewards.py` — every reward term: `step_terms` (all per-step terms of TMEnv.step, same order + state updates),
+  `give_up_cost`, `finish_bonus`, `hit_penalty`, `pointless_release`; reward state: `freeze_preset`, `champion_ghost`,
+  `HitRamp`, `Coverage`.
+- `env.py` — `TMEnv` (observations, progress, lap rules: stuck / off-zone / far off line / behind ghost / timeout,
+  mid-track starts), `SectionTracker`, `n_sections`, `StuckWatch`.
+- `cars.py` — `car_worker`, `CarPool` (asynchronous cars: each car process steps as soon as its own action arrives,
+  pipes + `connection.wait`), `make_pool_vecenv`, profiling (`prof_summary`, `prof_line`), `bench`.
+- `train_ppo.py` — PPO (SB3): `make_model`, `migrate`/`transfer_policy`, **champion tests in a separate spawn process**
+  (`ppo_test_worker`, fed EMA weights by the callback; rollback via `ROLLBACK` file), `_make_callback`,
+  `prepare_guide`, base runs, `train`, `run_episode`, `replay_champion`, `drive`, `transfer`.
+- `cli.py` — `selftest`, `diagnose`, `pack_cli`, `main()`.
 - `iqn.py` — Linesight-style learner: IQN (dueling, 64-dim cos embedding, N=8/K=32, kappa 5e-3), replay buffer
   (float16), 3-step returns, 7 s **mini-races** (time-left input appended, random per sample, gamma 0.999 -> 1),
   epsilon + Boltzmann exploration (eps points from `iqn_eps_*` settings), Linesight LR schedule, soft target updates,
@@ -299,7 +313,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 
 ## Testing (no game needed)
 ```
-mkdir /tmp/t && cp tm_ai.py iqn.py config.py /tmp/t && cd /tmp/t
+mkdir /tmp/t && cp *.py /tmp/t && cd /tmp/t                 # all modules (tm_ai.py is split into several)
 echo '{"map":"x","run":"t","envs":2,"test_every_laps":3,"time_limit_min":1}' > config.json
 PYTHONPATH=<repo>/tests python3 -u tm_ai.py train          # PPO; add "algo":"iqn" for IQN
 TMAI_IQN_WARMUP=3000 ...                                   # shorter IQN warm-up for tests
@@ -319,6 +333,10 @@ hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake 
 `time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:
 `python -m py_compile *.py` and extract the `<script>` from dashboard.html and `node --check` it.
 Test checkpoint conversion by training with the previous git version first, then resuming with the new one.
+Refactor proof (used for the module split): train a run with every reward term on (PB guide + TICKGYM_FAKE_CORNER),
+then on copies of that run drive fixed-seed scripted laps + the champion model with old and new code and compare the
+per-step rewards, reward terms and lap times byte for byte. `python3 -m pyflakes` can't see through the star imports:
+check that every global a function uses exists in its module (dis LOAD_GLOBAL vs module dict).
 Packs + hub: `python tests/test_hub.py` (temp copy; safety checks, PR validator, index builder, file:// import,
 verify incl. a faked time, benchmark). The fake game records real inputs (`export()` / `InputText`) and has map UIDs.
 

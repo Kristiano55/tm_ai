@@ -9,8 +9,8 @@ REPO = Path(__file__).resolve().parent.parent
 
 def run(algo):
     d = Path(tempfile.mkdtemp(prefix="tmai_start_"))
-    for f in ("tm_ai.py", "iqn.py", "config.py", "ppo_ext.py", "packs.py", "packcheck.py"):
-        shutil.copy(REPO / f, d)
+    for f in REPO.glob("*.py"):
+        shutil.copy(f, d)
     (d / "config.json").write_text(json.dumps({"map": "x", "run": "t", "envs": 2, "test_every_laps": 3,
                                                "time_limit_min": 1, "reward_v": 4, "algo": algo}))
     env = dict(os.environ, PYTHONPATH=str(REPO / "tests"), TICKGYM_FAKE_STARTWP="Start", TMAI_IQN_WARMUP="3000")

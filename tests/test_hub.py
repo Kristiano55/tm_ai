@@ -19,8 +19,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="tmai_hub_"))
-for f in ("tm_ai.py", "config.py", "packs.py", "packcheck.py", "hub.py", "iqn.py", "ppo_ext.py"):
-    shutil.copy(REPO / f, TMP / f)
+for f in REPO.glob("*.py"):                    # all code modules (tm_ai.py is split into several files)
+    shutil.copy(f, TMP / f.name)
 shutil.copytree(REPO / "hub_template", TMP / "hub_template")
 sys.path[:0] = [str(TMP), str(REPO / "tests")]
 (TMP / "config.json").write_text(json.dumps({"map": "fake:1000:asphalt", "run": "fx", "github_user": "kris"}))
