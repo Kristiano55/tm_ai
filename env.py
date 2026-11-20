@@ -166,10 +166,13 @@ class TMEnv(gym.Env):
     LOOK_OFF = 28                         # where the lookahead features start
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
-        self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
-        fw = read_json(Path(run_dir) / "rewards.json").get("weights") if run_dir else None
-        if fw:                                        # run started with a preset (minimal): its own weights
-            self.W.update({k: float(fw.get(k, 0.0)) for k in cfgmod.WEIGHTS})
+        # every term the reward code knows; Settings only has the minimal set (+ ghost, wall hit), the legacy terms
+        # are 0 unless the run has frozen weights (rewards.json: old runs, minimal-preset runs)
+        self.W = {k: float(cfg.get(k, 0.0)) for k in cfgmod.ALL_TERMS}
+        fw = run_rewards(run_dir)
+        if fw:
+            self.W.update({k: float(fw.get(k, 0.0)) for k in cfgmod.ALL_TERMS})
+        lg = fw or {}                                 # settings only legacy terms used (VCPs, coverage stretches)
         self.iqn = cfg.get("algo") == "iqn"          # IQN charges failure itself: no give-up penalty here
         self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         if self.iqn and int(cfg.get("_iqn_levels") or 21) != len(self.STEER):     # finer IQN steering (new runs)
@@ -178,7 +181,7 @@ class TMEnv(gym.Env):
         self.pnorm, self.pscale = float(cfg.get("_pnorm") or 0.0), 1.0     # map-neutral progress (base runs)
         self.cut_behind = float(cfg["cut_behind_s"])
         self.ghost_window = float(cfg["ghost_window_s"])
-        self.vcp_every = float(cfg["vcp_every_s"])
+        self.vcp_every = float(lg.get("vcp_every_s", 0.0))
         self.vcp_s, self.vcp_t, self.vcp_i = np.zeros(0), np.zeros(0), 0
         self.tf = cfg["ticks_per_step"] / 5.0          # per-step costs are scaled so they mean the same per second
         self.run_dir, self.role, self.shorten = (Path(run_dir) if run_dir else None), role, shorten
@@ -206,7 +209,7 @@ class TMEnv(gym.Env):
         # coverage (novelty -> speed focus): per cov_len-m stretch of the line, how well the AI knows it (0..1),
         # sent by the main process (Coverage in CarPool). Training cars of map runs only.
         self.cov_on = role == "training" and not self.pool_car and not self.slug
-        self.cov_len = max(5.0, float(cfg.get("cov_len", 25)))
+        self.cov_len = max(5.0, float(lg.get("cov_len", 25)))
         self.cov_known, self.cov_wks = np.zeros(0), np.zeros(0)
         self.cov_s0, self.cov_max, self.cov_spd = 0.0, 0.0, {}
 
@@ -470,14 +473,11 @@ class TMEnv(gym.Env):
         self._lid_mat = np.asarray(mat, dtype=np.int64) if mat is not None else np.zeros(len(hit), np.int64)
         return self._lid
 
-    def _run_weights(self):
-        """rewards.json of a run started with a reward preset: its frozen weights win over the settings."""
-        return read_json(self.run_dir / "rewards.json").get("weights") if self.run_dir else None
-
     def _read_weights(self):
-        """Pick up weights saved from the dashboard (applies from the next lap on)."""
-        d = self._run_weights() or read_json(cfgmod.CONFIG_PATH)
-        for k in cfgmod.WEIGHTS:
+        """Pick up weights saved from the dashboard (applies from the next lap on); runs with frozen weights
+        (rewards.json) keep theirs."""
+        d = run_rewards(self.run_dir) or read_json(cfgmod.CONFIG_PATH)
+        for k in cfgmod.ALL_TERMS:
             try:
                 self.W[k] = float(d[k])
             except (KeyError, TypeError, ValueError):

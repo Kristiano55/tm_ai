@@ -99,7 +99,8 @@ class CarPool:
         self.sent = [None] * n                       # when each car got its action (None = not stepping)
         self.prof = np.zeros(5)                      # summed seconds: tick, obs, env, waited for action; + steps
         self.replaced, self.fails = 0, {}
-        self.cov = Coverage(cfg, run_dir) if coverage and cfg.get("run_type") != "base" else None   # base runs: no coverage
+        self.cov = (Coverage(cfg, run_dir) if coverage and cfg.get("run_type") != "base" and uses_coverage(run_dir)
+                    else None)               # only runs that still use the legacy novelty terms; base runs: none
         self.cov_sent = [-1] * n
         for i in range(n):
             self.first_obs[i] = self._ready(i)

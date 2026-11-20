@@ -1,5 +1,6 @@
 """Shared settings. The dashboard edits config.json, tm_ai.py reads it."""
 import json
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -40,7 +41,6 @@ DEFAULTS = {
     "lidar_every": 1,               # 1 = lidar scan every step; 2 = every other step (reuses the last scan)
     "iqn_warm_run": "",
     "sec_fallback": True,           # with a PB/WR target line: sections where most laps fail use the AI's own route             # IQN: fill the replay memory with laps of this PPO run's champion first (empty = off)
-    "vcp_every_s": 4.0,        # virtual checkpoints every N seconds of the PB/ghost pace (0 = off)
     "test_tries_close": 8,     # ... and this many once the champion is within test_close_s of your PB
     "test_close_s": 0.5,
     "test_tries": 3,           # champion test = best of N laps (most-likely actions + seeded ones)
@@ -73,63 +73,67 @@ DEFAULTS = {
     "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
     "aux_weight": 0.05,        # PPO: auxiliary heads (wall hit soon, time to next CP, wheels grounded), training only
     "w_hit_ramp": True,        # wall-hit penalty ramps in with the finish rate (25 % below 30 % finished, 100 % from 60 %)
-    "cov_len": 25.0,           # coverage stretch length in m (novelty -> speed focus); at start
-    "cov_passes": 100.0,       # passes after which a stretch is 63 % "known"; at start
-    "reward_preset": "custom",  # "minimal": new runs freeze the MINIMAL weights (rewards.json); custom = settings
-    "reward_v": 4,             # reward layout version (old configs are upgraded once)
+    "reward_v": 5,             # reward layout version (old configs are upgraded once)
 }
 
 
-# Reward weights: key -> (default, label, hint). They are read live: running cars pick up a saved
-# change at the start of their next lap (no restart needed).
-WEIGHTS = {
-    "w_progress": (0.05, "Progress", "reward per metre driven along the route (keep small: it pays the same for slow and fast laps)"),
-    "w_time": (0.02, "Time penalty", "cost per 50 ms step; this is what makes going fast pay"),
-    "w_guide": (0.05, "Pull toward the target line", "per step, by distance from the PB/best line; only while behind its pace"),
-    "ghost_weight": (10.0, "Ghost", "reward per second gained on the fastest run so far (0 = off)"),
-    "w_vcp": (1.0, "Virtual checkpoint bonus", "flat reward per virtual checkpoint (every few s of the PB pace)"),
-    "w_vsplit": (2.0, "Virtual checkpoint split", "per second ahead (+) or behind (-) the PB/ghost at each virtual checkpoint"),
-    "w_checkpoint": (3.0, "Checkpoint bonus", "flat reward per checkpoint"),
-    "w_finish": (50.0, "Finish bonus", "flat reward for finishing"),
-    "w_finish_time": (10.0, "Finish speed bonus", "reward per second faster than the champion at the finish (negative if slower)"),
-    "w_steer_smooth": (0.002, "Smooth steering", "penalty per unit of steering change between steps"),
-    "w_crash": (0.05, "Crash penalty", "per m/s of sudden speed loss (wall hits)"),
-    "w_offzone": (20.0, "Off-zone penalty", "when the car leaves the playable area (plus the progress it gave up)"),
-    "w_stuck": (20.0, "Stuck penalty", "when the car stands still for 2 s (plus the progress it gave up)"),
-    "w_brake": (0.0, "Brake penalty", "per step while braking"),
-    "w_coast": (0.0, "Coast penalty", "per step with neither gas nor brake, everywhere"),
-    "w_release": (0.03, "Pointless release penalty", "per step released on a straight with nothing ahead; corners stay free"),
-    "w_slip": (0.0, "Slip penalty", "per step, scaled by the share of slipping wheels"),
-    "w_hit": (0.0, "Wall-hit penalty", "per step with a wall hit (exact flag from the game; try 0.3)"),
-    "w_wall": (0.0, "Wall-scrape penalty", "near a wall at speed; can discourage tight racing lines"),
-    "w_air": (0.0, "Airtime penalty", "per step with no wheel on the ground"),
-    "w_speed": (0.0, "Speed reward", "per step, proportional to speed (direct speed incentive)"),
-    "w_novel": (0.5, "Novelty bonus", "extra progress pay on stretches the AI rarely gets through: x (1 + this x (1 - known))"),
-    "w_known": (0.4, "Known-stretch cut", "less progress pay where the AI knows the stretch well: x (1 - this x known); max 0.5"),
-    "w_focus": (1.5, "Speed focus", "extra ghost reward on well-known stretches: time gained x (1 + this x known)"),
+# Reward weights. ALL_TERMS = every term the reward code still knows (old runs may use any of them, frozen in their
+# rewards.json); WEIGHTS = the ones in Settings (key -> (default, label, hint)), read live by the cars.
+# Defaults = the minimal set: progress, time, checkpoint, finish, give-up cost (stuck / off-zone + the remaining
+# metres); ghost and wall hit are the only optional extras (off by default).
+_TERMS = {
+    "w_progress": "Progress|reward per metre driven along the route",
+    "w_time": "Time penalty|cost per 50 ms step; this is what makes going fast pay",
+    "w_checkpoint": "Checkpoint bonus|flat reward per checkpoint",
+    "w_finish": "Finish bonus|flat reward for finishing",
+    "w_stuck": "Stuck penalty|when the car stands still for 2 s (plus the progress it gave up)",
+    "w_offzone": "Off-zone penalty|when the car leaves the playable area (plus the progress it gave up)",
+    "ghost_weight": "Ghost|optional: reward per second gained on the champion's ghost (try 10; 0 = off)",
+    "w_hit": "Wall-hit penalty|optional: per wall hit, scaled by the speed it cost (try 0.3; 0 = off)",
 }
+WEIGHTS = {k: (d, *_TERMS[k].split("|")) for k, d in (
+    ("w_progress", 0.05), ("w_time", 0.02), ("w_checkpoint", 3.0), ("w_finish", 50.0), ("w_stuck", 20.0),
+    ("w_offzone", 20.0), ("ghost_weight", 0.0), ("w_hit", 0.0))}
+DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
+
+# Every term with its default BEFORE reward_v 5 (the old "Lean" defaults): what an old config meant for a key it
+# didn't have, frozen into existing runs' rewards.json by the v5 migration. Legacy-only terms have no Settings row.
+OLD_DEFAULTS = dict(w_progress=0.05, w_time=0.02, w_guide=0.05, ghost_weight=10.0, w_vcp=0.0, w_vsplit=0.0,
+                    w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0, w_steer_smooth=0.0, w_crash=0.05,
+                    w_offzone=20.0, w_stuck=20.0, w_brake=0.0, w_coast=0.0, w_release=0.0, w_slip=0.0, w_hit=0.3,
+                    w_wall=0.0, w_air=0.02, w_speed=0.03, w_novel=0.5, w_known=0.4, w_focus=1.5)
+ALL_TERMS = tuple(OLD_DEFAULTS)
+LEGACY_TERMS = tuple(k for k in ALL_TERMS if k not in WEIGHTS)
+LEGACY_SETTINGS = {"vcp_every_s": 4.0, "cov_len": 25.0, "cov_passes": 100.0}   # only the legacy terms used these
 NEW_IN_V4 = {"w_novel": 0.0, "w_known": 0.0, "w_focus": 0.0, "w_air": 0.0, "w_speed": 0.0, "w_hit": 0.0,
              "ghost_weight": 10.0}     # values for configs from before reward_v 4 that don't have the key
-
-# "Lean" preset: only the terms that define the task; everything else off. This is also the default (recommended
-# for PPO); "Reset weights to defaults" fills it in.
-LEAN = {k: 0.0 for k in WEIGHTS}
-LEAN.update(w_progress=0.05, w_time=0.02, ghost_weight=10.0, w_checkpoint=3.0, w_finish=50.0, w_finish_time=10.0,
-            w_crash=0.05, w_offzone=20.0, w_stuck=20.0, w_guide=0.05,
-            w_air=0.02, w_speed=0.03, w_hit=0.3, w_novel=0.5, w_known=0.4, w_focus=1.5)
-WEIGHTS = {k: (LEAN[k], label, hint) for k, (_, label, hint) in WEIGHTS.items()}
-DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 
 # "Linesight" preset: exactly two terms. Linesight's 0.01/m vs 0.06 per 50 ms breaks even at 120 m/s (TMNF);
 # for TM2020 progress is 0.03/m, so driving pays from ~40 m/s (0.06 / 0.05 s / 0.03 per m).
 LINESIGHT = {k: 0.0 for k in WEIGHTS}
 LINESIGHT.update(w_progress=0.03, w_time=0.06)
+MODEL_FILES = ("latest.zip", "champion.zip", "latest.pt", "latest.prev.pt", "champion.pt")
 
-# "Minimal" preset: progress + time + finish + checkpoint + the give-up cost (stuck / off-zone, which also charges
-# the remaining metres); everything else 0. Chosen with the reward_preset setting; frozen into a NEW run's
-# rewards.json at its first start, so existing runs keep their rewards.
-MINIMAL = {k: 0.0 for k in WEIGHTS}
-MINIMAL.update(w_progress=0.05, w_time=0.02, w_finish=50.0, w_checkpoint=3.0, w_stuck=20.0, w_offzone=20.0)
+
+def freeze_legacy(weights):
+    """reward_v 5 migration: every existing run with a model (runs/<run>, runs/_base/<base>) that has no rewards.json
+    gets one with the weights it trained with (all terms + the legacy settings), so it resumes identically. The cars
+    find it in their run folder or a parent folder (base maps, pool maps, transfer tests)."""
+    roots = [d for d in (ROOT / "runs").glob("*") if d.is_dir() and not d.name.startswith("_")]
+    roots += [d for d in (ROOT / "runs" / "_base").glob("*") if d.is_dir()]
+    n = 0
+    for d in roots:
+        f = d / "rewards.json"
+        if f.exists() or not any((d / m).exists() for m in MODEL_FILES):
+            continue
+        try:
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"preset": "legacy", "weights": weights, "t": time.time()}), encoding="utf-8")
+            tmp.replace(f)
+            n += 1
+        except OSError:
+            pass
+    return n
 
 
 def load():
@@ -137,13 +141,18 @@ def load():
     if CONFIG_PATH.exists():
         try:
             on_disk = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            cfg.update(on_disk)
         except Exception:
             pass
-    v = int(on_disk.get("reward_v", 1) or 1) if on_disk is not None else 3
+    # no reward_v = a hand-written config (the dashboard always saves it): treat it as current, migrate nothing
+    v = int(on_disk.get("reward_v", 5) or 5) if on_disk is not None else 5
+    if on_disk is not None and v < 5:
+        cfg.update(OLD_DEFAULTS)                # what a config from before v5 meant for keys it doesn't have
+        cfg.update(LEGACY_SETTINGS)
+    if on_disk is not None:
+        cfg.update(on_disk)
     if v < 3:            # v2: finish bonus vs champion; v3: progress always beats the time penalty, giving up costs
         for k in (("w_finish_time",) if v < 2 else ()) + ("w_progress", "w_stuck", "w_offzone"):
-            cfg[k] = WEIGHTS[k][0]
+            cfg[k] = OLD_DEFAULTS[k]
         cfg["reward_v"] = 3
         try:
             save(cfg)
@@ -154,6 +163,21 @@ def load():
             if k not in on_disk:
                 cfg[k] = d
         cfg["reward_v"] = 4
+        try:
+            save(cfg)
+        except OSError:
+            pass
+    if on_disk is not None and v < 5:     # v5: minimal rewards for new runs; existing runs keep theirs (rewards.json)
+        legacy = {}
+        for k in list(ALL_TERMS) + list(LEGACY_SETTINGS):
+            try:
+                legacy[k] = float(cfg.get(k, OLD_DEFAULTS.get(k, LEGACY_SETTINGS.get(k, 0.0))))
+            except (TypeError, ValueError):
+                legacy[k] = float(OLD_DEFAULTS.get(k, LEGACY_SETTINGS.get(k, 0.0)))
+        freeze_legacy(legacy)
+        for k in WEIGHTS:                     # new runs: the minimal defaults
+            cfg[k] = WEIGHTS[k][0]
+        cfg["reward_v"] = 5
         try:
             save(cfg)
         except OSError:
@@ -180,13 +204,8 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
-    if out["reward_preset"] not in ("custom", "minimal"):
-        out["reward_preset"] = "custom"
     out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
     out["start_focus"] = min(max(out["start_focus"], 0.0), 1.0)
-    out["w_known"] = min(max(out["w_known"], 0.0), 0.5)
-    out["cov_len"] = max(5.0, out["cov_len"])
-    out["cov_passes"] = max(1.0, out["cov_passes"])
     pool = []
     for e in out["map_pool"] if isinstance(out["map_pool"], list) else []:
         if isinstance(e, str):

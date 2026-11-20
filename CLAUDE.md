@@ -162,8 +162,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Lap action stats** (`info["ast"]`, lap events `ast`): share per throttle mode, mean |steer|/127, full-lock share,
   mean speed, furthest progress m.
 - **`python tm_ai.py diagnose [map] [--pb file] [--min 4]`** (dashboard "Diagnose PPO"): fresh PPO trials
-  `runs/diag_a..e` (deleted before each), novelty weights 0 for a-d: a levels+3 modes, b analog+3, c levels+gas+brake,
-  d analog+gas+brake, e = best of a-d + novelty defaults. Each trial: own config file via `TMAI_CONFIG` (config.py
+  `runs/diag_a..d` (deleted before each): a levels+3 modes, b analog+3, c levels+gas+brake, d analog+gas+brake. Each trial: own config file via `TMAI_CONFIG` (config.py
   CONFIG_PATH override, inherited by cars), subprocess `train --new --run diag_x`, STOP after the trial time (counted
   from the first event). Report table + verdict (feature "breaks" = worse in both A/B pairs) -> `runs/_diag/diagnose.json`,
   trial logs `runs/_diag/diag_x.log`. `TMAI_DIAG_S` = trial seconds (tests).
@@ -238,22 +237,29 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
     lap after 8 s continuously > 40 m off. `StuckWatch` logs a hint when >80% of the last 200 laps end stuck at one spot.
   - Laps are cut only against the AI's **own champion** pace (`champ_trace`), never before a champion exists.
   - A dense positive "while driving" reward is required for PPO; dashboard warns when it goes negative.
-- **Novelty -> speed focus** (`Coverage` in tm_ai.py, owned by `CarPool` in the main process, so PPO + IQN; not in
-  base runs / pool cars / tests / bench): line cut into `cov_len` (25) m stretches; a lap counts stretch k only if it
-  drove through all of it (lap info `cov` = [k0, k1) from its start progress, mid-starts included; failing inside a
-  stretch doesn't count it). known = 1 - exp(-passes / `cov_passes` (100)). Cars get {known, wks} with their next action
-  (tuple message) when it changed; saved `coverage.json` (passes, median speed per stretch, section modes). A section's
-  stretches reset when its route swaps PB <-> AI (sections.json). Rewards (live): `novel` = progress x (w_novel (0.5) x
-  (1 - known) - w_known (0.4, max 0.5) x wks x known), only on forward progress; `focus` = ghost x w_focus (1.5) x known.
-  `wks` < 1 where progress x (1 - w_known) at the AI's median speed there would not beat 1.1 x time cost (logged once
-  per stretch). Give-up cost keeps the base progress weight. IQN: applied at collection time (replay stores summed
-  rewards). `reward_v` 4: configs from before get 0 for missing w_novel/w_known/w_focus/w_air/w_speed/w_hit (same
-  rewards on resume); new defaults: w_air 0.02, w_speed 0.03, w_hit 0.3, ghost 10.
-- **Reward presets:** dashboard buttons Lean / Linesight fill the weights; "Use minimal rewards" sets
-  `reward_preset` = "minimal" (default "custom"): a run starting from scratch (no model; not base runs) gets
-  `rewards.json` {preset, weights = config.MINIMAL: progress 0.05, time 0.02, finish 50, checkpoint 3, stuck 20,
-  off-zone 20, rest 0} (`freeze_preset`, PPO + IQN); TMEnv uses those weights (also on live reload) instead of the
-  settings. Existing runs never change. Zero-weight terms are left out of the reward breakdown.
+- **Reward simplification (reward_v 5):** Settings / DEFAULTS only have the minimal set (`config.WEIGHTS`): progress
+  0.05, time 0.02, checkpoint 3, finish 50, give-up cost (stuck 20 / off-zone 20 + the remaining metres), plus the
+  optional ghost (`ghost_weight`, 0 = off, + `ghost_window_s`) and wall hit (`w_hit`, 0 = off, + `w_hit_ramp`). Break-even
+  speed = 20 x w_time / w_progress = 8 m/s at any tick rate (the "driving earns" warning prints it; fake minimal runs
+  earn +0.14/step at 50 ms, +0.09 at 30 ms). The reward code still knows every older term (`config.ALL_TERMS`:
+  guide, vcp/vsplit, finish_time, steer_smooth, crash, brake, coast, release, slip, wall, air, speed, novelty/known/
+  focus), all 0 unless a run has frozen weights. Migration (first `config.load()` of a config with reward_v < 5):
+  `freeze_legacy` writes every existing run with a model (runs/<run>, runs/_base/<base>) a `rewards.json` {preset
+  "legacy", weights = all terms as that config meant them (`OLD_DEFAULTS` for missing keys) + `vcp_every_s`, `cov_len`,
+  `cov_passes`}, then resets the kept weights to the minimal defaults for new runs. A config without reward_v (hand-
+  written) counts as current. `common.run_rewards(run_dir)` finds rewards.json in the run folder or a parent (base
+  maps, pool maps, transfer tests), used by TMEnv (W, VCP spacing, coverage stretch), live reload, Coverage, IQN's
+  time cost, `break_even`. `reward_notice` logs at every start which weights a run uses and which legacy terms are on.
+  Old minimal-preset runs keep their rewards.json too. Proof: the byte-identical probe on an old run with 13 legacy
+  terms. Deleted (only reachable by removed settings): Settings rows of all legacy terms + vcp/coverage settings, the
+  `reward_preset` setting + `freeze_preset` + `MINIMAL` + "Use minimal rewards" button, the `LEAN` preset + button,
+  diagnose's novelty trial (e). Kept (old runs need them): all term code in rewards.py, VCPs, `Coverage` (now only
+  created when the run's weights use novel/known/focus; `uses_coverage`).
+- **Novelty -> speed focus (legacy term, rewards.json only):** `Coverage` in rewards.py, owned by `CarPool`; line cut into
+  `cov_len` (25) m stretches; a lap counts stretch k only if it drove through all of it. known = 1 - exp(-passes /
+  `cov_passes`). `novel` = progress x (w_novel x (1 - known) - w_known x wks x known); `focus` = ghost x w_focus x known.
+- **Reward presets:** dashboard buttons "Linesight preset" and "Reset to minimal" fill the weights. Zero-weight terms
+  are left out of the reward breakdown.
 - **Lap-time chart markers:** G = ghost rebuilt (event k=target), S = section target switched (k=section); dashboard
   `targets` (lap number when it happened).
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
@@ -289,7 +295,7 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   `target_kl=0.02`; rollback after `rollback_after` bad tests (IQN only if `iqn_rollback`, default off). Both algos test in a spawn process (busy flag,
   restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
 - **PPO is the main algorithm** (Kris, after IQN stalled on Training - 22). IQN code + settings stay; the dashboard
-  shows IQN settings only when IQN is chosen. Defaults = recommended PPO setup: Lean weights, 8 cars, 50 ms,
+  shows IQN settings only when IQN is chosen. Defaults = recommended PPO setup: minimal rewards, 8 cars, 50 ms,
   mid-starts 0.25 (after the first finish), best-of-3 tests.
 - **Kris rejected:** input bruteforce / TAS polishing ("pure AI learning is best");  random switching of steering layouts mid-training.
 
@@ -343,7 +349,7 @@ Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, o
 `prepare_guide` WITHOUT the detour (straight "WR" line), then train with the detour, then delete the file.
 `TICKGYM_FAKE_CORNER=1`: z 400..460 caps speed at 35 m/s unless gas AND brake are held (60). The fake brake now
 slows the car when held without gas (random IQN driving rarely finishes in 1 min there; with the old fake it does).
-Diagnose test: `TMAI_DIAG_S=25 python tm_ai.py diagnose` (~3 min for 5 trials). `TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
+Diagnose test: `TMAI_DIAG_S=25 python tm_ai.py diagnose` (~2.5 min for 4 trials). `TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
 a car, 100 = keeps failing -> run stops after 3). `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
 Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
 hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).

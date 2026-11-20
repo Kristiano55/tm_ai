@@ -159,6 +159,14 @@ def transfer_policy(old, new, old_levels, new_levels, old_base=N_BASE0, new_base
     new.num_timesteps, new._n_updates = old.num_timesteps, old._n_updates
 
 
+def break_even(cfg, run_dir):
+    """Speed (m/s) from which progress pays more than the time cost: per step w_time x ticks/5 vs
+    w_progress x v x ticks/100, so v = 20 w_time / w_progress - the same at 10, 30 or 50 ms."""
+    w = run_rewards(run_dir) or cfg
+    wp, wt = float(w.get("w_progress", 0.05)), float(w.get("w_time", 0.02))
+    return 20.0 * wt / wp if wp > 0 else float("inf")
+
+
 def saved_ticks(run_dir):
     """ticks_per_step the run's checkpoints were trained with: levels.json, else the last start event."""
     t = read_json(Path(run_dir) / "levels.json").get("ticks")
@@ -469,7 +477,8 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                         say(f"Warning: driving earns {running:+.4f} per step on average (before finish/checkpoint "
                             f"bonuses; at {cfg['ticks_per_step'] * 10} ms per step). Biggest costs: "
                             + ", ".join(f"{k} {v:+.4f}" for v, k in worst)
-                            + ". Stopping can look attractive; lower penalties or raise Progress.")
+                            + f". Progress beats the time cost from {break_even(cfg, run_dir):.0f} m/s (any decision "
+                            "interval). Stopping can look attractive; lower penalties or raise Progress.")
                 else:
                     self.neg = 0
                 self.rb, self.rb_steps = {}, 0
@@ -773,8 +782,7 @@ def train(cfg):
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     raise_priority(tick_too=True)
     base = cfg["run_type"] == "base"
-    if not base:
-        freeze_preset(cfg, run_dir)
+    reward_notice(run_dir)
     from_base = None if base else start_from_base(cfg, run_dir)
     pnorm = float(cfg["progress_norm_m"]) if (base or (run_dir / "base.json").exists()) else 0.0
     specs, maps = setup_cars(cfg, run_dir, pnorm)

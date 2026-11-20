@@ -176,8 +176,6 @@ def diag_verdict(res):
             bad = [_diag_worse(t[w], t[wo]) for w, wo in pairs]
             out.append(f"{name}: " + ("BREAKS learning here (worse in both comparisons)" if all(bad) else
                                       "probably hurts (worse in one comparison)" if any(bad) else "no harm seen"))
-    if "e" in t and res["e"].get("from") in t:
-        out.append("novelty rewards: " + ("hurt learning" if _diag_worse(t["e"], t[res["e"]["from"]]) else "no harm seen"))
     return out
 
 
@@ -192,10 +190,9 @@ def diagnose(cfg, map_path, pb="", minutes=4.0):
         base.update(map=map_path, pb_file=pb or "", pb_seconds=0.0)
     elif pb:
         base["pb_file"] = pb
-    base.update(algo="ppo", run_type="map", time_limit_min=0, stop_at_pb=False, resume=True,
-                w_novel=0.0, w_known=0.0, w_focus=0.0, reward_v=4)
+    base.update(algo="ppo", run_type="map", time_limit_min=0, stop_at_pb=False, resume=True, reward_v=5)
     secs = float(os.environ.get("TMAI_DIAG_S") or minutes * 60.0)
-    say(f"Diagnose: {len(DIAG_TRIALS) + 1} PPO trials of {secs / 60:.1f} min on {base['map']} "
+    say(f"Diagnose: {len(DIAG_TRIALS)} PPO trials of {secs / 60:.1f} min on {base['map']} "
         f"({base['envs']} cars, {base['ticks_per_step'] * 10} ms per step) ...")
     res = {}
 
@@ -234,9 +231,6 @@ def diagnose(cfg, map_path, pb="", minutes=4.0):
     for key, label, over in DIAG_TRIALS:
         trial(key, label, over)
     best = max("abcd", key=lambda k: _diag_score(res[k]["metrics"]))
-    nov = {k: cfgmod.WEIGHTS[k][0] for k in ("w_novel", "w_known", "w_focus")}
-    trial("e", f"{res[best]['label']} + novelty defaults", dict(res[best]["settings"], **nov))
-    res["e"]["from"] = best
     verdict = diag_verdict(res)
     report = {"t": time.time(), "map": base["map"], "pb_file": base.get("pb_file"), "minutes": round(secs / 60, 2),
               "ticks_per_step": base["ticks_per_step"], "cars": base["envs"], "trials": res, "best": best,

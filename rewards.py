@@ -23,21 +23,28 @@ from common import *  # noqa: F401,F403
 from common import _f, _cp_cuts, _wp_kind, _vocab_load, _VOCAB, _hang_file, _HANG, _P  # noqa: F401
 
 
-def freeze_preset(cfg, run_dir):
-    """A NEW run (no model yet) with reward_preset "minimal" gets rewards.json with the MINIMAL weights; the cars use
-    them instead of the settings. Existing runs are never changed."""
-    run_dir = Path(run_dir)
-    f = run_dir / "rewards.json"
-    if f.exists():
-        d = read_json(f)
-        say(f"This run uses the '{d.get('preset')}' reward preset (rewards.json); weight changes in Settings don't "
-            "apply to it.")
+def reward_notice(run_dir):
+    """Log once at the start which reward weights this run uses: frozen ones (rewards.json) + any legacy terms on."""
+    w = run_rewards(run_dir)
+    if not w:
+        say("Rewards: " + ", ".join(f"{k} {float(v):g}" for k, v in sorted(_settings_weights().items()) if float(v))
+            + " (Settings).")
         return
-    has_model = any((run_dir / n).exists() for n in ("latest.zip", "champion.zip", "latest.pt", "latest.prev.pt",
-                                                     "champion.pt"))
-    if cfg.get("reward_preset") == "minimal" and cfg.get("run_type") != "base" and not has_model:
-        write_json(f, {"preset": "minimal", "weights": dict(cfgmod.MINIMAL), "t": time.time()})
-        say("New run: minimal reward preset (progress, time, finish, checkpoint, give-up cost) frozen in rewards.json.")
+    d = read_json(Path(run_dir) / "rewards.json")
+    legacy = [f"{k} {float(w[k]):g}" for k in cfgmod.LEGACY_TERMS if float(w.get(k, 0) or 0)]
+    say(f"Rewards: this run keeps its saved weights ({d.get('preset') or 'rewards.json'}; Settings changes don't "
+        "apply to it). Legacy terms active: " + (", ".join(legacy) if legacy else "none") + ".")
+
+
+def _settings_weights():
+    c = read_json(cfgmod.CONFIG_PATH)
+    return {k: c.get(k, d) for k, (d, _, _) in cfgmod.WEIGHTS.items()}
+
+
+def uses_coverage(run_dir):
+    """Only the legacy novelty / known / focus terms need the coverage counts."""
+    w = run_rewards(run_dir) or {}
+    return any(float(w.get(k, 0) or 0) for k in ("w_novel", "w_known", "w_focus"))
 
 
 def champion_ghost(env, run_dir, ms, log=None):
@@ -114,7 +121,8 @@ class Coverage:
     def __init__(self, cfg, run_dir):
         self.cfg, self.dir = cfg, Path(run_dir)
         self.file = self.dir / "coverage.json"
-        self.L, self.tau = max(5.0, float(cfg.get("cov_len", 25))), max(1.0, float(cfg.get("cov_passes", 100)))
+        lg = run_rewards(run_dir) or {}
+        self.L, self.tau = max(5.0, float(lg.get("cov_len", 25))), max(1.0, float(lg.get("cov_passes", 100)))
         d = read_json(self.file)
         if d and abs(float(d.get("len", 0)) - self.L) > 1e-6:
             say(f"Coverage: stretch length changed ({d.get('len')} -> {self.L:g} m), starting a new count.")
@@ -132,7 +140,7 @@ class Coverage:
     def wks(self):
         """Per stretch: scale for w_known so that on a fully known stretch, progress pay at the AI's own median speed
         there still beats the time cost (with 10 % margin). Logged once per stretch."""
-        W = read_json(cfgmod.CONFIG_PATH)
+        W = run_rewards(self.dir) or read_json(cfgmod.CONFIG_PATH)
         def w(k):
             try:
                 return float(W.get(k, self.cfg.get(k, 0.0)))

@@ -199,24 +199,12 @@ const I={step:1}, F={
  time_limit_min:['Time limit (min)','Stop after N minutes. 0 = until stopped.','number',{min:0,max:100000,...I}],
  max_lap_seconds:['Max lap (s)','Hard time limit per training lap.','number',{min:5,max:3600,...I}],
  w_progress:['Progress','','w',{group:'Core'}], w_time:['Time','','w',{group:'Core'}], w_finish:['Finish','','w',{group:'Core'}],
- w_finish_time:['Finish speed','','w',{group:'Core'}], w_checkpoint:['Checkpoint','','w',{group:'Core'}],
- ghost_weight:['Ghost','','w',{group:'Ghost & target line'}],
- ghost_window_s:['Ghost window (s)','Ghost reward counts only within this far behind the ghost.','number',{min:0,max:60,step:'any',live:1,group:'Ghost & target line'}],
- w_guide:['Pull to line','','w',{group:'Ghost & target line'}],
- vcp_every_s:['Virtual CP every (s)','Virtual checkpoints every N s of the PB / ghost pace. 0 = off.','number',{min:0,max:120,step:'any',group:'Ghost & target line'}],
- w_vcp:['Virtual CP bonus','','w',{group:'Ghost & target line'}], w_vsplit:['Virtual CP split','','w',{group:'Ghost & target line'}],
- w_crash:['Crash','','w',{group:'Penalties'}], w_hit:['Wall hit','','w',{group:'Penalties'}],
- w_hit_ramp:['Wall-hit ramp-in','Wall-hit penalty at 25 % while under 30 % of laps finish, 100 % from 60 % (then for good).','checkbox',{group:'Penalties'}],
- w_stuck:['Stuck','','w',{group:'Penalties'}], w_offzone:['Off-zone','','w',{group:'Penalties'}],
- w_release:['Pointless release','','w',{group:'Driving style',more:1}], w_coast:['Coast','','w',{group:'Driving style',more:1}],
- w_brake:['Brake','','w',{group:'Driving style',more:1}], w_steer_smooth:['Smooth steering','','w',{group:'Driving style',more:1}],
- w_slip:['Slip','','w',{group:'Driving style',more:1}], w_air:['Airtime','','w',{group:'Driving style',more:1}],
- w_speed:['Speed','','w',{group:'Driving style',more:1}],
- reward_preset:['Reward preset for new runs','Minimal = only progress, time, finish, checkpoint and the give-up cost. Frozen into a run when it starts from scratch (rewards.json); existing runs keep their rewards. Settings = the weights below.','select',{opts:[['custom','Settings (weights below)'],['minimal','Minimal']]}],
- w_novel:['Novelty bonus','','w',{group:'Novelty & speed focus'}], w_known:['Known-stretch cut','','w',{group:'Novelty & speed focus',min:0,max:0.5}],
- w_focus:['Speed focus','','w',{group:'Novelty & speed focus'}],
- cov_len:['Stretch length (m)','Track is cut into stretches of this length; each counts how often laps got all the way through it. At start.','number',{group:'Novelty & speed focus',more:1,min:5,max:200,step:1}],
- cov_passes:['Passes to know a stretch','After this many full passes a stretch is 63 % known (less progress pay, more ghost-time pay). At start.','number',{group:'Novelty & speed focus',more:1,min:1,step:1}], w_wall:['Wall scrape','','w',{group:'Driving style',more:1}],
+ w_checkpoint:['Checkpoint','','w',{group:'Core'}],
+ w_stuck:['Stuck','','w',{group:'Core'}], w_offzone:['Off-zone','','w',{group:'Core'}],
+ ghost_weight:['Ghost','','w',{group:'Optional extras'}],
+ ghost_window_s:['Ghost window (s)','Ghost reward counts only within this far behind the ghost.','number',{min:0,max:60,step:'any',live:1,group:'Optional extras'}],
+ w_hit:['Wall hit','','w',{group:'Optional extras'}],
+ w_hit_ramp:['Wall-hit ramp-in','Wall-hit penalty at 25 % while under 30 % of laps finish, 100 % from 60 % (then for good).','checkbox',{group:'Optional extras'}],
  test_every_laps:['Test every N laps','Champion test after this many training laps (only after the first finished lap).','number',{min:1,max:100000,...I}],
  test_tries:['Tries','Champion test = best of N laps (most likely actions + seeded ones).','number',{min:1,max:20,...I}],
  test_tries_close:['Tries near PB','Best of N once the champion is within the margin below of your PB.','number',{min:1,max:50,...I}],
@@ -273,8 +261,7 @@ const I={step:1}, F={
 const SECTIONS=[
  ['run','Run & map',['run','run_type','map','pb_seconds','pb_file','resume','base_from']],
  ['cars','Cars & speed',['envs','ticks_per_step','time_limit_min','max_lap_seconds','lidar_every']],
- ['rew','Rewards',['w_progress','w_time','w_finish','w_finish_time','w_checkpoint','ghost_weight','ghost_window_s','w_guide','vcp_every_s','w_vcp','w_vsplit',
-   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall','w_novel','w_known','w_focus','cov_len','cov_passes','reward_preset']],
+ ['rew','Rewards',['w_progress','w_time','w_checkpoint','w_finish','w_stuck','w_offzone','ghost_weight','ghost_window_s','w_hit','w_hit_ramp']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
  ['line','Track & line',['line_refresh_s','mid_start_p','start_focus','mid_start_every_s','sec_fallback','cut_behind_s']],
  ['learn','Learning (PPO)',['horizon_s','decay_steps','obs_norm','analog_steer','gas_brake','sil_weight','aux_weight']],
@@ -283,7 +270,7 @@ const SECTIONS=[
  ['note','Notifications',['discord_webhook','discord_every_min']],
  ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_per','iqn_rollback','iqn_device','reward_v']],
 ];
-let DEF={}, BASE={}, WMETA=[], LEAN={}, LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
+let DEF={}, BASE={}, WMETA=[], LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
 const meta=k=>{const f=F[k]||[k,'','text'];return {k,label:f[0],hint:f[1],type:f[2],o:f[3]||{}}};
 const isLive=m=>m.type=='w'||m.o.live;
 function hintOf(m){ let h=m.hint; if(m.type=='w'){const w=WMETA.find(x=>x.k==m.k); h=w?w.hint:''} return h }
@@ -306,7 +293,7 @@ function sectionHtml([id,title,keys],c){
   const ms=keys.map(meta), main=ms.filter(m=>!m.o.more), more=ms.filter(m=>m.o.more);
   const groups=list=>{ if(id!='rew') return `<div class="fg">${list.map(m=>fieldHtml(m,c)).join('')}</div>`;
     const gs=[...new Set(list.map(m=>m.o.group))]; return gs.map(g=>`<div class="sub2">${esc(g)}</div><div class="fg">${list.filter(m=>m.o.group==g).map(m=>fieldHtml(m,c)).join('')}</div>`).join('') };
-  const extra={rew:`<div class="acts" style="margin-bottom:6px"><button type="button" class="sm" id="bLean">Lean preset</button><button type="button" class="sm" id="bLs">Linesight preset</button><button type="button" class="sm" id="bMin" title="Progress, time, finish, checkpoint and the give-up cost only; everything else 0. Applies to runs started from scratch from now on (frozen in their rewards.json); existing runs keep their rewards.">Use minimal rewards</button><button type="button" class="sm" id="bReset">Reset weights</button><span class="mut" id="preMsg"></span></div>`,
+  const extra={rew:`<div class="acts" style="margin-bottom:6px"><button type="button" class="sm" id="bLs">Linesight preset</button><button type="button" class="sm" id="bReset" title="Progress, time, checkpoint, finish and the give-up cost; ghost and wall hit off.">Reset to minimal</button><span class="mut" id="preMsg"></span><div class="mut" style="margin-top:4px">Runs started before the reward simplification keep their saved weights (their rewards.json); these settings apply to new runs.</div></div>`,
     cars:`<div class="flex" style="margin-top:10px"><span class="mut">Not sure how many cars? The benchmark tries 6/8/10/12.</span><button type="button" class="sm" id="bBench2">Benchmark cars</button></div>`,
     note:`<div class="flex" style="margin-top:10px"><span class="mut" id="dcMsg"></span><button type="button" class="sm" id="bDc">Send test</button></div>`}[id]||'';
   const nl=ms.filter(isLive).length, when=nl==ms.length?'all changes apply live (next lap)':nl?'apply at the next Start · <span class="tag live">live</span> = next lap':'changes apply at the next Start';
@@ -326,10 +313,8 @@ function fillForm(c){
   $('f_map').addEventListener('change',()=>{const m=$('f_map').value.trim().toLowerCase(), r=RUNS.find(x=>(x.map||'').toLowerCase()==m);
     if(r){$('f_run').value=r.name; runInfo(); onEdit()}});
   $('f_run').addEventListener('input',runInfo); runInfo();
-  $('bLean').onclick=()=>preset(LEAN,'Lean preset filled in - press Save.');
   $('bLs').onclick=()=>preset(LINES,'Linesight preset filled in - press Save.');
-  $('bMin').onclick=()=>{ $('f_reward_preset').value='minimal'; $('preMsg').textContent='Minimal rewards chosen for NEW runs (existing runs keep theirs) - press Save. Set "Reward preset for new runs" back to "Settings" to undo.'; onEdit() };
-  $('bReset').onclick=()=>preset(Object.fromEntries(WMETA.map(m=>[m.k,m.default])),'Default weights filled in - press Save.');
+  $('bReset').onclick=()=>preset(Object.fromEntries(WMETA.map(m=>[m.k,m.default])),'Minimal weights filled in - press Save.');
   $('bBench2').onclick=()=>$('bBench').click();
   $('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('dcMsg').textContent=j.message};
   onEdit(); search();
@@ -532,7 +517,7 @@ let S_LAST=null;
 function hitTxt(s){ const h=s&&s.hit_ramp; if(!h||!s.config.w_hit) return '';
   return `Wall-hit penalty at <b>${Math.round(h.factor*100)}%</b> ${h.on===false?'(ramp off)':h.reached?'(reached 60% finished: stays at 100%)':`(finish rate ${Math.round(h.rate*100)}% of the last 100 laps; 100% from 60%)`}<br>` }
 function render(s){ S_LAST=s;
-  const c=s.config; LEAN=s.lean||LEAN; LINES=s.linesight||LINES;
+  const c=s.config; LINES=s.linesight||LINES;
   if(!cfgLoaded){ DEF=s.defaults||Object.assign({},c);   /* never empty: an empty DEF would save an empty config */ WMETA=s.weights||[]; BASE=c; fillForm(c); cfgLoaded=true }
   drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;

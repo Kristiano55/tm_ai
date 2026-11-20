@@ -580,13 +580,13 @@ def train(cfg):
     cfg = layout_cfg(cfg, run_dir)
     T.say(f"IQN: {cfg['_iqn_levels']} steering levels x {cfg['_iqn_modes']} throttle modes"
           + (" (gas+brake on)" if cfg["_iqn_modes"] == 4 else ""))
-    T.freeze_preset(cfg, run_dir)
+    T.reward_notice(run_dir)
     pool = T.CarPool(cfg, run_dir, n_env)                     # cars in their own processes, not in lock-step
     dim, nvec = pool.dim, pool.nvec
     n_act = int(nvec[0] * nvec[1])
     n_in = dim + 1
     H = max(N_STEP + 1, int(round(cfg["minirace_s"] * 100 / cfg["ticks_per_step"])))      # mini-race, in steps
-    time_cost = cfg["w_time"] * cfg["ticks_per_step"] / 5.0
+    time_cost = float((T.run_rewards(run_dir) or cfg).get("w_time", cfg["w_time"])) * cfg["ticks_per_step"] / 5.0
     EPS_PTS = eps_points(cfg)
 
     ctx = mp.get_context("spawn")

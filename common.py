@@ -263,6 +263,23 @@ def atomic_save(path, write, backup=True):
     os.replace(tmp, path)
 
 
+def run_rewards(run_dir):
+    """The run's frozen reward weights (rewards.json in its folder or a parent folder up to runs/: base maps, pool
+    maps and transfer tests share their run's file), or None = the weights in Settings."""
+    if not run_dir:
+        return None
+    d, top = Path(run_dir).resolve(), (cfgmod.ROOT / "runs").resolve()
+    while True:
+        f = d / "rewards.json"
+        if f.exists():
+            w = read_json(f).get("weights")
+            if w:
+                return w
+        if d == top or d.parent == d or top not in d.parents:
+            return None
+        d = d.parent
+
+
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
