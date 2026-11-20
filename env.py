@@ -194,6 +194,8 @@ class TMEnv(gym.Env):
         self.mid_p = float(cfg["iqn_mid_start_p" if self.iqn else "mid_start_p"]) if role == "training" else 0.0
         self.mid_every = max(20, int(cfg["mid_start_every_s"] * 100 / cfg["ticks_per_step"]))
         self.starts, self.fails, self._ca_m, self.start_i, self.acts = [], np.zeros(0), "unset", None, []
+        self.start_focus = float(cfg.get("start_focus", 0.5))
+        self.tloss, self._seg_k, self._seg_phi = np.zeros(0), None, 0.0
         self._starts_line = "unset"
         self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
         self.cprof, self._cprof_key = None, None
@@ -401,11 +403,32 @@ class TMEnv(gym.Env):
         save_npy(f, seg)
 
     def _pick_start(self):
-        """Mostly the sections where laps fail; every section keeps some chance."""
-        w = 1.0 + self.fails
-        i = int(self.np_random.choice(len(self.starts), p=w / w.sum()))
+        """start_focus (0.5) of the picks go where laps fail (fails) or lose time to the ghost (tloss), half each
+        when both are known; the rest uniform, so every start keeps some chance."""
+        n, f = len(self.starts), self.start_focus
+        if len(self.tloss) != n:
+            self.tloss = np.zeros(n)
+        parts = [w / w.sum() for w in (self.fails, self.tloss) if len(w) == n and w.sum() > 0]
+        focus = np.mean(parts, axis=0) if parts else np.full(n, 1.0 / n)
+        p = (1.0 - f) / n + f * focus
+        i = int(self.np_random.choice(n, p=p / p.sum()))
         self.fails *= 0.995
+        self.tloss *= 0.995
         return i
+
+    def _track_loss(self, s, phi):
+        """Time lost to the ghost between consecutive start points (per start point, smoothed): where to start more."""
+        ss = np.array([st.get("s", np.nan) for st in self.starts], dtype=np.float64)
+        if len(self.tloss) != len(ss):
+            self.tloss = np.zeros(len(ss))
+        ok = np.where(ss <= s, ss, -np.inf)
+        k = int(np.argmax(ok)) if np.isfinite(ok).any() else -1
+        if k == self._seg_k:
+            return
+        if self._seg_k is not None and self._seg_k >= 0 and k >= 0 and ss[k] > ss[self._seg_k]:
+            lost = max(0.0, self._seg_phi - phi)                  # seconds lost to the ghost in that stretch
+            self.tloss[self._seg_k] = 0.8 * self.tloss[self._seg_k] + 0.2 * min(lost, 5.0)
+        self._seg_k, self._seg_phi = k, phi
 
     def _blame(self, s, failed):
         """Credit a failed lap to the start point just before where it ended."""
@@ -838,6 +861,7 @@ class TMEnv(gym.Env):
         self.start_i, self.acts = None, []
         self.rsum, self.rsteps = {}, 0
         self.cov_spd = {}
+        self._seg_k, self._seg_phi = None, 0.0
         self.ast = np.zeros(9)      # this lap: steps per throttle mode (4), sum |steer|/127, full-lock steps, speed, n, max m
         if self.starts and self.np_random.random() < self.mid_p:
             try:
@@ -896,6 +920,8 @@ class TMEnv(gym.Env):
         dp = s - self._s                      # _s = progress already paid; a skipped stretch is paid at
         dp = min(dp, 10.0) if dp >= 0 else max(dp, -10.0)   # <= 10 m per step, a backward jump costs once
         r, phi, kn, ck = RW.step_terms(self, r, t, pos, s, dp, speed, steer, mode, taken, tick)   # all per-step terms
+        if self.starts and self.prof is not None and self.mid_p > 0:
+            self._track_loss(s, phi)
         tf = self.tf
         self.prev_speed = speed
         self._s = self._s + dp if s >= self._s else s

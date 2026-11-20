@@ -225,6 +225,9 @@ const I={step:1}, F={
  rollback_margin_s:['Bad test margin (s)','A test counts as bad if slower than the champion by this much.','number',{min:0,max:60,step:'any',more:1}],
  stop_at_pb:['Stop at PB','Stop training when the champion beats your PB.','checkbox'],
  line_refresh_s:['Line refresh (s)','Rebuild the reference line + ghost when the champion beats it by this much. 0 = never.','number',{min:0,max:60,step:'any'}],
+ start_focus:['Mid-start focus','Share of mid-track starts placed where laps fail or lose time to the ghost; the rest are spread evenly. 0 = all even, 1 = all focused.','number',{min:0,max:1,step:0.05}],
+ obs_norm:['Input normalisation','PPO + IQN: inputs scaled by their running average/spread (clipped at 5). Saved with the run; older runs start at "no scaling" and blend in slowly.','checkbox',{more:1}],
+ iqn_per:['Prioritized replay (IQN)','IQN: replays surprising experiences more often (alpha 0.6, beta 0.4 -> 1). NEW IQN runs only; existing IQN runs keep uniform sampling.','checkbox',{iqn:1}],
  mid_start_p:['Mid-track starts','Share of laps that start partway along the champion lap (after the first finish). 0 = off.','number',{min:0,max:1,step:0.05}],
  mid_start_every_s:['Start spacing (s)','Mid-track start points every N s of the champion lap.','number',{min:0.5,max:60,step:'any'}],
  sec_fallback:['Section fallback','With a PB/WR line: where most laps fail, chase the AI\'s own route in that section.','checkbox'],
@@ -273,12 +276,12 @@ const SECTIONS=[
  ['rew','Rewards',['w_progress','w_time','w_finish','w_finish_time','w_checkpoint','ghost_weight','ghost_window_s','w_guide','vcp_every_s','w_vcp','w_vsplit',
    'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall','w_novel','w_known','w_focus','cov_len','cov_passes','reward_preset']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
- ['line','Track & line',['line_refresh_s','mid_start_p','mid_start_every_s','sec_fallback','cut_behind_s']],
- ['learn','Learning (PPO)',['horizon_s','decay_steps','analog_steer','gas_brake','sil_weight','aux_weight']],
+ ['line','Track & line',['line_refresh_s','mid_start_p','start_focus','mid_start_every_s','sec_fallback','cut_behind_s']],
+ ['learn','Learning (PPO)',['horizon_s','decay_steps','obs_norm','analog_steer','gas_brake','sil_weight','aux_weight']],
  ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
  ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
  ['note','Notifications',['discord_webhook','discord_every_min']],
- ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_rollback','iqn_device','reward_v']],
+ ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_per','iqn_rollback','iqn_device','reward_v']],
 ];
 let DEF={}, BASE={}, WMETA=[], LEAN={}, LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
 const meta=k=>{const f=F[k]||[k,'','text'];return {k,label:f[0],hint:f[1],type:f[2],o:f[3]||{}}};

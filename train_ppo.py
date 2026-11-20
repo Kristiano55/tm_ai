@@ -408,6 +408,11 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
         def _on_rollout_end(self):
             self.last_v = float(self.model.rollout_buffer.values.mean())
             self.ema_update()
+            if cfg.get("obs_norm", True) and hasattr(self.model.policy, "obs_norm"):
+                # input statistics of this rollout; applied at the next rollout START, so the stats a rollout was
+                # collected with are also the ones its PPO update uses (old log-probs stay valid)
+                ob = self.model.rollout_buffer.observations
+                self.norm_pending = np.asarray(ob, np.float32).reshape(-1, ob.shape[-1])
 
         def ema_update(self, reset=False):
             """Smoothed copy of the weights. Champion tests drive with it: steadier than the latest update."""
@@ -416,12 +421,15 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
                 self.ema = {k: v.detach().clone() for k, v in sd.items()}
                 return
             for k, v in sd.items():
-                if v.dtype.is_floating_point:
+                if v.dtype.is_floating_point and not k.startswith("obs_norm."):   # input stats: the current ones
                     self.ema[k].mul_(0.7).add_(v.detach(), alpha=0.3)
                 else:
                     self.ema[k] = v.detach().clone()
 
         def _on_rollout_start(self):
+            if getattr(self, "norm_pending", None) is not None:
+                self.model.policy.obs_norm.update(self.norm_pending)
+                self.norm_pending = None
             self.model.aux_rows = []                        # aux-head labels of this rollout, one row per step
             self.model.ret_scale = self._ret_scale()
             vn = self.model.get_vec_normalize_env()

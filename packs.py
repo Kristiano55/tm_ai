@@ -229,6 +229,11 @@ def build_model(man, files):
     sd = model.policy.state_dict()
     with np.load(io.BytesIO(files["model.npz"]), allow_pickle=False) as z:
         arrays = {k.replace("__", "."): z[k] for k in z.files}
+    missing = set(sd) - set(arrays)
+    if missing and all(k.startswith("obs_norm.") for k in missing):    # packs from before the input normaliser
+        from ppo_ext import ObsNorm
+        arrays.update({k: sd[k].cpu().numpy() for k in missing})
+        arrays["obs_norm.count"] = np.array(ObsNorm.PRIOR, np.float32)
     if set(arrays) != set(sd):
         raise pc.PackError("the pack's weights do not fit this version's network")
     vocab = json.loads(files["materials.json"]) if "materials.json" in files else {}
@@ -240,6 +245,8 @@ def build_model(man, files):
             raise pc.PackError(f"weight {k} contains NaN / inf")
         if a.ndim == 2 and a.shape[1] == mm["obs_dim"]:
             a = _remap_surface(a, vocab)
+        elif k in ("obs_norm.mean", "obs_norm.var") and a.shape == (mm["obs_dim"],):   # per-input stats follow too
+            a = _remap_surface(a[None, :], vocab)[0]
         sd[k] = torch.tensor(a, dtype=sd[k].dtype)
     model.policy.load_state_dict(sd)
     model.num_timesteps = int(mm.get("num_timesteps") or 0)

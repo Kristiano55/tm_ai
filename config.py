@@ -65,6 +65,9 @@ DEFAULTS = {
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
     "iqn_gas_brake": False,    # IQN: 4th throttle mode gas + brake (new IQN runs only: IQN checkpoints don't convert)
     "iqn_steer_levels": 21,    # IQN: 21 / 31 / 41 steering levels (new IQN runs only)
+    "obs_norm": True,          # PPO + IQN: inputs normalised by running mean/std (clipped +-5), saved with the run
+    "iqn_per": True,           # IQN: prioritized replay (alpha 0.6, beta 0.4 -> 1); new IQN runs only
+    "start_focus": 0.5,        # mid-track starts: share picked by where laps fail / lose time (rest uniform)
     "analog_steer": True,      # PPO: steering is one analog value -127..127 instead of 21 levels (IQN keeps levels)
     "gas_brake": True,         # PPO: 4th throttle mode = gas + brake held together (IQN keeps 3 modes)
     "sil_weight": 0.1,         # PPO: self-imitation from the AI's own top-20 laps (0 = off)
@@ -180,6 +183,7 @@ def coerce(cfg):
     if out["reward_preset"] not in ("custom", "minimal"):
         out["reward_preset"] = "custom"
     out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
+    out["start_focus"] = min(max(out["start_focus"], 0.0), 1.0)
     out["w_known"] = min(max(out["w_known"], 0.0), 0.5)
     out["cov_len"] = max(5.0, out["cov_len"])
     out["cov_passes"] = max(1.0, out["cov_passes"])

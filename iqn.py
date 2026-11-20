@@ -31,6 +31,9 @@ EMB = 64
 N_Q, K_Q = 8, 32          # quantiles per sample for the loss / for choosing actions
 KAPPA = 5e-3
 BATCH = 512
+PER_ALPHA, PER_EPS, PER_REFRESH = 0.6, 1e-3, 10      # prioritized replay (Schaul et al.)
+PER_BETA = [(0, 0.4), (3e6, 1.0)]                    # importance-sampling correction, annealed to 1 with the LR schedule
+NORM_EVERY = 10                                      # learner updates between input-statistics updates
 WARMUP = int(os.environ.get("TMAI_IQN_WARMUP", 20000))   # experiences before learning starts
 
 
@@ -54,10 +57,12 @@ class IQNNet(nn.Module):
         self.adv = nn.Sequential(nn.Linear(hid, hid), nn.LeakyReLU(), nn.Linear(hid, n_act))
         self.val = nn.Sequential(nn.Linear(hid, hid), nn.LeakyReLU(), nn.Linear(hid, 1))
         self.register_buffer("ipi", torch.arange(1, EMB + 1, dtype=torch.float32) * math.pi)
+        from ppo_ext import ObsNorm
+        self.norm = ObsNorm(n_in)                     # running input mean/std (pass-through until the first update)
 
     def forward(self, x, taus):                       # x [B, n_in], taus [B, N] -> quantiles [B, N, A]
         b, n = taus.shape
-        h = self.body(x)
+        h = self.body(self.norm(x))
         e = F.leaky_relu(self.phi(torch.cos(taus.unsqueeze(-1) * self.ipi)))
         z = (h.unsqueeze(1) * e).reshape(b * n, -1)
         a, v = self.adv(z), self.val(z)
@@ -77,16 +82,20 @@ class Replay:
         self.k = np.zeros(cap, np.int64)            # real steps in this sample (<= N_STEP)
         self.end = np.zeros(cap, np.int8)           # 0 = goes on, 1 = finished, 2 = failed (stuck/off-zone)
         self.c = np.zeros(cap, np.float32)          # time cost per step (charged for the rest of a failed race)
+        self.p = np.zeros(cap, np.float32)          # PER priority (already ^alpha); new samples get the max so far
+        self.pm = np.ones(1, np.float32)
 
     def add(self, o, a, rs, k, o2, end, c):
         j = self.i
         self.o[j], self.a[j], self.o2[j], self.k[j], self.end[j], self.c[j] = o, a, o2, k, end, c
         self.r[j] = 0.0
         self.r[j, :k] = rs
+        self.p[j] = self.pm[0]
         self.i, self.n = (j + 1) % self.cap, min(self.n + 1, self.cap)
 
-    def sample(self, b):
-        idx = np.random.randint(0, self.n, b)
+    def sample(self, b, idx=None):
+        if idx is None:
+            idx = np.random.randint(0, self.n, b)
         return (self.o[idx].astype(np.float32), self.a[idx], self.r[idx], self.k[idx], self.o2[idx].astype(np.float32),
                 self.end[idx], self.c[idx])
 
@@ -113,7 +122,29 @@ def layout_cfg(cfg, run_dir, quiet=False):
         T.say(f"IQN: this run keeps its layout ({lv} steering levels, {nm} throttle modes); the IQN steering levels / "
               "gas+brake settings only apply to new IQN runs (IQN checkpoints can't be converted).")
     NM[0] = nm
-    return dict(cfg, _iqn_levels=lv, _iqn_modes=nm)
+    per = bool(cfg.get("iqn_per", True))
+    if have:                                          # an existing run keeps its replay sampling (older runs: uniform)
+        per = bool(meta.get("per", False))
+    return dict(cfg, _iqn_levels=lv, _iqn_modes=nm, _iqn_per=per)
+
+
+def per_sample(p, cum, b, beta, rng):
+    """Prioritized replay: b indices with P(i) = p_i / sum p (stratified over the cumulative sum) and their
+    importance-sampling weights (n P(i))^-beta / max."""
+    nb, tot = len(cum), cum[-1]
+    u = (np.arange(b) + rng.rand(b)) * (tot / b)
+    idx = np.minimum(np.searchsorted(cum, u, side="right"), nb - 1)
+    pr = np.maximum(p[idx].astype(np.float64), 1e-12) / tot
+    w = (nb * pr) ** (-beta)
+    return idx, (w / w.max()).astype(np.float32)
+
+
+def load_net(net, sd):
+    """load_state_dict that accepts checkpoints from before the input normaliser (identity stats, PRIOR count)."""
+    from ppo_ext import norm_keys_missing
+    sd, old = norm_keys_missing(net, sd, "norm.")
+    net.load_state_dict(sd)
+    return old
 
 
 def with_tau(obs, tau_frac):
@@ -170,7 +201,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
         try:
             if env is None:
                 env = T.TMEnv(cfg, run_dir, shorten=False, role="champion test")
-            net.load_state_dict(msg["sd"])
+            load_net(net, msg["sd"])
             best_try = None
             for sd in [None] + [1000 + i for i in range(max(0, cfg["test_tries"] - 1))]:
                 rng = np.random.default_rng(sd)
@@ -289,7 +320,8 @@ class SharedReplay(Replay):
         from multiprocessing import shared_memory
         fields = [("o", (cap, dim), np.float16), ("o2", (cap, dim), np.float16), ("a", (cap,), np.int64),
                   ("r", (cap, N_STEP), np.float32), ("k", (cap,), np.int64), ("end", (cap,), np.int8),
-                  ("c", (cap,), np.float32), ("ctr", (2,), np.int64)]
+                  ("c", (cap,), np.float32), ("ctr", (2,), np.int64), ("p", (cap,), np.float32),
+                  ("pm", (1,), np.float32)]
         self.cap, self.shms, self.names, self.owner = cap, [], {}, names is None
         for f, shape, dt in fields:
             size = max(1, int(np.prod(shape)) * np.dtype(dt).itemsize)
@@ -299,12 +331,13 @@ class SharedReplay(Replay):
             setattr(self, f, np.ndarray(shape, dt, buffer=shm.buf))
         if self.owner:
             self.ctr[:] = 0
+            self.pm[:] = 1.0
 
     i = property(lambda self: int(self.ctr[0]), lambda self, v: self.ctr.__setitem__(0, v))
     n = property(lambda self: int(self.ctr[1]), lambda self, v: self.ctr.__setitem__(1, v))
 
     def close(self):
-        for f in ("o", "o2", "a", "r", "k", "end", "c", "ctr"):
+        for f in ("o", "o2", "a", "r", "k", "end", "c", "ctr", "p", "pm"):
             setattr(self, f, None)
         shms, self.shms = self.shms, []            # idempotent: unlink exactly once
         for shm in shms:
@@ -372,8 +405,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                     continue
                 try:
                     d = torch.load(src, map_location=dev)
-                    net.load_state_dict(d["net"])
-                    tgt.load_state_dict(d["tgt"])
+                    load_net(net, d["net"])
+                    load_net(tgt, d["tgt"])
                     opt.load_state_dict(d["opt"])
                     steps0 = int(d.get("steps", 0))
                     T.say(f"Resumed IQN from {src.name} ({steps0:,} steps)" + (
@@ -392,8 +425,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
               and meta.get("n_act") == n_act):
             try:                                            # latest.pt missing: continue from the champion
                 sd = torch.load(run_dir / "champion.pt", map_location=dev)
-                net.load_state_dict(sd)
-                tgt.load_state_dict(sd)
+                load_net(net, sd)
+                load_net(tgt, sd)
                 T.say("!" * 12 + " Resumed IQN from champion.pt because latest.pt is missing " + "!" * 12)
             except Exception as e:
                 T.say("!" * 12 + f" STARTING FROM SCRATCH because champion.pt could not be loaded ({str(e)[:80]}) "
@@ -404,7 +437,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 T.say("!" * 12 + " STARTING FROM SCRATCH because 'Resume from latest checkpoint' is off " + "!" * 12)
             tgt.load_state_dict(net.state_dict())
         T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act, "levels": int(cfg.get("_iqn_levels") or 21),
-                                            "modes": int(cfg.get("_iqn_modes") or 3)})
+                                            "modes": int(cfg.get("_iqn_modes") or 3),
+                                            "per": bool(cfg.get("_iqn_per", False))})
         ctr[0], ctr[1], ctr[2] = steps0, max(0, steps0 - WARMUP) * cfg["iqn_reuse"], 0
         buf = SharedReplay(cfg["iqn_buffer"], dim, names=rnames)
         wnp = np.frombuffer(wbuf, dtype=np.float32)
@@ -424,6 +458,9 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
         publish()
         ready_evt.set()
         last_save = last_chk = time.time()
+        per, cum, norm_on = bool(cfg.get("_iqn_per")), None, bool(cfg.get("obs_norm", True))
+        T.say("IQN: prioritized replay " + ("on (alpha 0.6, beta 0.4 -> 1)" if per else "off (uniform sampling)")
+              + ", input normalisation " + ("on" if norm_on else "off"))
         while not stop_evt.is_set():
             now = time.time()
             if now - last_chk > 2.0:
@@ -431,8 +468,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 if (run_dir / "ROLLBACK").exists():
                     try:
                         sd = torch.load(run_dir / "champion.pt", map_location=dev)
-                        net.load_state_dict(sd)
-                        tgt.load_state_dict(sd)
+                        load_net(net, sd)
+                        load_net(tgt, sd)
                         publish()
                     except Exception as e:
                         T.say(f"Rollback failed ({str(e)[:60]})")
@@ -446,8 +483,15 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
                 continue
             b0 = time.perf_counter()
             gamma = sched(GAMMA, steps)
+            idx = isw = None
+            if per:                                                     # prioritized replay: P(i) ~ p_i (= |TD|^alpha)
+                nb = buf.n
+                if cum is None or ctr[2] % PER_REFRESH == 0 or len(cum) != nb:
+                    cum = np.cumsum(buf.p[:nb], dtype=np.float64)       # refreshed every few updates (cheap enough)
+                idx, w = per_sample(buf.p, cum, BATCH, sched(PER_BETA, steps), np.random)
+                isw = torch.from_numpy(w).to(dev)
             with rlock:
-                o, ac, r, k, o2, end, c = buf.sample(BATCH)
+                o, ac, r, k, o2, end, c = buf.sample(BATCH, idx)
             tau = np.random.randint(1, H + 1, BATCH)                  # time left in this sample's mini-race
             m = np.minimum(k, tau)
             disc = gamma ** np.arange(N_STEP)
@@ -470,11 +514,19 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
             z = net(x, taus).gather(2, torch.from_numpy(ac).to(dev)[:, None, None].expand(-1, N_Q, 1)).squeeze(2)
             td = tgt_z[:, None, :] - z[:, :, None]
             hub = torch.where(td.abs() <= KAPPA, 0.5 * td ** 2 / KAPPA, td.abs() - 0.5 * KAPPA)
-            loss = ((taus[:, :, None] - (td.detach() < 0).float()).abs() * hub).sum(1).mean()
+            sample_loss = ((taus[:, :, None] - (td.detach() < 0).float()).abs() * hub).sum(1).mean(1)
+            loss = (sample_loss * isw).mean() if isw is not None else sample_loss.mean()
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 30.0)
             opt.step()
+            if per:                                                     # new priorities: mean |TD| of each sample
+                pn = (td.detach().abs().mean((1, 2)).cpu().numpy().astype(np.float64) + PER_EPS) ** PER_ALPHA
+                buf.p[idx] = pn.astype(np.float32)
+                buf.pm[0] = max(float(buf.pm[0]), float(pn.max()))
+            if norm_on and ctr[2] % NORM_EVERY == 0:                   # input statistics from replay samples
+                net.norm.update(x)
+                tgt.norm.load_state_dict(net.norm.state_dict())
             ctr[1] += BATCH
             ctr[2] += 1
             if ctr[2] % 4 == 0:                                        # soft target update
@@ -790,7 +842,7 @@ def drive(cfg):
     T.say("No recorded champion lap (champion_actions.json): driving the champion network instead.")
     meta = T.read_json(run_dir / "iqn.json")
     net = IQNNet(meta["n_in"], meta["n_act"])
-    net.load_state_dict(torch.load(run_dir / "champion.pt", map_location="cpu"))
+    load_net(net, torch.load(run_dir / "champion.pt", map_location="cpu"))
     sd = T.read_json(run_dir / "best.json").get("champion_seed")
     rng = np.random.default_rng(sd)
     torch.manual_seed(0 if sd is None else sd)

@@ -23,6 +23,55 @@ AUX_HIT_S, AUX_GROUND_S, AUX_CP_CAP_S = 0.5, 0.3, 10.0
 SIL_LAPS, SIL_BATCH, EXTRA_STEPS, AUX_BATCH = 20, 256, 4, 512
 
 
+class ObsNorm(nn.Module):
+    """Running mean/std of the inputs, clipped to +-CLIP, INSIDE the network (buffers in the state dict): saved with the
+    run, carried by the EMA / tester weights, packs and IQN's flat weight copies. Pass-through (exactly the raw inputs)
+    until the first update(). Runs converted from before get count = PRIOR at identity, so their stats move in slowly
+    (behaviour unchanged on resume). Used by PPO (PrivPolicy) and IQN (IQNNet)."""
+    CLIP, MIN_STD, PRIOR = 5.0, 0.1, 2e5
+
+    def __init__(self, n):
+        super().__init__()
+        self.register_buffer("mean", th.zeros(n))
+        self.register_buffer("var", th.ones(n))
+        self.register_buffer("count", th.zeros(()))
+        self.register_buffer("active", th.zeros(()))
+
+    def forward(self, x):
+        if float(self.active) <= 0:
+            return x
+        return ((x - self.mean) / self.var.sqrt().clamp(min=self.MIN_STD)).clamp(-self.CLIP, self.CLIP)
+
+    @th.no_grad()
+    def update(self, x):
+        """x [N, n] raw inputs (numpy or tensor): parallel Welford update."""
+        x = th.as_tensor(np.asarray(x, np.float32) if not th.is_tensor(x) else x, dtype=th.float32,
+                         device=self.mean.device).reshape(-1, self.mean.shape[0])
+        nb = float(x.shape[0])
+        if nb < 2:
+            return
+        bm, bv = x.mean(0), x.var(0, unbiased=False)
+        n0 = float(self.count)
+        tot = n0 + nb
+        d = bm - self.mean
+        self.mean.add_(d * nb / tot)
+        self.var.copy_((self.var * n0 + bv * nb + d * d * n0 * nb / tot) / tot)
+        self.count.fill_(tot)
+        self.active.fill_(1.0)
+
+
+def norm_keys_missing(module, sd, prefix):
+    """Fill a state dict from before ObsNorm existed: identity stats with a PRIOR count (moves in slowly)."""
+    sd = dict(sd)
+    keys = [k for k in module.state_dict() if k.startswith(prefix)]
+    if keys and not any(k in sd for k in keys):
+        for k in keys:
+            sd[k] = module.state_dict()[k].clone()
+        sd[prefix + "count"] = th.tensor(ObsNorm.PRIOR)
+        return sd, True
+    return sd, False
+
+
 class MaskedMlpExtractor(MlpExtractor):
     def __init__(self, *a, n_priv=N_PRIV, **k):
         super().__init__(*a, **k)
@@ -35,7 +84,17 @@ class MaskedMlpExtractor(MlpExtractor):
 
 
 class PrivPolicy(ActorCriticPolicy):
+    def load_state_dict(self, state_dict, *a, **k):
+        """Models saved before ObsNorm: identity stats with a PRIOR count are filled in (same behaviour on resume)."""
+        sd, _ = norm_keys_missing(self, state_dict, "obs_norm.")
+        return super().load_state_dict(sd, *a, **k)
+
+    def extract_features(self, obs, features_extractor=None):
+        on = getattr(self, "obs_norm", None)
+        return super().extract_features(on(obs) if on is not None else obs, features_extractor)
+
     def _build_mlp_extractor(self):
+        self.obs_norm = ObsNorm(int(np.prod(self.observation_space.shape)))
         self.mlp_extractor = MaskedMlpExtractor(self.features_dim, net_arch=self.net_arch,
                                                 activation_fn=self.activation_fn, device=self.device)
         self.aux_head = nn.Linear(self.mlp_extractor.latent_dim_pi, 3)     # hit / grounded logits, CP time

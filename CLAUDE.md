@@ -178,6 +178,21 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   All route points of a step are interpolated in one batch (`_route_points`, `to_car_frame_many`): ~5x faster obs.
   **New features must be appended at the end of the non-lidar block** so `migrate()` / `widen_columns()` can
   convert old PPO checkpoints (new input weights start at 0 = same behaviour). IQN checkpoints don't convert.
+- **Input normalisation** (`obs_norm`, default on, PPO + IQN): `ppo_ext.ObsNorm` = buffers mean/var/count/active INSIDE
+  the network (PrivPolicy.obs_norm before the features; IQNNet.norm on obs + time-left), so it is saved with the run
+  and travels with EMA/tester weights, IQN's flat weight copies, packs (+ surface remap of mean/var) and the IQN warm
+  start. (x - mean) / max(std, 0.1), clipped +-5; pass-through (exact raw inputs) until the first update. Models /
+  checkpoints / packs from before get identity stats with count = `ObsNorm.PRIOR` (2e5) via `norm_keys_missing`
+  (PrivPolicy.load_state_dict override, `iqn.load_net`): identical behaviour on resume (byte-identical probe), stats
+  blend in slowly. PPO: rollout obs stashed at rollout end, applied at the next rollout START (stats constant within
+  collect + update); EMA copies the stats exactly. IQN: learner updates from the replay batch every `NORM_EVERY` (10)
+  updates, tgt gets the same stats.
+- **IQN prioritized replay** (`iqn_per`, default on, NEW IQN runs only: iqn.json `per`; runs from before keep
+  uniform): replay field `p` (= (|TD| + 1e-3)^0.6, new samples get the max `pm`), stratified sampling over a cumsum
+  refreshed every 10 updates (`per_sample`), IS weights (n P)^-beta / max with beta 0.4 -> 1 over 3M steps
+  (`PER_BETA`), per-sample quantile loss weighted. Logged at learner start.
+- **Mid-start focus** (`start_focus` 0.5): `_pick_start` p = (1 - f)/n + f x mean(normalised fails, normalised
+  `tloss`); `tloss` = smoothed seconds lost to the ghost between consecutive start points (`_track_loss`, per car).
 - **Privileged critic inputs** (PPO, `N_PRIV` = 6, AFTER the lidar): ghost time left, PB time left, m to next CP, m to
   finish, ghost gap, section failure rate. Actor sees 0 (`MaskedMlpExtractor`), so first actions stay identical.
 - **Self-imitation** (`sil_weight` 0.1): top-20 finished full laps per map (obs f16, action, RAW reward) in
