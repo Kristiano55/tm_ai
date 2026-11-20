@@ -63,6 +63,7 @@ class Store:
         self.laps, self.tests, self.upds = [], [], []     # laps: (lap number, ms) of full laps only
         self.n_all, self.n_mid = 0, 0
         self.rbs, self.ends = [], []
+        self.targets = []                                    # reward target changes: ghost rebuilds, section switches
         self.sess_t0, self.sess_lap0, self.last_t = None, 0, None
         self.prof = None
         self.map_laps, self.map_n, self.map_tests = {}, {}, {}
@@ -116,6 +117,9 @@ class Store:
                 self.tests.append(e)
                 if e.get("map"):
                     self.map_tests[e["map"]] = self.map_tests.get(e["map"], 0) + 1
+            elif k in ("target", "section") and not e.get("map"):
+                self.targets.append({"lap": self.n_all, "k": k, "what": e.get("what") or e.get("mode")})
+                del self.targets[:-1000]
             elif k == "upd":
                 self.upds.append(e)
             elif k == "prof":
@@ -336,6 +340,7 @@ def build_state():
         "rb": {k: sum(r.get(k, 0.0) for r in S.rbs[-5:]) / max(1, len(S.rbs[-5:]))
                for k in sorted({k for r in S.rbs[-5:] for k in r})},
         "ends": S.ends[-1500:], "track": track_outline(rd), "lean": cfgmod.LEAN, "linesight": cfgmod.LINESIGHT,
+        "run_preset": read_json(rd / "rewards.json").get("preset"), "targets": S.targets[-300:],
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
         "defaults": {**cfgmod.DEFAULTS, "github_token": ""},
         "best_run": read_json(rd / "best_run.json") or None,

@@ -210,11 +210,12 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
                 T.save_npy(line_file, T.make_line(np.asarray(tr["hist"])[:, :3]))
                 for f in ("profile.json", "profile.npy"):
                     (run_dir / f).unlink(missing_ok=True)
-                env.hist = tr["hist"]
                 env._load_line()
-                env._offer_profile(ms)
                 T.write_json(line_meta, {"ms": ms, "t": time.time()})
                 T.say(f"Reference line + ghost from the {ms / 1000:.3f} s champion lap")
+            env.hist = tr["hist"]
+            if fin and (promoted or not (run_dir / "profile.npy").exists()):   # ghost follows the champion only
+                T.champion_ghost(env, run_dir, ms, log)
             T.write_json(best_file, best)
             log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled)
             T.say(f"Champion test {tests}: " + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
@@ -516,6 +517,7 @@ def train(cfg):
     cfg = layout_cfg(cfg, run_dir)
     T.say(f"IQN: {cfg['_iqn_levels']} steering levels x {cfg['_iqn_modes']} throttle modes"
           + (" (gas+brake on)" if cfg["_iqn_modes"] == 4 else ""))
+    T.freeze_preset(cfg, run_dir)
     pool = T.CarPool(cfg, run_dir, n_env)                     # cars in their own processes, not in lock-step
     dim, nvec = pool.dim, pool.nvec
     n_act = int(nvec[0] * nvec[1])

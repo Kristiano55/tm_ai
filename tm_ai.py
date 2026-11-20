@@ -379,6 +379,48 @@ def _cp_cuts(trace):
     return cuts
 
 
+def freeze_preset(cfg, run_dir):
+    """A NEW run (no model yet) with reward_preset "minimal" gets rewards.json with the MINIMAL weights; the cars use
+    them instead of the settings. Existing runs are never changed."""
+    run_dir = Path(run_dir)
+    f = run_dir / "rewards.json"
+    if f.exists():
+        d = read_json(f)
+        say(f"This run uses the '{d.get('preset')}' reward preset (rewards.json); weight changes in Settings don't "
+            "apply to it.")
+        return
+    has_model = any((run_dir / n).exists() for n in ("latest.zip", "champion.zip", "latest.pt", "latest.prev.pt",
+                                                     "champion.pt"))
+    if cfg.get("reward_preset") == "minimal" and cfg.get("run_type") != "base" and not has_model:
+        write_json(f, {"preset": "minimal", "weights": dict(cfgmod.MINIMAL), "t": time.time()})
+        say("New run: minimal reward preset (progress, time, finish, checkpoint, give-up cost) frozen in rewards.json.")
+
+
+def champion_ghost(env, run_dir, ms, log=None):
+    """Rebuild the ghost (reward target) from the champion lap: called only when the champion improves (or no ghost
+    exists). PB-guide runs rebuild the guide (faster of PB vs AI best per section). Logs event k=target."""
+    run_dir = Path(run_dir)
+    try:
+        if env.guide:
+            r = build_guide(run_dir)
+            if not r:
+                return False
+            say(f"Champion {ms / 1000:.3f} s -> target line sections: {' '.join(r[1])} (target pace {r[0] / 1000:.3f} s)")
+            gms = r[0]
+        else:
+            old = read_json(run_dir / "profile.json").get("ms")
+            env._offer_profile(ms)
+            gms = read_json(run_dir / "profile.json").get("ms")
+            if gms == old:
+                return False
+        if log:
+            log(k="target", what="ghost", ms=int(ms), ghost_ms=int(gms))
+        return True
+    except Exception as e:                      # file trouble must never stop training
+        say(f"Ghost rebuild failed ({str(e)[:80]})")
+        return False
+
+
 def build_guide(run_dir):
     """Target line = per checkpoint section, the faster of your PB and the AI's best finished run.
     So the line starts as your PB and switches section by section wherever the AI finds something faster.
@@ -621,6 +663,9 @@ class TMEnv(gym.Env):
 
     def __init__(self, cfg, run_dir=None, shorten=True, role="training"):
         self.W = {k: float(cfg[k]) for k in cfgmod.WEIGHTS}
+        fw = read_json(Path(run_dir) / "rewards.json").get("weights") if run_dir else None
+        if fw:                                        # run started with a preset (minimal): its own weights
+            self.W.update({k: float(fw.get(k, 0.0)) for k in cfgmod.WEIGHTS})
         self.iqn = cfg.get("algo") == "iqn"          # IQN charges failure itself: no give-up penalty here
         self.STEER = STEER_LEVELS[cfg["steer_mode"]]
         if self.iqn and int(cfg.get("_iqn_levels") or 21) != len(self.STEER):     # finer IQN steering (new runs)
@@ -902,9 +947,13 @@ class TMEnv(gym.Env):
         self._lid_mat = np.asarray(mat, dtype=np.int64) if mat is not None else np.zeros(len(hit), np.int64)
         return self._lid
 
+    def _run_weights(self):
+        """rewards.json of a run started with a reward preset: its frozen weights win over the settings."""
+        return read_json(self.run_dir / "rewards.json").get("weights") if self.run_dir else None
+
     def _read_weights(self):
         """Pick up weights saved from the dashboard (applies from the next lap on)."""
-        d = read_json(cfgmod.CONFIG_PATH)
+        d = self._run_weights() or read_json(cfgmod.CONFIG_PATH)
         for k in cfgmod.WEIGHTS:
             try:
                 self.W[k] = float(d[k])
@@ -1005,10 +1054,10 @@ class TMEnv(gym.Env):
         return float((np.interp(s, self.prof[0], self.prof[1]) - tick) / 100.0)
 
     def _finished(self, ms):
-        """Called on every finished lap: keep the fastest run ever (best_run.txt) and update the ghost."""
+        """Called on every finished lap: keep the fastest run ever (best_run.txt). The ghost is NOT touched here: it
+        follows the champion only (champion_ghost), so the reward target doesn't move on every lucky lap."""
         try:
             self._offer_best(ms)
-            self._offer_profile(ms)
         except Exception:                         # file trouble must never stop training
             pass
 
@@ -1028,11 +1077,6 @@ class TMEnv(gym.Env):
         os.replace(tmp, self.run_dir / "best_run.txt")
         write_json(f, {"ms": ms, "source": self.role, "t": time.time()})
         save_npy(self.run_dir / "best_trace.npy", np.asarray(self.hist, dtype=np.float64))
-        if self.guide:
-            r = build_guide(self.run_dir)
-            if r:
-                say(f"[{self.role}] New best run {ms / 1000:.3f} s -> target line sections: {' '.join(r[1])} "
-                    f"(theoretical {r[0] / 1000:.3f} s)")
 
     def _offer_profile(self, ms):
         if self.run_dir is None or self.dense is None:
@@ -1068,21 +1112,6 @@ class TMEnv(gym.Env):
         if m != self._ramp_m:
             self._ramp_m = m
             self.hit_factor = float(read_json(f).get("factor", 1.0))
-
-    def _ghost_from_best(self):
-        """If the fastest saved run (best_run) beats the current ghost, the ghost follows it on the current line."""
-        if self.run_dir is None or self.dense is None or self.guide:
-            return
-        try:
-            bms, gms = read_json(self.run_dir / "best_run.json").get("ms"), read_json(self.run_dir / "profile.json").get("ms")
-            if bms is None or (gms is not None and bms >= gms):
-                return
-            prof = trace_to_profile(self.dense, np.load(self.run_dir / "best_trace.npy"))
-            if len(prof) >= 5 and prof[-1, 0] >= 0.95 * self.dense[2][-1]:     # the run follows this line to the end
-                save_npy(self.run_dir / "profile.npy", prof)
-                write_json(self.run_dir / "profile.json", {"ms": int(bms)})
-        except Exception:
-            pass
 
     def _limit_ticks(self):
         """Once a champion exists, cut hopeless laps at 1.6x its time: much faster training."""
@@ -1480,7 +1509,8 @@ class TMEnv(gym.Env):
             elif tick >= self.limit:
                 truncated, end = True, "timeout"
         for k, v in r.items():
-            self.rsum[k] = self.rsum.get(k, 0.0) + v
+            if v or k in self.rsum:                  # terms whose weight is 0 never show up in the breakdown
+                self.rsum[k] = self.rsum.get(k, 0.0) + v
         self.rsteps += 1
         reward = float(sum(r.values()))
         if terminated or truncated:
@@ -2372,10 +2402,10 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
                 env._load_line()
                 for f in ("profile.json", "profile.npy"):
                     (R / f).unlink(missing_ok=True)
-                env._offer_profile(ms)
-                env._ghost_from_best()                           # ghost = faster of this lap and the best saved run
                 write_json(line_meta, {"ms": ms, "t": time.time()})
                 say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
+            if fin and (promoted or not (R / "profile.npy").exists()):   # ghost follows the champion only
+                champion_ghost(env, R, ms, (lambda **kw: log(**kw, map=slug)) if slug else log)
             write_json(best_file, best)
             log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled,
                 tries=n_try, seed=tr["seed"], map=slug)
@@ -2797,6 +2827,8 @@ def train(cfg):
     torch.set_num_threads(2)                                   # tiny MLP: more threads only slow it down
     raise_priority(tick_too=True)
     base = cfg["run_type"] == "base"
+    if not base:
+        freeze_preset(cfg, run_dir)
     from_base = None if base else start_from_base(cfg, run_dir)
     pnorm = float(cfg["progress_norm_m"]) if (base or (run_dir / "base.json").exists()) else 0.0
     specs, maps = setup_cars(cfg, run_dir, pnorm)

@@ -72,6 +72,7 @@ DEFAULTS = {
     "w_hit_ramp": True,        # wall-hit penalty ramps in with the finish rate (25 % below 30 % finished, 100 % from 60 %)
     "cov_len": 25.0,           # coverage stretch length in m (novelty -> speed focus); at start
     "cov_passes": 100.0,       # passes after which a stretch is 63 % "known"; at start
+    "reward_preset": "custom",  # "minimal": new runs freeze the MINIMAL weights (rewards.json); custom = settings
     "reward_v": 4,             # reward layout version (old configs are upgraded once)
 }
 
@@ -120,6 +121,12 @@ DEFAULTS.update({k: v[0] for k, v in WEIGHTS.items()})
 # for TM2020 progress is 0.03/m, so driving pays from ~40 m/s (0.06 / 0.05 s / 0.03 per m).
 LINESIGHT = {k: 0.0 for k in WEIGHTS}
 LINESIGHT.update(w_progress=0.03, w_time=0.06)
+
+# "Minimal" preset: progress + time + finish + checkpoint + the give-up cost (stuck / off-zone, which also charges
+# the remaining metres); everything else 0. Chosen with the reward_preset setting; frozen into a NEW run's
+# rewards.json at its first start, so existing runs keep their rewards.
+MINIMAL = {k: 0.0 for k in WEIGHTS}
+MINIMAL.update(w_progress=0.05, w_time=0.02, w_finish=50.0, w_checkpoint=3.0, w_stuck=20.0, w_offzone=20.0)
 
 
 def load():
@@ -170,6 +177,8 @@ def coerce(cfg):
             v = d
         out[k] = v
     out["envs"] = max(1, out["envs"])
+    if out["reward_preset"] not in ("custom", "minimal"):
+        out["reward_preset"] = "custom"
     out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
     out["w_known"] = min(max(out["w_known"], 0.0), 0.5)
     out["cov_len"] = max(5.0, out["cov_len"])

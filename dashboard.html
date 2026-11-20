@@ -114,7 +114,7 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
 
   <section class="grp" aria-label="Laps and tests"><div class="gh">Laps &amp; tests</div>
   <div class="card" data-c="laps"><div class="ch"><h3>Lap times <small>every finished training lap, lower is faster</small></h3></div>
-    <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span></div>
+    <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span><span title="The ghost (reward target) was rebuilt from a new champion"><em style="color:#c9a227;font-style:normal;font-weight:700;margin-right:4px">G</em> ghost rebuilt</span><span title="A section's target route switched between your PB and the AI's own route"><em style="color:#a06be0;font-style:normal;font-weight:700;margin-right:4px">S</em> section target switched</span><span class="mut" id="presetTxt"></span></div>
     <canvas id="c1" class="t"></canvas></div>
   <div class="row r3">
     <div class="card" data-c="tests"><div class="ch"><h3>Champion tests <small>↑ promoted · ↺ rolled back</small></h3></div>
@@ -212,6 +212,7 @@ const I={step:1}, F={
  w_brake:['Brake','','w',{group:'Driving style',more:1}], w_steer_smooth:['Smooth steering','','w',{group:'Driving style',more:1}],
  w_slip:['Slip','','w',{group:'Driving style',more:1}], w_air:['Airtime','','w',{group:'Driving style',more:1}],
  w_speed:['Speed','','w',{group:'Driving style',more:1}],
+ reward_preset:['Reward preset for new runs','Minimal = only progress, time, finish, checkpoint and the give-up cost. Frozen into a run when it starts from scratch (rewards.json); existing runs keep their rewards. Settings = the weights below.','select',{opts:[['custom','Settings (weights below)'],['minimal','Minimal']]}],
  w_novel:['Novelty bonus','','w',{group:'Novelty & speed focus'}], w_known:['Known-stretch cut','','w',{group:'Novelty & speed focus',min:0,max:0.5}],
  w_focus:['Speed focus','','w',{group:'Novelty & speed focus'}],
  cov_len:['Stretch length (m)','Track is cut into stretches of this length; each counts how often laps got all the way through it. At start.','number',{group:'Novelty & speed focus',more:1,min:5,max:200,step:1}],
@@ -270,7 +271,7 @@ const SECTIONS=[
  ['run','Run & map',['run','run_type','map','pb_seconds','pb_file','resume','base_from']],
  ['cars','Cars & speed',['envs','ticks_per_step','time_limit_min','max_lap_seconds','lidar_every']],
  ['rew','Rewards',['w_progress','w_time','w_finish','w_finish_time','w_checkpoint','ghost_weight','ghost_window_s','w_guide','vcp_every_s','w_vcp','w_vsplit',
-   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall','w_novel','w_known','w_focus','cov_len','cov_passes']],
+   'w_crash','w_hit','w_hit_ramp','w_stuck','w_offzone','w_release','w_coast','w_brake','w_steer_smooth','w_slip','w_air','w_speed','w_wall','w_novel','w_known','w_focus','cov_len','cov_passes','reward_preset']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
  ['line','Track & line',['line_refresh_s','mid_start_p','mid_start_every_s','sec_fallback','cut_behind_s']],
  ['learn','Learning (PPO)',['horizon_s','decay_steps','analog_steer','gas_brake','sil_weight','aux_weight']],
@@ -302,7 +303,7 @@ function sectionHtml([id,title,keys],c){
   const ms=keys.map(meta), main=ms.filter(m=>!m.o.more), more=ms.filter(m=>m.o.more);
   const groups=list=>{ if(id!='rew') return `<div class="fg">${list.map(m=>fieldHtml(m,c)).join('')}</div>`;
     const gs=[...new Set(list.map(m=>m.o.group))]; return gs.map(g=>`<div class="sub2">${esc(g)}</div><div class="fg">${list.filter(m=>m.o.group==g).map(m=>fieldHtml(m,c)).join('')}</div>`).join('') };
-  const extra={rew:`<div class="acts" style="margin-bottom:6px"><button type="button" class="sm" id="bLean">Lean preset</button><button type="button" class="sm" id="bLs">Linesight preset</button><button type="button" class="sm" id="bReset">Reset weights</button><span class="mut" id="preMsg"></span></div>`,
+  const extra={rew:`<div class="acts" style="margin-bottom:6px"><button type="button" class="sm" id="bLean">Lean preset</button><button type="button" class="sm" id="bLs">Linesight preset</button><button type="button" class="sm" id="bMin" title="Progress, time, finish, checkpoint and the give-up cost only; everything else 0. Applies to runs started from scratch from now on (frozen in their rewards.json); existing runs keep their rewards.">Use minimal rewards</button><button type="button" class="sm" id="bReset">Reset weights</button><span class="mut" id="preMsg"></span></div>`,
     cars:`<div class="flex" style="margin-top:10px"><span class="mut">Not sure how many cars? The benchmark tries 6/8/10/12.</span><button type="button" class="sm" id="bBench2">Benchmark cars</button></div>`,
     note:`<div class="flex" style="margin-top:10px"><span class="mut" id="dcMsg"></span><button type="button" class="sm" id="bDc">Send test</button></div>`}[id]||'';
   const nl=ms.filter(isLive).length, when=nl==ms.length?'all changes apply live (next lap)':nl?'apply at the next Start · <span class="tag live">live</span> = next lap':'changes apply at the next Start';
@@ -324,6 +325,7 @@ function fillForm(c){
   $('f_run').addEventListener('input',runInfo); runInfo();
   $('bLean').onclick=()=>preset(LEAN,'Lean preset filled in - press Save.');
   $('bLs').onclick=()=>preset(LINES,'Linesight preset filled in - press Save.');
+  $('bMin').onclick=()=>{ $('f_reward_preset').value='minimal'; $('preMsg').textContent='Minimal rewards chosen for NEW runs (existing runs keep theirs) - press Save. Set "Reward preset for new runs" back to "Settings" to undo.'; onEdit() };
   $('bReset').onclick=()=>preset(Object.fromEntries(WMETA.map(m=>[m.k,m.default])),'Default weights filled in - press Save.');
   $('bBench2').onclick=()=>$('bBench').click();
   $('bDc').onclick=async()=>{const r=await fetch('/api/discord_test',{method:'POST',body:'{}'});const j=await r.json();$('dcMsg').textContent=j.message};
@@ -561,9 +563,12 @@ function render(s){ S_LAST=s;
   $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;
   $('log').textContent=s.log.join('\n');
   const laps=s.laps, tests=s.tests.filter(t=>t.ms);
+  $('presetTxt').textContent=s.run_preset?`This run: ${s.run_preset} rewards`:'';
   draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},
      {t:'d',p:tests.filter(t=>t.promoted).map(t=>[t.lap_n,t.ms/1000]),c:'#e8622a',r:4},
-     ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[])],v=>v.toFixed(1)+' s');
+     ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[]),
+     {t:'m',ch:'G',c:'#c9a227',x:(s.targets||[]).filter(t=>t.k=='target').map(t=>t.lap)},
+     {t:'m',ch:'S',c:'#a06be0',x:(s.targets||[]).filter(t=>t.k=='section').map(t=>t.lap)}],v=>v.toFixed(1)+' s');
   const all=s.tests.map((t,i)=>[i+1,t]);
   draw($('c2'),[{t:'l',p:all.filter(([,t])=>t.ms).map(([i,t])=>[i,t.ms/1000]),c:'#3b8bea'},{t:'l',p:all.filter(([,t])=>t.champ_ms).map(([i,t])=>[i,t.champ_ms/1000]),c:'#e8622a'},
      {t:'m',ch:'↑',c:'#e8622a',x:all.filter(([,t])=>t.promoted).map(([i])=>i)},{t:'m',ch:'↺',c:'#8b93a0',x:all.filter(([,t])=>t.rolled_back).map(([i])=>i)}],v=>v.toFixed(1)+' s');

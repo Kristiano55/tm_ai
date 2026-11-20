@@ -210,6 +210,13 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   per stretch). Give-up cost keeps the base progress weight. IQN: applied at collection time (replay stores summed
   rewards). `reward_v` 4: configs from before get 0 for missing w_novel/w_known/w_focus/w_air/w_speed/w_hit (same
   rewards on resume); new defaults: w_air 0.02, w_speed 0.03, w_hit 0.3, ghost 10.
+- **Reward presets:** dashboard buttons Lean / Linesight fill the weights; "Use minimal rewards" sets
+  `reward_preset` = "minimal" (default "custom"): a run starting from scratch (no model; not base runs) gets
+  `rewards.json` {preset, weights = config.MINIMAL: progress 0.05, time 0.02, finish 50, checkpoint 3, stuck 20,
+  off-zone 20, rest 0} (`freeze_preset`, PPO + IQN); TMEnv uses those weights (also on live reload) instead of the
+  settings. Existing runs never change. Zero-weight terms are left out of the reward breakdown.
+- **Lap-time chart markers:** G = ghost rebuilt (event k=target), S = section target switched (k=section); dashboard
+  `targets` (lap number when it happened).
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
   every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
   failing (>=50 laps) and an AI route exists (`sec_best_<k>` or best lap) -> mode "ai": `build_guide` uses the AI's
@@ -236,8 +243,10 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   changes; shown in the reward breakdown card.
 - **Champion tests:** best of `test_tries` (argmax + seeded sampling, reproducible), `test_tries_close` (8) once the
   champion is within `test_close_s` (0.5 s) of the PB (`pb_seconds`, else the traced PB file's time; `test_tries()`);
-  the test event logs tries + winning seed, Play champion replays `champion_seed`. Ghost: fastest finished lap (tests
-  included); after a line rebuild `_ghost_from_best()` keeps the best saved run if it beats the champion lap; PPO uses EMA weights and
+  the test event logs tries + winning seed, Play champion replays `champion_seed`. **Ghost follows the champion
+  only** (`champion_ghost`, called by both testers when the champion improves or no ghost exists; PB-guide runs
+  rebuild the guide there): training laps only update best_run.txt/best_trace (no ghost/guide rebuild). Event
+  k=target {what: ghost, ms, ghost_ms}. PPO uses EMA weights and
   `target_kl=0.02`; rollback after `rollback_after` bad tests (IQN only if `iqn_rollback`, default off). Both algos test in a spawn process (busy flag,
   restarted if it dies); the tester writes `ROLLBACK`, the learner loads the champion and deletes the flag.
 - **PPO is the main algorithm** (Kris, after IQN stalled on Training - 22). IQN code + settings stay; the dashboard
