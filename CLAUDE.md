@@ -12,6 +12,8 @@ He is a TM2020 TAS / SpeedTAS player, not an ML engineer: explain changes in Tra
   unless the UI changed; read only the code you need.
 - Finish with: update CLAUDE.md if behaviour changed, commit, push to main.
 - Report in at most 10 lines: what changed, settings added (name + default), tests run, anything not done.
+- Feature freeze: no new features (hub, packs, base, dashboard, new inputs, new rewards, new algorithms) until one
+  real map beats its PB. Only fixes, simplification and tuning.
 
 ## What it is
 An AI that learns to drive Trackmania 2020 maps through **tickgym** (https://tm.achepta.com/tickgym/), a Python
