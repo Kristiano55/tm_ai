@@ -2,6 +2,7 @@
 Command line: selftest, diagnose, packs/hub commands, main() (tm_ai.py calls it).
 """
 import argparse
+import collections
 import faulthandler
 import json
 import os
@@ -145,6 +146,13 @@ def diag_metrics(run_dir, n_modes):
         "stuck_share": round(len(stuck) / len(laps), 3) if laps else None,
         "stuck_spot": ({"cp": top[0][0], "x": top[0][1], "z": top[0][2], "share_of_stuck": round(top[1] / len(stuck), 3)}
                        if top else None),
+        # how stuck laps ended (lap events from this version on): which rule, speed at the end, wall hits
+        "stuck_rules": dict(collections.Counter(e["ast"].get("why") or "?" for e in stuck if e.get("ast"))),
+        "stuck_v_end": round(float(np.mean([e["ast"]["v_end"] for e in stuck if e.get("ast", {}).get("v_end") is not None]
+                                           or [np.nan])), 1) if stuck else None,
+        "stuck_with_wall_hit": (round(float(np.mean([1.0 if e["ast"].get("hits") else 0.0 for e in stuck
+                                                     if e.get("ast") and "hits" in e["ast"]] or [np.nan])), 2)
+                                if stuck else None),
         "mean_speed_ms": round(float(np.mean([a["v"] for a in ast])), 1) if ast else None,
         "furthest_m": round(float(max(prog)), 1) if prog else None,
         "progress_p90_late_m": round(float(np.percentile(late, 90)), 1) if late else None,

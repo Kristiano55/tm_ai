@@ -438,6 +438,41 @@ def map_targets(m, start):
     return keep, dropped
 
 
+AI_SECTION_MAX_X = 2.0   # an AI section drive slower than 2x your PB's section time is no target (Shemesh: 84 s pace)
+
+
+def section_route(run_dir, k, pb=None):
+    """The AI's best real drive through section k as (duration ticks, label, rows) or None: sec_best_<k> (it must start
+    with checkpoint count <= k and end on checkpoint k+1) or the best finished lap (best_trace, same checkpoint count as
+    the PB) - the faster one, and only if <= AI_SECTION_MAX_X x the PB's own time for that section."""
+    run_dir = Path(run_dir)
+    try:
+        pb = pb if pb is not None else np.load(run_dir / "pb_trace.npy")
+    except (OSError, ValueError):
+        return None
+    pc = _cp_cuts(pb)
+    if k + 1 >= len(pc):
+        return None
+    pb_dur = pb[pc[k + 1], 3] - (pb[pc[k], 3] if k else 0.0)
+    out = []
+    try:
+        seg = np.load(run_dir / f"sec_best_{k}.npy")
+        if (seg.ndim == 2 and seg.shape[1] >= 5 and len(seg) >= 3 and seg[0, 4] <= k and seg[-1, 4] >= k + 1
+                and seg[-1, 3] > seg[0, 3]):
+            out.append((seg[-1, 3] - seg[0, 3], "AI*", seg))
+    except (OSError, ValueError):
+        pass
+    try:
+        ai = np.load(run_dir / "best_trace.npy")
+        ac = _cp_cuts(ai) if ai.ndim == 2 and ai.shape[1] >= 5 else []
+        if len(ac) == len(pc) and ai[-1, 4] >= k + 1:
+            out.append((ai[ac[k + 1], 3] - (ai[ac[k], 3] if k else 0.0), "AI", ai))
+    except (OSError, ValueError):
+        pass
+    out = [c for c in out if 0 < c[0] <= AI_SECTION_MAX_X * max(pb_dur, 1.0)]
+    return min(out, key=lambda c: c[0]) if out else None
+
+
 def build_guide(run_dir):
     """Target line = per checkpoint section, the faster of your PB and the AI's best finished run.
     So the line starts as your PB and switches section by section wherever the AI finds something faster.
@@ -468,10 +503,12 @@ def build_guide(run_dir):
             dur = tr[b, 3] - (tr[a, 3] if j else 0.0)
             cand.append((dur, k, tr[a:b + 1] if j == n - 1 else tr[a:b], tr[a, 3] if j else 0.0))
         if j < len(modes) and modes[j] == "ai":
-            ai_c = [c for c in cand if c[1] != "PB"]
+            pb_dur = next(c[0] for c in cand if c[1] == "PB")
+            ai_c = [c for c in cand if c[1] != "PB" and c[0] <= AI_SECTION_MAX_X * max(pb_dur, 1.0)]
             try:
                 seg = np.load(run_dir / f"sec_best_{j}.npy")
-                if seg.ndim == 2 and len(seg) >= 3:
+                if (seg.ndim == 2 and seg.shape[1] >= 5 and len(seg) >= 3 and seg[0, 4] <= j and seg[-1, 4] >= j + 1
+                        and 0 < seg[-1, 3] - seg[0, 3] <= AI_SECTION_MAX_X * max(pb_dur, 1.0)):   # a real route
                     ai_c.append((seg[-1, 3] - seg[0, 3], "AI*", seg if j == n - 1 else seg[:-1], seg[0, 3]))
             except (OSError, ValueError):
                 pass

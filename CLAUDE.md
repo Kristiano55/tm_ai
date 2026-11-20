@@ -161,7 +161,10 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
 - **Tick-rate change:** levels.json stores `ticks` (else the last start event's cfg); a different ticks_per_step on
   resume resets VecNormalize's return stats (logged). The negative-driving warning names the 3 biggest costs.
 - **Lap action stats** (`info["ast"]`, lap events `ast`): share per throttle mode, mean |steer|/127, full-lock share,
-  mean speed, furthest progress m.
+  mean speed, furthest progress m, and how the lap ended: `why` (stuck rule: "slow" < 1.5 m/s for 2 s / "no move"
+  < 3 m in 2 s / "stall" on the line without progress / "far"), `v_end`, `hits` (wall hits this lap), `off` (m off the
+  line). `diag_metrics` (check / diagnose) summarises them for the stuck laps (`stuck_rules`, `stuck_v_end`,
+  `stuck_with_wall_hit`).
 - **`python tm_ai.py check [map] [--pb file]`** (~3 min, real game): PASS / FAIL per line -> `runs/_check/check.json`
   (exit 1 if anything failed): car accelerates, forward speed, up vector, lidar hits, route/checkpoints (+ dropped start
   block), wheel surface ids (+ INFO: missing telemetry fields), determinism (a scripted drive twice = same finish /
@@ -274,7 +277,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   `targets` (lap number when it happened).
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
   every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
-  failing (>=50 laps) and an AI route exists (`sec_best_<k>` or best lap) -> mode "ai": `build_guide` uses the AI's
+  failing (>=50 laps) and a REAL AI route exists (`common.section_route`: sec_best_<k> that starts at CP k and ends on
+  CP k+1, or a finished lap with the PB's checkpoint count, and <= `AI_SECTION_MAX_X` (2) x the PB's section time;
+  an 84 s "AI route" once gave a 84 s target pace) -> mode "ai"; `build_guide` applies the same rule, else the PB: `build_guide` uses the AI's
   fastest route there (line + ghost + VCPs). Back to "pb" when 3 laps drive the whole section within 15 m of the PB
   route (`secs_wr` in lap info), or a periodic "try" (after 10 min, doubling to 1 h; 50 laps, <=50% fail = keep).
   Every switch is an event (k=section). Hysteresis: after a switch the target is kept >= 10 min (`HOLD_S`), to AI
@@ -287,7 +292,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   the target line + ghost; per checkpoint section the faster of PB vs AI best run is used (`build_guide`). The AI
   never drives the PB inputs (Kris was explicit about this).
 - **Virtual checkpoints** every `vcp_every_s` of ghost pace: flat bonus + split vs ghost.
-- **Mid-track starts** (snapshots along champion lap / PB) only after the first finished lap; IQN uses
+- **Mid-track starts** (snapshots along champion lap / PB) after the first finished lap; WITH a `pb_file` they start
+  right away from the PB's states only (PPO + IQN; Shemesh: 12887 IQN laps, none past CP1, so later sections never got
+  practice), the champion lap joins once it exists (PPO). IQN uses
   `iqn_mid_start_p` (0.2) and, with a `pb_file`, starts only along the PB/WR states (to learn the WR route's cut); built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
 - **Champion tests only after the first finished full lap** of the run (`tests_ready()`: best_run.json / champion;
@@ -367,7 +374,9 @@ Fake map names `fake:<length>:<surface>` (asphalt 80 m/s / dirt 50 / grass 45, o
 `TICKGYM_FAKE_CORNER=1`: z 400..460 caps speed at 35 m/s unless gas AND brake are held (60). The fake brake now
 slows the car when held without gas (random IQN driving rarely finishes in 1 min there; with the old fake it does).
 Diagnose test: `TMAI_DIAG_S=25 python tm_ai.py diagnose` (~2.5 min for 4 trials). `TICKGYM_FAKE_FAIL=<file>`: resets raise TransportError while the file exists (content = how many in a row; 2 kills
-a car, 100 = keeps failing -> run stops after 3). `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
+a car, 100 = keeps failing -> run stops after 3). `TICKGYM_FAKE_WALL=150`: a wall at z=150 wrecks the car (speed 0 for the rest of the lap) unless it is <= 20 m/s there
+(hard spot after the start); a PB that brakes for it: "0 accel 1 / 2500 accel 0 / 2500 brake 1 / 3500 brake 0 /
+3500 accel 1" (fake input files are in ms) = 14.85 s. `TICKGYM_FAKE_HANG=<file>`: the next car to step after the file appears hangs forever (car replacement test).
 Fake surfaces: material 16 (asphalt), dirt (6) for z 600..800, gameplay id 3 for z 300..320, ice 0; the down rays
 hit and see the material 20 m ahead. `pb_seconds` 13.8 triggers best-of-8 (fake champion 13.75 s).
 `time_limit_min` is an int setting (0.7 -> 0 = no limit). Always also:

@@ -9,6 +9,9 @@ _HANG=os.environ.get("TICKGYM_FAKE_HANG","")
 # TICKGYM_FAKE_FAIL=<file path>: when that file exists, the next car to reset deletes it and raises TransportError
 # (like "the connection failed: timed out"); the file content = how many resets in a row fail (2 kills a car)
 _FAIL=os.environ.get("TICKGYM_FAKE_FAIL","")
+# TICKGYM_FAKE_WALL=<z>: a wall across the road at z (e.g. 150): crossing it faster than 20 m/s wrecks the car (speed 0
+# for the rest of the lap = "stuck"); only braking to <= 20 m/s before it gets through (a hard spot after the start)
+WALL=float(os.environ.get("TICKGYM_FAKE_WALL","0") or 0)
 # Surfaces: asphalt (material 16) everywhere except dirt (material 6) for z 600..800; gameplay id 3 ("turbo")
 # for z 300..320, else 0. Ice fields are 0 (a summer map). The 4 downward rays (32..35) hit the road ~2 m below
 # and see the material ~20 m ahead.
@@ -91,7 +94,7 @@ class G:
                 else: os.remove(_FAIL)
             except (OSError,ValueError): pass
             else: raise TransportError("the connection failed: timed out")
-        s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];return s.tel()
+        s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];s.crashed=False;return s.tel()
     def step(s,ticks,actions=(),steer=None,accelerate=None,brake=None):
         for a in actions:
             if a.kind=='accel': s.acc=bool(a.value)
@@ -109,7 +112,11 @@ class G:
         _wait(FAKE_MS); s.tick+=ticks; s.v=min(s.v+(1.6 if accelerate else -1),s.vmax); s.v=max(s.v,0)
         if getattr(s,'brk',False) and not accelerate: s.v=max(s.v-2,0)
         if CORNER and 400<=s.z<460: s.v=min(s.v,60.0 if (accelerate and s.brk) else 35.0)
-        s.z+=s.v*ticks/100; return s.tel()
+        if getattr(s,'crashed',False): s.v=0.0             # TICKGYM_FAKE_WALL: wrecked against the wall for good
+        nz=s.z+s.v*ticks/100
+        if WALL and s.z<WALL<=nz and s.v>20.0:              # hit the wall faster than 20 m/s: stopped dead
+            s.crashed,s.v,nz=True,0.0,WALL-1.0
+        s.z=nz; return s.tel()
     def _scan(s,n,z):
         hit=[1 if 32<=i<36 else 0 for i in range(n)]
         return NS(hit=hit,distance=[2.0 if h else 0 for h in hit],material_id=[s.mat(z+20) if h else 0 for h in hit])
@@ -119,7 +126,7 @@ class G:
     def snapshot(s):
         G.snaps=getattr(G,'snaps',{}); i=len(G.snaps)+1; G.snaps[i]=(s.z,s.v,s.tick); return NS(id=i,tick=s.tick)
     def restore(s,snap):
-        s.z,s.v,s.tick=G.snaps[snap.id]; return s.tel()
+        s.z,s.v,s.tick=G.snaps[snap.id]; s.crashed=False; return s.tel()
     def discard(s,*a): pass
     def export(s): return NS(finish_ms=s.tick*10,actions=list(getattr(s,"rec",[])))
     def close(s): pass

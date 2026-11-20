@@ -78,7 +78,9 @@ class SectionTracker:
         return sum(o) / len(o) if len(o) >= 10 else None
 
     def _ai_route(self, k):
-        return (self.run_dir / f"sec_best_{k}.npy").exists() or (self.run_dir / "best_trace.npy").exists()
+        """A real AI route through section k: a drive that completed it (sec_best_k from the CP k crossing to CP k+1,
+        or a finished lap) and is not absurdly slower than your PB there (section_route)."""
+        return section_route(self.run_dir, k) is not None
 
     def _set(self, k, mode, why, log):
         old, self.mode[k] = self.mode[k], mode
@@ -273,8 +275,10 @@ class TMEnv(gym.Env):
         except OSError:
             m = None
         done = bool(self.champ_ms) or (self.run_dir / "best_run.json").exists()   # the AI has finished a lap
-        if not done:                            # no mid-track starts until then: learn the start first
+        if not done and not self.guide:         # no PB and no finished lap yet: learn the start first
             return
+        # with your PB: start points along the PB's states from the beginning, so the sections after a hard spot get
+        # practice while the hard spot itself is being learned (Shemesh: 12887 laps, none past CP1)
         if m == self._ca_m:
             return
         self._ca_m = m
@@ -292,7 +296,7 @@ class TMEnv(gym.Env):
                 acts = []
             self.g.reset(seed=0)
             pa = np.zeros(8)
-            pb_only = self.iqn and self.guide       # IQN: start on the WR/PB route (where it cuts), not the AI's own
+            pb_only = (self.iqn or not done) and self.guide   # IQN / no finish yet: start on the PB route only
             if pb_only:
                 acts = []
             else:
@@ -314,7 +318,8 @@ class TMEnv(gym.Env):
             self.fails = np.zeros(len(self.starts))
             self._starts_line = "unset"
             mk = self.run_dir / "starts_logged.json"          # log once per rebuild, not once per car
-            if self.starts and (self.role != "training" or read_json(mk).get("m") != m):
+            seen = read_json(mk)
+            if self.starts and (self.role != "training" or "m" not in seen or seen["m"] != m):
                 if self.role == "training":
                     write_json(mk, {"m": m})
                 say(f"[{self.role}] {len(self.starts)} mid-track start points built "
@@ -862,6 +867,7 @@ class TMEnv(gym.Env):
         self.rsum, self.rsteps = {}, 0
         self.cov_spd = {}
         self._seg_k, self._seg_phi = None, 0.0
+        self.why, self.hits = "", 0
         self.ast = np.zeros(9)      # this lap: steps per throttle mode (4), sum |steer|/127, full-lock steps, speed, n, max m
         if self.starts and self.np_random.random() < self.mid_p:
             try:
@@ -925,6 +931,8 @@ class TMEnv(gym.Env):
         tf = self.tf
         self.prev_speed = speed
         self._s = self._s + dp if s >= self._s else s
+        if self.extra and _f(t.runtime, "wall_hit_this_step"):
+            self.hits += 1
         a = self.ast
         a[mode] += 1
         a[4] += abs(steer) / 127.0
@@ -980,9 +988,11 @@ class TMEnv(gym.Env):
             self.far = self.far + self.ticks if self.off_line > self.FAR_LINE else 0
             if self.slow >= 200 or no_progress:                                 # stuck
                 terminated, end = True, "stuck"
+                self.why = "slow" if self.slow >= 200 else ("no move" if moved < 3.0 else "stall")
                 r["end"] = -(W["w_stuck"] + give_up)
             elif self.far >= self.FAR_TICKS and not self.iqn:                  # lost, far off the line (PPO)
                 terminated, end = True, "far off line"
+                self.why = "far"
                 r["end"] = -(W["w_stuck"] + give_up)
             elif (self.role == "training" and self.cut_behind and tick > 500
                   and self._behind_champ(s, tick, phi) < -self.cut_behind):      # tests always drive the full lap
@@ -1013,7 +1023,11 @@ class TMEnv(gym.Env):
             info["rb"], info["rsteps"] = dict(self.rsum), self.rsteps
             a, n = self.ast, max(self.ast[7], 1)
             info["ast"] = {"m": [round(float(x) / n, 3) for x in a[:self.n_modes]], "sa": round(float(a[4] / n), 3),
-                           "fl": round(float(a[5] / n), 3), "v": round(float(a[6] / n), 1), "s": round(float(a[8]), 1)}
+                           "fl": round(float(a[5] / n), 3), "v": round(float(a[6] / n), 1), "s": round(float(a[8]), 1),
+                           # how the lap ended: stuck rule (slow < 1.5 m/s 2 s / no move < 3 m in 2 s / stall on the
+                           # line), speed at the end, wall hits this lap, metres off the line
+                           "why": self.why, "v_end": round(speed, 1), "hits": int(self.hits),
+                           "off": round(float(self.off_line), 1)}
             if self.cov_on:
                 info["cov"] = self._cov_info(length, bool(t.finished))
             info["tm"], self.tm = self.tm, {"tick": 0.0, "obs": 0.0, "env": 0.0, "n": 0}
