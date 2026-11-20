@@ -97,8 +97,8 @@ def selftest(cfg):
     if ice:
         print("ice raw values (max over the test drive; on a summer map icing_state/blend and is_any_wheel_on_ice"
               "_or_snow must be 0, grip scales 1):", {k: round(v, 3) for k, v in ice.items()})
-    print("lidar min/max m:", np.round((o[env.N_BASE:] * env.ray_range).min(), 1),
-          np.round((o[env.N_BASE:] * env.ray_range).max(), 1), "| obs size:", o.shape[0])
+    lid = o[env.N_BASE:env.N_BASE + len(env.ray_range)] * env.ray_range   # lidar only (PPO appends N_PRIV after)
+    print("lidar min/max m:", np.round(lid.min(), 1), np.round(lid.max(), 1), "| obs size:", o.shape[0])
     env.close()
 
 
