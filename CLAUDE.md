@@ -189,6 +189,14 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   - LINESIGHT preset is progress 0.03/m, time 0.06 per 50 ms (driving pays from ~40 m/s; Linesight's TMNF ratio
     0.01/m broke even at 120 m/s, so IQN on TM2020 got stuck at ~17 m/s).
   - Ghost reward only within `ghost_window_s` behind the ghost, otherwise slow laps learned to quit.
+  - **Start block among the waypoints** ("Better Training - 14": 5873/5873 laps stuck ~8-30 m from the spawn,
+    gas 22 %): the start block's waypoint group became "checkpoint 1", so progress was capped right after the spawn
+    (fallback route and `cp_arc`), driving on paid nothing and the AI learned to stop. `map_targets()` drops groups
+    tagged start (not start/finish) and, on one-lap maps, any group < `START_WP_M` (30 m) from the spawn; `cp_arc`
+    now comes from the PB trace's own checkpoint crossings when pb_trace.npy exists. selftest prints the waypoint
+    groups (+ tag) and what was dropped. IQN random actions favour gas (`iqn.GAS_P`: 70 % gas). Test:
+    `python tests/test_start.py` (fake `TICKGYM_FAKE_STARTWP=<tag>` adds a start group at z=8; fresh PPO + IQN must
+    hold gas > 60 % in the first 30 laps and get past the start).
   - **Progress off the target line** (the WR line can take a cut the AI doesn't): the matched arc length is clamped
     between the last taken and next checkpoint (`cp_arc`, waypoints mapped onto the line); > `NEAR_LINE` 15 m off,
     the line is re-acquired anywhere in that section. Progress already paid is `_s`: a skipped stretch is paid out at

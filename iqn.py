@@ -120,6 +120,17 @@ def with_tau(obs, tau_frac):
     return np.concatenate([obs, np.full((len(obs), 1), tau_frac, np.float32)], axis=1).astype(np.float32)
 
 
+GAS_P = {3: (0.7, 0.2, 0.1), 4: (0.7, 0.15, 0.1, 0.05)}   # random actions: mostly gas (uniform = brake 1/3)
+
+
+def random_action(n_act, rng):
+    """Random exploration action: any steering level, throttle mostly gas. A uniform pick held brake a third of the
+    time (half with gas+brake) and fresh runs crawled into "stuck" at the start."""
+    nm = NM[0]
+    m = int(rng.choice(nm, p=GAS_P.get(nm, None)))
+    return int(rng.integers(n_act // nm)) * nm + m
+
+
 def choose(net, obs, eps, beps, rng, seed_noise=None):
     """obs [B, dim] -> action indices; full mini-race ahead when acting."""
     with torch.no_grad():
@@ -128,7 +139,7 @@ def choose(net, obs, eps, beps, rng, seed_noise=None):
     for i in range(len(out)):
         u = rng.random()
         if u < eps:
-            out[i] = rng.integers(q.shape[1])
+            out[i] = random_action(q.shape[1], rng)
         elif u < eps + beps:
             out[i] = int(np.argmax(q[i] + TAU_B * rng.gumbel(size=q.shape[1])))
     return out

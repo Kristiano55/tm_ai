@@ -396,6 +396,39 @@ def freeze_preset(cfg, run_dir):
         say("New run: minimal reward preset (progress, time, finish, checkpoint, give-up cost) frozen in rewards.json.")
 
 
+START_WP_M = 30.0        # a waypoint group this close to the spawn is the start block, not a checkpoint
+
+
+def _wp_kind(wp):
+    for a in ("tag", "kind", "type", "waypoint_type", "role", "name"):
+        v = getattr(wp, a, None)
+        if v is not None:
+            return str(v).lower()
+    return ""
+
+
+def map_targets(m, start):
+    """Centres of the map's checkpoint groups (+ finish), WITHOUT the start block. A start block among the waypoints
+    used to become "checkpoint 1" a few metres after the spawn: progress was capped there until it was "taken"
+    (never), so driving on paid nothing, the stuck rule fired ~30 m out and the AI learned to stop pressing gas.
+    Dropped: groups tagged start (not start/finish), and on one-lap maps any group within START_WP_M of the spawn."""
+    groups, kinds = {}, {}
+    for wp in m.waypoints:
+        if wp.group_id is not None:
+            groups.setdefault(wp.group_id, []).append(np.asarray(wp.vertices, dtype=np.float64).mean(axis=0))
+            kinds.setdefault(wp.group_id, _wp_kind(wp))
+    one_lap = int(getattr(m, "lap_count", 1) or 1) <= 1
+    keep, dropped = [], []
+    for g, c in groups.items():
+        centre, k = np.mean(c, axis=0), kinds[g]
+        tagged_start = "start" in k and "finish" not in k
+        near = one_lap and float(np.linalg.norm((centre - start)[[0, 2]])) < START_WP_M
+        (dropped if (tagged_start or near) else keep).append(centre)
+    if not keep:                                    # never drop everything
+        keep, dropped = [np.mean(c, axis=0) for c in groups.values()], []
+    return keep, dropped
+
+
 def champion_ghost(env, run_dir, ms, log=None):
     """Rebuild the ghost (reward target) from the champion lap: called only when the champion improves (or no ghost
     exists). PB-guide runs rebuild the guide (faster of PB vs AI best per section). Logs event k=target."""
@@ -718,12 +751,8 @@ class TMEnv(gym.Env):
         self._connect()
 
         # Fallback route (until a reference line exists): start -> centre of each checkpoint.
-        groups = {}
-        for wp in self.g.map.waypoints:
-            if wp.group_id is not None:
-                groups.setdefault(wp.group_id, []).append(np.asarray(wp.vertices).mean(axis=0))
-        targets = [np.mean(c, axis=0) for c in groups.values()]
         start = np.asarray(self.g.map.start_position, dtype=np.float64)
+        targets, self.dropped_wp = map_targets(self.g.map, start)
         self.route = np.vstack([start] + targets)
         seg = np.diff(self.route, axis=0)
         self.seg_len = np.maximum(np.linalg.norm(seg, axis=1), 1e-3)
@@ -991,6 +1020,24 @@ class TMEnv(gym.Env):
         if self.dense is None or self.multilap:
             return None
         pts, _, cum = self.dense
+        pb = None
+        if self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists():
+            try:
+                pb = np.load(self.run_dir / "pb_trace.npy")
+            except (OSError, ValueError):
+                pb = None
+        if pb is not None and len(pb) > 2:         # exact: where your PB's checkpoint counter went up
+            cut = [i for i in range(1, len(pb)) if pb[i, 4] > pb[i - 1, 4]]
+            arcs = []
+            for i in cut:
+                d = np.linalg.norm(pts - pb[i, :3], axis=1)
+                j = int(np.argmin(d))
+                if d[j] > 60.0:
+                    arcs = None
+                    break
+                arcs.append(float(cum[j]))
+            if arcs:
+                return np.sort(np.array(arcs))
         arcs = []
         for c in self.route[1:]:
             d = np.linalg.norm(pts - c, axis=1)
@@ -3101,6 +3148,8 @@ def selftest(cfg):
         if term or trunc:
             break
     print("steering:", "analog -127..127 (PPO)" if env.analog else env.STEER.tolist())
+    print("waypoint groups:", [(wp.group_id, _wp_kind(wp) or "?") for wp in env.g.map.waypoints],
+          "| dropped as start block:", [np.round(c, 1).tolist() for c in env.dropped_wp] or "none")
     print("route points:", len(env.route) - 1, "| route length: %.0f m" % env.lap_len,
           "| reference line:", "yes" if env.dense is not None else "not yet")
     print("local velocity m/s (expect z > 0, x ~ 0):", np.round(o[1:4] * 100, 2))

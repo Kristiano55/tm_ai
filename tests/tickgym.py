@@ -62,7 +62,10 @@ class G:
         if str(m).startswith("fake:"):
             parts=str(m).split(":"); s.L=float(parts[1]); s.surf=parts[2] if len(parts)>2 else "asphalt"
         s.vmax=SURF[s.surf][1] if s.surf else 80.0
-        s.map=NS(waypoints=[NS(group_id=1,vertices=[[0,0,s.L/2]]),NS(group_id=2,vertices=[[0,0,s.L]])],start_position=[0,0,0],lap_count=1)
+        wps=[NS(group_id=1,vertices=[[0,0,s.L/2]],tag="Checkpoint"),NS(group_id=2,vertices=[[0,0,s.L]],tag="Finish")]
+        if os.environ.get("TICKGYM_FAKE_STARTWP"):    # the start block listed as a waypoint group (like real maps)
+            wps.insert(0,NS(group_id=0,vertices=[[0,0,8.0]],tag=os.environ["TICKGYM_FAKE_STARTWP"]))
+        s.map=NS(waypoints=wps,start_position=[0,0,0],lap_count=1)
     def mat(s,z): return SURF[s.surf][0] if s.surf else _mat(z)
     def gp(s,z): return 0 if s.surf else _gp(z)
     def tel(s):
