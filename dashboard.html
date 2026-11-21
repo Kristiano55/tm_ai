@@ -76,6 +76,13 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
 @media(max-width:800px){.q .tip{position:fixed;left:12px;right:12px;bottom:64px;transform:none;width:auto;max-width:none}#set{grid-template-columns:1fr}.snav{display:none}#secSel{display:block;width:100%}.stop{flex-wrap:wrap}header{padding:10px 12px}main{padding:12px}.pill{max-width:100%}}
 .mapc{margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.mapc label{display:flex;gap:4px;align-items:center}
 tr.tot td{border-top:1px solid #3a414c;font-weight:600}
+.ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}.ctl select{width:auto}.ctl .hint{margin-left:auto}
+.gap{font-variant-numeric:tabular-nums;font-size:var(--f-s);color:var(--mut)}.gap b{font-weight:600}.gap b.bad{color:var(--red)}.gap b.ok{color:var(--grn)}
+.rr{display:flex;gap:6px;align-items:center}.rr select{padding:2px 4px}
+#tip{position:fixed;pointer-events:none;z-index:50;background:#0b0d10;border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:12px;color:var(--tx);white-space:nowrap;display:none}
+.log{font:12px/1.5 Consolas,monospace;color:#c9ced6;white-space:pre-wrap;word-break:break-word;min-height:90px;max-height:320px;overflow:auto}
+.log .w,.lw{color:var(--red)}.log .c,.lg2{color:var(--grn)}.log .s,.ls{color:#a06be0}
+.mid,.big,.sec td,.kpi .mut{font-variant-numeric:tabular-nums}table.sec td:nth-child(2),table.sec td:nth-child(3),table.sec td:nth-child(4){text-align:right}
 </style></head><body>
 <header>
   <div class="logo" aria-hidden="true">&raquo;</div>
@@ -83,6 +90,7 @@ tr.tot td{border-top:1px solid #3a414c;font-weight:600}
   <nav aria-label="Pages"><button id="n1" class="on">Dashboard</button><button id="n3">Hub</button><button id="n2">Settings</button></nav>
   <div class="sp"></div>
   <div class="pill" role="status"><span class="dot" id="dot"></span><b id="st">Idle</b><span class="mut" id="why"></span></div>
+  <label class="mut rr" title="How often this page asks for new data (this page only, not a setting; paused while the window is hidden)">Refresh <select id="rRate"><option value="2">2 s</option><option value="5">5 s</option><option value="10">10 s</option><option value="30">30 s</option></select></label>
   <div class="acts"><button id="bPlay">Play champion</button><button id="bStop">Stop</button><button id="bStart" class="p">Start training</button></div>
 </header>
 <datalist id="runList"></datalist>
@@ -115,9 +123,13 @@ tr.tot td{border-top:1px solid #3a414c;font-weight:600}
   </div></section>
 
   <section class="grp" aria-label="Laps and tests"><div class="gh">Laps &amp; tests</div>
-  <div class="card" data-c="laps"><div class="ch"><h3>Lap times <small>every finished training lap, lower is faster</small></h3></div>
+  <div class="card" data-c="laps"><div class="ch"><h3>Lap times <small>every finished full training lap, lower is faster</small></h3><span class="gap" id="lapGap"></span></div>
     <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span><span title="IQN exploitation laps: driven without random actions"><b style="background:#46c37b"></b>No-random laps</span><span title="The ghost (reward target) was rebuilt from a new champion"><em style="color:#c9a227;font-style:normal;font-weight:700;margin-right:4px">G</em> ghost rebuilt</span><span title="A section's target route switched between your PB and the AI's own route"><em style="color:#a06be0;font-style:normal;font-weight:700;margin-right:4px">S</em> section target switched</span><span class="mut" id="presetTxt"></span></div>
-    <canvas id="c1" class="t"></canvas></div>
+    <div class="ctl"><button type="button" class="sm" id="lzIn" title="Zoom in on the lap axis">+</button><button type="button" class="sm" id="lzOut" title="Zoom out">−</button><button type="button" class="sm" id="lzReset">Reset view</button>
+      <select id="lFilter" aria-label="Which laps to show"><option value="all">All finished full laps</option><option value="greedy">No-random laps only</option><option value="tests">Champion tests only</option></select>
+      <button type="button" class="sm" id="lClear" title="Hide the laps finished so far (view only: nothing is deleted, training is not touched)">Clear dots</button><button type="button" class="sm" id="lAll">Show all</button>
+      <span class="mut" id="lInfo"></span><span class="mut hint">wheel: zoom · drag: scroll · double-click: reset · hover a dot for details</span></div>
+    <canvas id="c1" class="t" style="cursor:grab;touch-action:none"></canvas></div>
   <div class="row r3">
     <div class="card" data-c="tests"><div class="ch"><h3>Champion tests <small>↑ promoted · ↺ rolled back</small></h3></div>
       <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Current driver</span><span><b style="background:var(--org)"></b>Champion</span></div><canvas id="c2"></canvas></div>
@@ -131,6 +143,7 @@ tr.tot td{border-top:1px solid #3a414c;font-weight:600}
       <div id="rbBars" class="mut">no data yet</div><div class="mut" id="rbSum" style="margin-top:8px"></div></div>
     <div class="card" data-c="ends"><div class="ch"><h3>Where laps end <small>full laps bright, mid-track faint · wheel / buttons to zoom, drag to pan, double-click to reset</small></h3></div>
       <div class="lg" style="margin-bottom:6px"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span>
+        <span><b style="background:#39c46a;border-radius:2px"></b>start</span><span><b style="background:#3b8bea"></b>checkpoint</span><span><b style="background:#ef5b60;border-radius:2px"></b>finish</span>
         <span class="mapc"><button type="button" class="sm" id="mzIn" title="Zoom in">+</button><button type="button" class="sm" id="mzOut" title="Zoom out">−</button><button type="button" class="sm" id="mzReset">Reset view</button>
         <label class="mut"><input type="checkbox" id="mFull"> full laps only</label>
         <button type="button" class="sm" id="mClear" title="Hide the dots of laps that ended so far (view only: nothing is deleted, training is not touched)">Clear dots</button><button type="button" class="sm" id="mAll">Show all</button>
@@ -157,7 +170,9 @@ tr.tot td{border-top:1px solid #3a414c;font-weight:600}
   </section>
 
   <section class="grp" aria-label="Log"><div class="gh">Log</div>
-  <div class="card" data-c="log"><div class="ch"><h3>Training log</h3></div><pre id="log"></pre></div></section>
+  <div class="card" data-c="log"><div class="ch"><h3>Training log <small>last 200 lines · <span class="lw">warnings</span> · <span class="lg2">new champions</span> · <span class="ls">section switches</span></small></h3>
+    <label class="mut"><input type="checkbox" id="logWarn"> warnings only</label><button type="button" class="sm hide" id="logJump">Jump to latest</button></div>
+    <div id="log" class="log" tabindex="0" aria-live="off"></div></div></section>
 </main>
 
 <main id="hubv" class="hide"><div class="card">
@@ -183,6 +198,7 @@ tr.tot td{border-top:1px solid #3a414c;font-weight:600}
 </main>
 <div class="savebar hide" id="saveBar"><span class="msg" id="saved" role="status">No unsaved changes</span>
   <button id="bDiscard">Discard</button><button class="p" id="bSave">Save</button></div>
+<div id="tip" role="tooltip"></div>
 <script>
 const $=id=>document.getElementById(id);
 const sec=v=>v==null?'–':v.toFixed(3)+' s', ms=v=>v==null?'–':(v/1000).toFixed(3)+' s', n0=v=>Number(v||0).toLocaleString('en-US');
@@ -411,7 +427,7 @@ const CLOSED=new Set(store.get('closed',[]));
 for(const c of document.querySelectorAll('#dash .card[data-c]')){ const h=c.querySelector('.ch'); const b=document.createElement('button');
   b.className='tog'; b.type='button'; const set=()=>{const cl=CLOSED.has(c.dataset.c); c.classList.toggle('closed',cl); b.textContent=cl?'▸':'▾'; b.setAttribute('aria-expanded',String(!cl));
     b.setAttribute('aria-label',(cl?'Expand ':'Collapse ')+h.textContent.trim())};
-  b.onclick=()=>{ CLOSED.has(c.dataset.c)?CLOSED.delete(c.dataset.c):CLOSED.add(c.dataset.c); store.set('closed',[...CLOSED]); set(); tick() };
+  b.onclick=()=>{ CLOSED.has(c.dataset.c)?CLOSED.delete(c.dataset.c):CLOSED.add(c.dataset.c); store.set('closed',[...CLOSED]); set(); CH={}; if(S_LAST) render(S_LAST) };
   h.prepend(b); set() }
 
 const TCOL={tick:['#3b8bea','TICK (game physics)'],obs:['#39c46a','building inputs'],env:['#e8a33a','rewards / rules'],wait:['#8b93a0','waiting for an action']};
@@ -479,20 +495,24 @@ function drawTime(s){
     if(b.lidar_other) t+=` Lidar every ${b.lidar_other.lidar_every} step(s): ${b.lidar_other.x}x (setting now ${b.lidar_every}).`;
     $('bTxt').textContent=t }
 }
-function draw(cv,layers,fmt){
+/* opt.xr = [x0, x1] shows only that part of the x axis (zoom); layers with .info (a label per point) are hoverable */
+function draw(cv,layers,fmt,opt){
+  opt=opt||{}; cv._pts=[]; cv._ax=null;
   const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight; cv.width=w*d; cv.height=h*d;
   const g=cv.getContext('2d'); g.scale(d,d); g.font='11px Segoe UI,sans-serif';
-  let xs=[],ys=[]; for(const l of layers){ if(l.t=='h'){ys.push(l.y)} else if(l.t!='m'){for(const p of l.p){xs.push(p[0]);ys.push(p[1])}} }
+  let xs=[],ys=[]; for(const l of layers){ if(l.t=='h'){ys.push(l.y)} else if(l.t!='m'){for(const p of l.p){if(!opt.xr||(p[0]>=opt.xr[0]&&p[0]<=opt.xr[1])){xs.push(p[0]);ys.push(p[1])}}} }
   if(!xs.length){g.fillStyle='#8b93a0';g.fillText('no data yet',w/2-28,h/2);return}
   const mn=a=>a.reduce((x,y)=>Math.min(x,y)),mx=a=>a.reduce((x,y)=>Math.max(x,y));
-  let x0=mn(xs),x1=mx(xs),y0=mn(ys),y1=mx(ys); if(x1==x0)x1=x0+1; const pad=(y1-y0||1)*.08; y0-=pad;y1+=pad;
-  const L=52,R=10,T=10,B=22,X=v=>L+(v-x0)/(x1-x0)*(w-L-R),Y=v=>T+(1-(v-y0)/(y1-y0))*(h-T-B);
+  let x0=mn(xs),x1=mx(xs),y0=mn(ys),y1=mx(ys); if(opt.xr){x0=opt.xr[0];x1=opt.xr[1]} if(x1==x0)x1=x0+1; const pad=(y1-y0||1)*.08; y0-=pad;y1+=pad;
+  const L=opt.L||52,R=10,T=10,B=22,X=v=>L+(v-x0)/(x1-x0)*(w-L-R),Y=v=>T+(1-(v-y0)/(y1-y0))*(h-T-B);
+  cv._ax={x0,x1,L,R,w};
   g.strokeStyle='#262b32';g.fillStyle='#8b93a0';g.lineWidth=1;
   for(let i=0;i<=4;i++){const v=y0+(y1-y0)*i/4,y=Y(v);g.beginPath();g.moveTo(L,y);g.lineTo(w-R,y);g.stroke();g.fillText(fmt(v),4,y+4)}
-  for(let i=0;i<=4;i++){const v=x0+(x1-x0)*i/4;g.fillText(Math.round(v),X(v)-8,h-6)}
+  for(let i=0;i<=4;i++){const v=x0+(x1-x0)*i/4,t=n0(Math.round(v)),tw=g.measureText(t).width;g.fillText(t,Math.min(Math.max(X(v)-tw/2,L),w-tw-2),h-6)}
   g.save();g.beginPath();g.rect(L,T,w-L-R,h-T-B);g.clip();
   for(const l of layers){ g.strokeStyle=g.fillStyle=l.c||'#3b8bea';
-    if(l.t=='d'){g.globalAlpha=.8;for(const p of l.p){g.beginPath();g.arc(X(p[0]),Y(p[1]),l.r||2,0,7);g.fill()}g.globalAlpha=1}
+    if(l.t=='d'){g.globalAlpha=.8;l.p.forEach((p,i)=>{const px=X(p[0]),py=Y(p[1]);g.beginPath();g.arc(px,py,l.r||2,0,7);g.fill();
+      if(l.info&&px>=L&&px<=w-R) cv._pts.push([px,py,l.info[i]])});g.globalAlpha=1}
     else if(l.t=='l'){g.lineWidth=l.w||1.5;g.beginPath();l.p.forEach((p,i)=>i?g.lineTo(X(p[0]),Y(p[1])):g.moveTo(X(p[0]),Y(p[1])));g.stroke()}
     else if(l.t=='h'){g.setLineDash([6,5]);g.beginPath();g.moveTo(L,Y(l.y));g.lineTo(w-R,Y(l.y));g.stroke();g.setLineDash([]);if(l.s){g.fillText(l.s,L+8,Y(l.y)-5)}}
     else if(l.t=='m'){g.font='13px Segoe UI,sans-serif';for(const x of l.x){g.fillText(l.ch,X(x)-4,T+12)}g.font='11px Segoe UI,sans-serif'} }
@@ -509,6 +529,63 @@ function drawRb(rb){
     <span style="text-align:right;color:#c9ced6">${v.toFixed(4)}</span></div>`}).join('');
   const run=ks.filter(k=>!['finish','end','checkpoint'].includes(k)).reduce((a,k)=>a+rb[k],0);
   $('rbSum').innerHTML=hitTxt(S_LAST)+`While driving: <b style="color:${run<0?'#e5484d':'#39c46a'}">${run>=0?'+':''}${run.toFixed(4)}</b> per step`+(run<0?' – negative: stopping can look attractive to the AI':'')}
+/* view state of this page (localStorage, never config / training) */
+function vst(k,v,set){ try{ if(set){localStorage.setItem('tmai.'+k,v);return v} return localStorage.getItem('tmai.'+k)??v }catch(e){return v} }
+let CH={};                                          /* last drawn data per card: redraw only when it changed */
+function changed(k,data){ const j=JSON.stringify(data); if(CH[k]===j) return false; CH[k]=j; return true }
+function tip(e,t){ const el=$('tip'); if(!t){el.style.display='none';return} el.textContent=t; el.style.display='block';
+  const r=el.getBoundingClientRect(); el.style.left=Math.min(e.clientX+12,innerWidth-r.width-8)+'px'; el.style.top=Math.max(e.clientY-r.height-10,4)+'px' }
+function hoverPts(cv,e,rad){ const r=cv.getBoundingClientRect(), x=e.clientX-r.left, y=e.clientY-r.top; let best=null,bd=(rad||7)**2;
+  for(const p of cv._pts||[]){ const d=(p[0]-x)**2+(p[1]-y)**2; if(d<bd){bd=d;best=p} } return best }
+
+/* lap chart: x-zoom on the lap axis, drag to scroll, filters, clear dots, hover */
+const LV={r:null};                                   /* visible lap range [a, b]; null = all */
+function lapData(){ const s=S_LAST; if(!s) return null; const clr=Number(vst('laps.clear','0'))||0, f=vst('laps.filter','all');
+  const laps=(s.laps||[]).filter(l=>!clr||l[3]>clr), tests=(s.tests||[]).filter(t=>t.ms&&(!clr||(t.t||0)>clr||!t.t));
+  return {laps:f=='tests'?[]:f=='greedy'?laps.filter(l=>l[2]):laps, tests:f=='greedy'?[]:tests, f, all:(s.laps||[]).length, clr} }
+function drawLaps(){ const s=S_LAST, D=lapData(); if(!D) return; const cv=$('c1'), ch=s.champion_ms;
+  const pts=D.laps.map(l=>[l[0],l[1]]), lab=D.laps.map(l=>`Lap ${n0(l[0])} · ${l[1].toFixed(3)} s · finished`+(l[2]?' (no-random lap)':''));
+  const tp=D.tests.map(t=>[t.lap_n,t.ms/1000]), tl=D.tests.map(t=>`Champion test after lap ${n0(t.lap_n)} · ${(t.ms/1000).toFixed(3)} s · `+
+    (t.promoted?'new champion':t.rolled_back?'rolled back':ch&&t.ms>ch?`${((t.ms-ch)/1000).toFixed(3)} s slower than the champion`:'not faster'));
+  const layers=[];
+  if(D.f!='tests'){ const nr=D.laps.filter(l=>!l[2]), g=D.laps.filter(l=>l[2]);
+    layers.push({t:'d',p:nr.map(l=>[l[0],l[1]]),c:'#3b8bea',info:nr.map(l=>`Lap ${n0(l[0])} · ${l[1].toFixed(3)} s · finished`)});
+    if(D.f=='all') layers.push({t:'l',p:movAvg(pts,20),c:'#6fb1ff'});
+    layers.push({t:'d',p:g.map(l=>[l[0],l[1]]),c:'#46c37b',r:3,info:g.map(l=>`Lap ${n0(l[0])} · ${l[1].toFixed(3)} s · finished (no-random lap)`)}) }
+  layers.push({t:'d',p:D.f=='tests'?tp:tp.filter((p,i)=>D.tests[i].promoted),c:'#e8622a',r:4,info:D.f=='tests'?tl:tl.filter((x,i)=>D.tests[i].promoted)});
+  if(ch) layers.push({t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)});
+  layers.push({t:'m',ch:'G',c:'#c9a227',x:(s.targets||[]).filter(t=>t.k=='target').map(t=>t.lap)},{t:'m',ch:'S',c:'#a06be0',x:(s.targets||[]).filter(t=>t.k=='section').map(t=>t.lap)});
+  draw(cv,layers,v=>v.toFixed(3)+' s',{xr:LV.r,L:62});
+  const inV=p=>!LV.r||(p[0]>=LV.r[0]&&p[0]<=LV.r[1]), shown=(D.f=='tests'?tp:pts).filter(inV).length;
+  $('lInfo').textContent=`${n0(shown)} ${D.f=='tests'?'tests':'laps'} shown`+(D.clr?' (cleared earlier ones)':'')+(LV.r?` · laps ${n0(Math.round(LV.r[0]))}–${n0(Math.round(LV.r[1]))}`:'')+(D.all>=2000&&D.f!='tests'?' · the last 2,000 finished laps':'') }
+function lapZoom(f,frac){ const ax=$('c1')._ax; if(!ax) return; const a=LV.r?LV.r[0]:ax.x0, b=LV.r?LV.r[1]:ax.x1, c=a+(b-a)*(frac??0.5), half=(b-a)/f/2;
+  const lo=Math.max(ax.x0-1e9,c-(b-a)/f*(frac??0.5)), hi=lo+(b-a)/f; LV.r=f<1&&LV.r&&hi-lo>=fullSpan()?null:[lo,hi]; drawLaps() }
+function fullSpan(){ const l=(S_LAST&&S_LAST.laps)||[]; return l.length?l[l.length-1][0]-l[0][0]:1 }
+(function lapCtl(){ const cv=$('c1');
+  cv.addEventListener('wheel',e=>{e.preventDefault(); const ax=cv._ax; if(!ax) return; const r=cv.getBoundingClientRect(); const frac=Math.min(Math.max((e.clientX-r.left-ax.L)/(ax.w-ax.L-ax.R),0),1); lapZoom(e.deltaY<0?1.25:0.8,frac)},{passive:false});
+  let drag=null; cv.addEventListener('pointerdown',e=>{drag=e.clientX;cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing'});
+  cv.addEventListener('pointermove',e=>{ if(drag!=null&&cv._ax){ const ax=cv._ax, dx=(e.clientX-drag)/(ax.w-ax.L-ax.R)*(ax.x1-ax.x0); if(dx){ if(!LV.r) LV.r=[ax.x0,ax.x1]; LV.r=[LV.r[0]-dx,LV.r[1]-dx]; drag=e.clientX; drawLaps() } tip(e,null); return }
+    const p=hoverPts(cv,e); tip(e,p?p[2]:null) });
+  const up=()=>{drag=null;cv.style.cursor='grab'}; cv.addEventListener('pointerup',up); cv.addEventListener('pointercancel',up); cv.addEventListener('pointerleave',e=>tip(e,null));
+  cv.addEventListener('dblclick',()=>{LV.r=null;drawLaps()});
+  $('lzIn').onclick=()=>lapZoom(1.5); $('lzOut').onclick=()=>lapZoom(1/1.5); $('lzReset').onclick=()=>{LV.r=null;drawLaps()};
+  $('lFilter').value=vst('laps.filter','all'); $('lFilter').onchange=()=>{vst('laps.filter',$('lFilter').value,1);drawLaps()};
+  $('lClear').onclick=()=>{vst('laps.clear',String(Date.now()/1000),1);drawLaps()}; $('lAll').onclick=()=>{vst('laps.clear','0',1);drawLaps()} })();
+
+/* training log: warnings red, new champions green, section switches purple; auto-scroll unless the user scrolled up */
+const LOG_W=/warning|hint|starting from scratch|out of memory|no finish|rolling back|error|failed|crash|stopped unexpectedly/i,
+      LOG_C=/new champion/i, LOG_S=/^\S*\s*section \d+ \(checkpoint/i;
+let LOGW=vst('log.warn','0')=='1', LOGPAUSE=false;
+function drawLog(lines){ const el=$('log'), esc2=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  const cls=t=>LOG_C.test(t)?'c':LOG_W.test(t)?'w':LOG_S.test(t.replace(/^\d\d:\d\d:\d\d\s*/,''))?'s':'';
+  const rows=lines.map(t=>[t,cls(t)]).filter(([t,c])=>!LOGW||c=='w');
+  el.innerHTML=rows.length?rows.map(([t,c])=>c?`<span class="${c}">${esc2(t)}</span>`:esc2(t)).join('\n'):'<span class="mut">'+(LOGW?'no warnings in the last 200 lines':'no log yet')+'</span>';
+  if(!LOGPAUSE) el.scrollTop=el.scrollHeight }
+(function logCtl(){ const el=$('log');
+  el.addEventListener('scroll',()=>{ LOGPAUSE=el.scrollTop+el.clientHeight<el.scrollHeight-8; $('logJump').classList.toggle('hide',!LOGPAUSE) });
+  $('logJump').onclick=()=>{LOGPAUSE=false;el.scrollTop=el.scrollHeight;$('logJump').classList.add('hide')};
+  $('logWarn').checked=LOGW; $('logWarn').onchange=()=>{LOGW=$('logWarn').checked;vst('log.warn',LOGW?'1':'0',1);if(S_LAST)drawLog(S_LAST.log||[])} })();
+
 /* map view: zoom / pan / hidden dots live only in this browser (localStorage), never in config or training */
 const MV={k:1,cx:null,cz:null,sc:1,w:0,h:0};
 function mvGet(k,d){try{return localStorage.getItem('tmai.map.'+k)??d}catch(e){return d}}
@@ -520,8 +597,9 @@ function mapZoom(f,px,py){ const cv=$('cMap'); if(MV.cx==null) return; px=px??MV
 function mapInit(){ const cv=$('cMap'); if(cv.dataset.mi) return; cv.dataset.mi=1;
   cv.addEventListener('wheel',e=>{e.preventDefault(); const r=cv.getBoundingClientRect(); mapZoom(e.deltaY<0?1.25:0.8,e.clientX-r.left,e.clientY-r.top)},{passive:false});
   let drag=null; cv.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing'});
-  cv.addEventListener('pointermove',e=>{ if(!drag||MV.cx==null) return; MV.cx-=(e.clientX-drag[0])/(MV.sc*MV.k); MV.cz-=(e.clientY-drag[1])/(MV.sc*MV.k); drag=[e.clientX,e.clientY]; mapRedraw() });
+  cv.addEventListener('pointermove',e=>{ if(!drag||MV.cx==null){ const p=hoverPts(cv,e,9); tip(e,p?p[2]:null); return } tip(e,null); MV.cx-=(e.clientX-drag[0])/(MV.sc*MV.k); MV.cz-=(e.clientY-drag[1])/(MV.sc*MV.k); drag=[e.clientX,e.clientY]; mapRedraw() });
   const up=()=>{drag=null;cv.style.cursor='grab'}; cv.addEventListener('pointerup',up); cv.addEventListener('pointercancel',up);
+  cv.addEventListener('pointerleave',e=>tip(e,null));
   cv.addEventListener('dblclick',()=>{MV.k=1;MV.cx=null;mapRedraw()});
   $('mzIn').onclick=()=>mapZoom(1.5); $('mzOut').onclick=()=>mapZoom(1/1.5); $('mzReset').onclick=()=>{MV.k=1;MV.cx=null;mapRedraw()};
   $('mFull').checked=mvGet('full','0')=='1'; $('mFull').onchange=()=>{mvSet('full',$('mFull').checked?'1':'0');mapRedraw()};
@@ -533,7 +611,7 @@ function drawMap(cv,track,ends){
   const clr=Number(mvGet('clear','0'))||0, onlyFull=mvGet('full','0')=='1', all=ends.length;
   ends=ends.filter(e=>(!clr||(e[4]||0)>clr)&&(!onlyFull||!e[3]));
   $('mInfo').textContent=all?`${ends.length} of ${all} lap ends shown`+(clr?' (cleared earlier ones)':''):'';
-  const pts=track.concat(ends.map(e=>[e[0],e[1]]));
+  const pts=track.concat(ends.map(e=>[e[0],e[1]]),((S_LAST&&S_LAST.marks)||[]).map(m=>[m.x,m.z]));
   if(!pts.length){g.fillStyle='#8b93a0';g.font='11px Segoe UI';g.fillText('no data yet',w/2-28,h/2);return}
   let x0=Math.min(...pts.map(p=>p[0])),x1=Math.max(...pts.map(p=>p[0])),z0=Math.min(...pts.map(p=>p[1])),z1=Math.max(...pts.map(p=>p[1]));
   const sc=Math.min((w-20)/Math.max(x1-x0,1),(h-20)/Math.max(z1-z0,1));
@@ -544,6 +622,17 @@ function drawMap(cv,track,ends){
   const rr=Math.min(2.2*Math.sqrt(MV.k),6);
   for(const e of ends){g.globalAlpha=e[3]?0.15:0.45;g.fillStyle=(e[2]=='stuck'||e[2]=='off-zone')?'#e5484d':'#e8a33a';
     g.beginPath();g.arc(X(e[0]),Z(e[1]),rr,0,7);g.fill()} g.globalAlpha=1;
+  cv._pts=[]; g.font='600 11px Segoe UI';           /* start / checkpoints / finish (from the PB or champion trace) */
+  const mk=(S_LAST&&S_LAST.marks)||[], st=mk.find(m=>m.k=='start'), fi=mk.find(m=>m.k=='finish');
+  const same=st&&fi&&Math.hypot(st.x-fi.x,st.z-fi.z)<8;   /* start/finish block (multilap): one half-green half-red marker */
+  for(const m of [...mk.filter(m=>m.k=='cp'),...mk.filter(m=>m.k=='finish'),...mk.filter(m=>m.k=='start')]){
+    if(same&&m.k=='finish') continue;
+    const px=X(m.x),py=Z(m.z), nm=same&&m.k=='start'?'Start / Finish':m.name; cv._pts.push([px,py,nm]);
+    g.strokeStyle='#0e1013'; g.lineWidth=2;
+    if(m.k=='cp'){ g.fillStyle='#3b8bea'; g.beginPath(); g.arc(px,py,6,0,7); g.fill(); g.stroke(); g.fillStyle='#e8eaed'; g.fillText(m.name.replace(' ',''),px+9,py+4); continue }
+    g.fillStyle=m.k=='start'?'#39c46a':'#ef5b60'; g.fillRect(px-6,py-6,12,12);
+    if(same){ g.fillStyle='#ef5b60'; g.beginPath(); g.moveTo(px+6,py-6); g.lineTo(px+6,py+6); g.lineTo(px-6,py+6); g.fill() }
+    g.strokeRect(px-6,py-6,12,12) }
   if(MV.k>1){g.fillStyle='#8b93a0';g.font='11px Segoe UI';g.fillText(`zoom x${MV.k.toFixed(1)}`,8,h-8)}}
 function movAvg(p,k){ const o=[];let s=0;for(let i=0;i<p.length;i++){s+=p[i][1];if(i>=k)s-=p[i-k][1];o.push([p[i][0],s/Math.min(i+1,k)])}return o }
 
@@ -553,7 +642,8 @@ function hitTxt(s){ const h=s&&s.hit_ramp; if(!h||!s.config.w_hit) return '';
 function render(s){ S_LAST=s;
   const c=s.config; LINES=s.linesight||LINES;
   if(!cfgLoaded){ DEF=s.defaults||Object.assign({},c);   /* never empty: an empty DEF would save an empty config */ WMETA=s.weights||[]; BASE=c; fillForm(c); cfgLoaded=true }
-  drawRb(s.rb||{}); drawMap($('cMap'),s.track||[],s.ends||[]);
+  if(changed('rb',s.rb)) drawRb(s.rb||{});
+  if(changed('map',[s.track,s.ends,s.marks])) drawMap($('cMap'),s.track||[],s.ends||[]);
   $('sub').textContent=`Control Panel · run ${c.run} · league of ${c.envs} cars · ${c.steer_mode} steering`;
   const run=s.state=='running'||s.state=='playing';
   $('dot').className='dot'+(s.state=='running'||s.state=='playing'?' run':(s.reason.startsWith('crash')||s.reason.includes('unexpected')?' err':''));
@@ -578,29 +668,35 @@ function render(s){ S_LAST=s;
   $('banner').innerHTML=bn.map(t=>`<div style="color:${t.startsWith('STARTING')?'var(--red)':'var(--org)'}">${t.replace(/</g,'&lt;')}</div>`).join(''); $('stopBar').style.width=(100-100*s.next_test_in/Math.max(1,c.test_every_laps))+'%';
   $('kLaps').textContent=n0(s.laps_total); $('kFin').textContent=(s.finished_pct==null?'':`${s.finished_pct}% of full laps finished`)+(s.mid_laps?` · ${n0(s.mid_laps)} mid-track`:'');
   $('kAvg').textContent=sec(s.recent_avg); $('kBest').textContent=sec(s.best_lap);
-  $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'')}${(s.best_lap-pb/1000).toFixed(2)} s vs PB`:'';
-  drawTime(s); drawSections(s.sections); drawBase(s);
+  $('kBestPb').textContent=s.best_lap&&pb?`${(s.best_lap-pb/1000>=0?'+':'−')}${Math.abs(s.best_lap-pb/1000).toFixed(3)} s vs PB`:'';
+  drawTime(s); if(changed('sec',s.sections)) drawSections(s.sections); drawBase(s);
   $('kSpeed').textContent=s.speed?Math.round(s.speed)+'x':'–'; $('kCars').textContent=`vs real time · league of ${c.envs} cars`;
   $('kTests').textContent=n0(s.tests_total); $('kProm').textContent=`${s.promotions} faster champions found`;
   $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;
-  $('log').textContent=s.log.join('\n');
-  const laps=s.laps, tests=s.tests.filter(t=>t.ms);
+  if(changed('log',[s.log,LOGW])) drawLog(s.log||[]);
+  const tests=s.tests.filter(t=>t.ms);
   const ol=s.own_line||{}; $('presetTxt').textContent=[s.run_preset?`This run: ${s.run_preset} rewards`:'',
     ol.on?`Line: its own (since champion ${(ol.champ_ms/1000).toFixed(3)} s, PB ${(ol.pb_ms/1000).toFixed(3)} s)`:''].filter(Boolean).join(' · ');
-  draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},{t:'d',p:s.glaps||[],c:'#46c37b',r:3},
-     {t:'d',p:tests.filter(t=>t.promoted).map(t=>[t.lap_n,t.ms/1000]),c:'#e8622a',r:4},
-     ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[]),
-     {t:'m',ch:'G',c:'#c9a227',x:(s.targets||[]).filter(t=>t.k=='target').map(t=>t.lap)},
-     {t:'m',ch:'S',c:'#a06be0',x:(s.targets||[]).filter(t=>t.k=='section').map(t=>t.lap)}],v=>v.toFixed(1)+' s');
+  if(changed('laps',[s.laps,s.tests,s.targets,ch,pb])) drawLaps();
+  $('lapGap').innerHTML=ch&&pb?`champion ${ms(ch)} · PB ${ms(pb)} · gap <b class="${ch>pb?'bad':'ok'}">${ch>pb?'+':'−'}${(Math.abs(ch-pb)/1000).toFixed(3)} s</b>`:(ch?`champion ${ms(ch)}`:'');
   const all=s.tests.map((t,i)=>[i+1,t]);
-  draw($('c2'),[{t:'l',p:all.filter(([,t])=>t.ms).map(([i,t])=>[i,t.ms/1000]),c:'#3b8bea'},{t:'l',p:all.filter(([,t])=>t.champ_ms).map(([i,t])=>[i,t.champ_ms/1000]),c:'#e8622a'},
-     {t:'m',ch:'↑',c:'#e8622a',x:all.filter(([,t])=>t.promoted).map(([i])=>i)},{t:'m',ch:'↺',c:'#8b93a0',x:all.filter(([,t])=>t.rolled_back).map(([i])=>i)}],v=>v.toFixed(1)+' s');
-  draw($('c3'),[{t:'l',p:s.v,c:'#3b8bea',w:1}],v=>v.toFixed(1));
-  draw($('c4'),[{t:'l',p:s.vl,c:'#3b8bea',w:1}],v=>v.toFixed(3));
+  if(changed('tests',s.tests)) draw($('c2'),[{t:'l',p:all.filter(([,t])=>t.ms).map(([i,t])=>[i,t.ms/1000]),c:'#3b8bea'},{t:'l',p:all.filter(([,t])=>t.champ_ms).map(([i,t])=>[i,t.champ_ms/1000]),c:'#e8622a'},
+     {t:'m',ch:'↑',c:'#e8622a',x:all.filter(([,t])=>t.promoted).map(([i])=>i)},{t:'m',ch:'↺',c:'#8b93a0',x:all.filter(([,t])=>t.rolled_back).map(([i])=>i)}],v=>v.toFixed(3)+' s',{L:62});
+  if(changed('v',s.v)) draw($('c3'),[{t:'l',p:s.v,c:'#3b8bea',w:1}],v=>v.toFixed(1));
+  if(changed('vl',s.vl)) draw($('c4'),[{t:'l',p:s.vl,c:'#3b8bea',w:1}],v=>v.toFixed(3));
   const L=s.learn||{}; $('vlTxt').textContent=[L.aux!=null?`Aux heads loss ${L.aux.toFixed(3)}`:'',
     L.sil!=null?`Self-imitation loss ${L.sil.toFixed(3)} (${Math.round((L.sil_act||0)*100)}% of samples better than expected, ${n0(L.sil_n)} steps of top laps)`:'',
     L.sstd!=null?`Steering exploration ±${L.sstd.toFixed(1)} of 127`:''].filter(Boolean).join(' · ');
 }
-async function tick(){ try{ render(await (await fetch('/api/state')).json()) }catch(e){} }
-tick(); setInterval(tick,2000); addEventListener('resize',tick);
+/* --- low-CPU polling: every N s (this page only, default 5), paused while the window is hidden; cards redraw only
+   when their data changed (or the view / size changed) --- */
+let POLL=null, BUSY=false;
+async function tick(){ if(BUSY) return; BUSY=true; try{ render(await (await fetch('/api/state')).json()) }catch(e){} BUSY=false }
+function pollEvery(){ return Number(vst('poll','5'))||5 }
+function startPoll(){ stopPoll(); if(document.hidden) return; tick(); POLL=setInterval(tick,pollEvery()*1000) }
+function stopPoll(){ if(POLL){clearInterval(POLL);POLL=null} }
+$('rRate').value=String(pollEvery()); $('rRate').onchange=()=>{vst('poll',$('rRate').value,1);startPoll()};
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) stopPoll(); else {CH={};startPoll()} });
+let RZ=null; addEventListener('resize',()=>{clearTimeout(RZ);RZ=setTimeout(()=>{CH={};if(S_LAST)render(S_LAST)},150)});
+startPoll();
 </script></body></html>

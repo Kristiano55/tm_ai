@@ -4,3 +4,4 @@ gymnasium
 stable-baselines3
 torch
 psutil
+pywebview; sys_platform == "win32"   # optional: the dashboard in its own window (WebView2)

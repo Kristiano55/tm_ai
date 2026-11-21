@@ -283,9 +283,26 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   `guide`) vs "AI route (fallback: N% fail)" vs "PB/WR" vs "its own line"; column "Fail rate (of laps reaching it)"
   ("of the last N laps reaching it", window 200); "reached by practice starts only" when no lap from the start line
   got there (sections.json `full` counts); bottom row "Best case (sum of AI bests)" vs the PB total.
-- **Dashboard map "Where laps end":** zoom (wheel / + / −, up to x60), drag to pan, double-click / Reset view, "full
-  laps only", "Clear dots" (hides lap ends up to now by their event time `ends[i][4]`; "Show all" undoes) - view only,
-  kept in localStorage `tmai.map.*`, never in config or training.
+- **Dashboard views (Kris-approved exception to the freeze; view only, never config or training; state in localStorage
+  `tmai.*` via `vst()`):**
+  - Map "Where laps end": zoom (wheel / + / −, up to x60), drag to pan, double-click / Reset view, "full laps only",
+    "Clear dots" (hides lap ends up to now by event time `ends[i][4]`; "Show all" undoes). Start (green square), CPs
+    (blue, "CP1".."CPn") and finish (red square) from `map_marks()` (pb_trace, else champ_trace / best_trace: counter
+    increments before the last row = CPs, first row = start, last row = finish; start == finish -> one half-green
+    half-red "Start / Finish"); hover shows the name (`hoverPts` + `#tip`).
+  - Lap chart: x-zoom on the lap axis (wheel / + / −), drag to scroll, double-click / Reset view, filter (all full laps /
+    no-random laps / champion tests), Clear dots / Show all, hover = lap number, time (3 decimals), how it ended. The
+    server sends the last 2000 finished full laps `[n, s, greedy, t]` (+ tests with `t`). Header: champion · PB · gap.
+  - Training log: last 200 lines (`_tail`), red = warning / hint / STARTING FROM SCRATCH / out of memory / no finish /
+    rolling back / error, green = NEW CHAMPION, purple = section switches; "warnings only"; auto-scroll pauses while
+    scrolled up ("Jump to latest").
+  - Low CPU: refresh every 5 s by default (header picker 2/5/10/30 s, page-only), polling stops while the page is
+    hidden (`visibilitychange`), cards redraw only when their data changed (`changed()`), at most 2000 laps / 1500
+    lap ends drawn. 20k-lap fake run, 60 s: visible server 0.4 -> 0.3 %, browser 2.1 -> 0.5 %; hidden 0.5 -> 0.0 %,
+    2.3 -> 0.1 %.
+  - Own window: `start_dashboard.bat` runs `dashboard.py --window` -> pywebview (WebView2; optional in
+    requirements.txt, Windows only) else the browser. Closing the window never stops training; the server keeps
+    running (and guarding training) until Ctrl+C.
 - **Lap-time chart markers:** G = ghost rebuilt (event k=target), S = section target switched (k=section); dashboard
   `targets` (lap number when it happened).
 - **Own line once close to the PB** (`own_line_s` 2.0, 0 = never; PPO + IQN, runs with a `pb_file`): the target line,

@@ -60,7 +60,7 @@ class Store:
 
     def clear(self):
         self.off = 0
-        self.laps, self.tests, self.upds = [], [], []     # laps: (lap number, ms) of full laps only
+        self.laps, self.tests, self.upds = [], [], []     # laps: (lap number, ms, greedy, t) of full laps only
         self.glaps = []                                      # IQN exploitation laps (no random actions): [n, s]
         self.n_all, self.n_mid = 0, 0
         self.rbs, self.ends = [], []
@@ -113,7 +113,7 @@ class Store:
                 if e.get("mid"):
                     self.n_mid += 1
                 else:
-                    self.laps.append((self.n_all, e.get("ms")))
+                    self.laps.append((self.n_all, e.get("ms"), 1 if e.get("greedy") else 0, e.get("t") or 0))
                     if e.get("greedy") and e.get("ms"):
                         self.glaps.append([self.n_all, e["ms"] / 1000.0])
                         del self.glaps[:-2000]
@@ -134,6 +134,47 @@ class Store:
 
 
 STORE = Store()
+
+
+def _tail(path, n):
+    """Last n lines of a text file without reading all of it (train.log grows for days)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 200 * n))
+        data = f.read().decode("utf-8", errors="replace")
+    return data.splitlines()[-n:]
+
+
+_MARKS = {"key": None, "marks": []}
+
+
+def map_marks(rd):
+    """Start, checkpoints and finish for the map card: where the PB (else the champion / best lap) trace's checkpoint
+    counter went up; start = the trace's first point. Cached by file times."""
+    for name in ("pb_trace.npy", "champ_trace.npy", "best_trace.npy"):
+        f = rd / name
+        if f.exists():
+            break
+    else:
+        return []
+    key = (str(f), f.stat().st_mtime)
+    if _MARKS["key"] == key:
+        return _MARKS["marks"]
+    out = []
+    try:
+        import numpy as np
+        tr = np.load(f)
+        out.append({"k": "start", "name": "Start", "x": round(float(tr[0, 0]), 1), "z": round(float(tr[0, 2]), 1)})
+        # every trace here ends at the finish: checkpoints = counter increments before the last row
+        ups = [i for i in range(1, len(tr) - 1) if tr[i, 4] > tr[i - 1, 4]]
+        for j, i in enumerate(ups):
+            out.append({"k": "cp", "name": f"CP {j + 1}", "x": round(float(tr[i, 0]), 1), "z": round(float(tr[i, 2]), 1)})
+        out.append({"k": "finish", "name": "Finish", "x": round(float(tr[-1, 0]), 1), "z": round(float(tr[-1, 2]), 1)})
+    except Exception:
+        out = []
+    _MARKS.update(key=key, marks=out)
+    return out
 
 
 def track_outline(rd):
@@ -286,7 +327,7 @@ def tests_can_run(cfg, rd, best):
     if cfg["run_type"] == "base":
         return any((rd / "maps" / cfgmod.map_slug(e["map"]) / "best_run.json").exists() for e in cfg["map_pool"])
     # same rule as the trainers (common.full_lap_done): a champion, or a finished FULL lap in this run's events
-    return bool(best.get("champion_ms")) or any(ms for _, ms in STORE.laps)
+    return bool(best.get("champion_ms")) or any(lp[1] for lp in STORE.laps)
 
 
 def safe(fn, *a):
@@ -336,15 +377,15 @@ def build_state():
         state, reason = status.get("state", "idle"), status.get("reason", "")
 
     S = STORE
-    fin = [(n, ms / 1000.0) for n, ms in S.laps if ms]
-    last50 = [ms for _, ms in S.laps[-50:]]
+    fin = [(lp[0], lp[1] / 1000.0) for lp in S.laps if lp[1]]
+    last50 = [lp[1] for lp in S.laps[-50:]]
     last20 = [s for _, s in fin][-20:]
     last_test_lap = S.tests[-1]["lap_n"] if S.tests else 0
     sess_end = now if running else (S.last_t or now)
     upd = S.upds[-1] if S.upds else {}
     log_path = rd / "train.log"
     try:
-        log = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-14:]
+        log = _tail(log_path, 200)
     except OSError:
         log = []
     return {
@@ -367,8 +408,10 @@ def build_state():
         "tests_total": len(S.tests), "promotions": sum(1 for t in S.tests if t["promoted"]),
         "learn": {k: upd.get(k) for k in ("aux", "sil", "sil_act", "sil_n")},
         "updates": upd.get("u", 0), "steps": upd.get("steps", 0), "speed": upd.get("speed"),
-        "laps": downsample([[n, s] for n, s in fin]), "glaps": S.glaps[-1000:],
-        "tests": [{"lap_n": t["lap_n"], "ms": t["ms"], "champ_ms": t["champ_ms"],
+        # the last 2000 finished full laps: [lap number, s, no-random lap, event time] (the page draws at most these)
+        "laps": [[lp[0], round(lp[1] / 1000.0, 3), lp[2], round(lp[3], 1)] for lp in S.laps if lp[1]][-2000:],
+        "glaps": S.glaps[-1000:], "marks": map_marks(rd),
+        "tests": [{"lap_n": t["lap_n"], "ms": t["ms"], "champ_ms": t["champ_ms"], "t": t.get("t"),
                    "promoted": t["promoted"], "rolled_back": t["rolled_back"]} for t in S.tests[-400:]],
         "v": downsample([[i + 1, u["v"]] for i, u in enumerate(S.upds)]),
         "vl": downsample([[i + 1, u["vl"]] for i, u in enumerate(S.upds)]),
@@ -672,17 +715,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps({"message": msg}))
 
 
+def open_window(url):
+    """Own lightweight window (pywebview: WebView2 on Windows) if installed. Returns False -> use the browser.
+    Closing the window never stops training: it runs in its own process, and this server keeps running."""
+    try:
+        import webview
+    except ImportError:
+        print("pywebview is not installed (pip install pywebview): opening the dashboard in the browser.")
+        return False
+    try:
+        webview.create_window("Trackmania AI", url, width=1440, height=920, background_color="#0e1013")
+        webview.start()                                  # blocks until the window is closed
+    except Exception as e:
+        print(f"Could not open the dashboard window ({str(e)[:100]}): opening the browser.")
+        return False
+    print("Dashboard window closed. Training (if running) keeps going; this server keeps watching it.")
+    print(f"Reopen {url} in a browser, or press Ctrl+C here to quit the dashboard.")
+    return True
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
-    port = ap.parse_args().port
+    ap.add_argument("--window", action="store_true", help="open in its own window (pywebview) instead of the browser")
+    args = ap.parse_args()
+    port = args.port
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
     print("Trackmania AI dashboard:", url, "(Ctrl+C to quit)")
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     threading.Thread(target=frozen_guard, daemon=True).start()
     threading.Thread(target=discord_loop, daemon=True).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    if args.window:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        if not open_window(url):
+            webbrowser.open(url)
+        try:
+            while True:                                  # keep serving (and guarding training) after the window
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    else:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
