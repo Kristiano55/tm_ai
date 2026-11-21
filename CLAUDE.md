@@ -435,3 +435,5 @@ verify incl. a faked time, benchmark). The fake game records real inputs (`expor
 - Base: lap-time chart mixes maps in base runs (per-map table is the real view).
 - Run comparison view in the dashboard.
 - Check selftest's raw ice values on a real ice/snow map.
+- After the freeze (Kris: "not yet"): local IQN knowledge library `brain/` (brain add <run> / brain train, curated
+  memories of the AI's own driving, physics.json per surface, `start_from_brain` for new IQN runs, dashboard card).
