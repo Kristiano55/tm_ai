@@ -67,6 +67,7 @@ DEFAULTS = {
     "iqn_steer_levels": 21,    # IQN: 21 / 31 / 41 steering levels (new IQN runs only)
     "own_line_s": 2.0,         # with a PB file: once the champion is within N s of the PB, follow its own line (0 = never)
     "obs_norm": True,          # PPO + IQN: inputs normalised by running mean/std (clipped +-5), saved with the run
+    "iqn_greedy_share": 0.2,   # IQN: share of training laps driven without random actions (new IQN runs; old: 0)
     "iqn_per": True,           # IQN: prioritized replay (alpha 0.6, beta 0.4 -> 1); new IQN runs only
     "start_focus": 0.5,        # mid-track starts: share picked by where laps fail / lose time (rest uniform)
     "analog_steer": True,      # PPO: steering is one analog value -127..127 instead of 21 levels (IQN keeps levels)
@@ -207,6 +208,7 @@ def coerce(cfg):
     out["envs"] = max(1, out["envs"])
     out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
     out["own_line_s"] = max(0.0, out["own_line_s"])
+    out["iqn_greedy_share"] = min(max(out["iqn_greedy_share"], 0.0), 1.0)
     out["minirace_s"] = min(max(out["minirace_s"], 1.0), 15.0)
     out["start_focus"] = min(max(out["start_focus"], 0.0), 1.0)
     pool = []

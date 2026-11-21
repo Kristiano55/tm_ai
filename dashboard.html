@@ -114,7 +114,7 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
 
   <section class="grp" aria-label="Laps and tests"><div class="gh">Laps &amp; tests</div>
   <div class="card" data-c="laps"><div class="ch"><h3>Lap times <small>every finished training lap, lower is faster</small></h3></div>
-    <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span><span title="The ghost (reward target) was rebuilt from a new champion"><em style="color:#c9a227;font-style:normal;font-weight:700;margin-right:4px">G</em> ghost rebuilt</span><span title="A section's target route switched between your PB and the AI's own route"><em style="color:#a06be0;font-style:normal;font-weight:700;margin-right:4px">S</em> section target switched</span><span class="mut" id="presetTxt"></span></div>
+    <div class="lg" style="margin-bottom:6px"><span><b style="background:var(--blue)"></b>Training laps</span><span><b style="background:#6fb1ff"></b>20-lap average</span><span><b style="background:var(--org)"></b>Champion (tests)</span><span title="IQN exploitation laps: driven without random actions"><b style="background:#46c37b"></b>No-random laps</span><span title="The ghost (reward target) was rebuilt from a new champion"><em style="color:#c9a227;font-style:normal;font-weight:700;margin-right:4px">G</em> ghost rebuilt</span><span title="A section's target route switched between your PB and the AI's own route"><em style="color:#a06be0;font-style:normal;font-weight:700;margin-right:4px">S</em> section target switched</span><span class="mut" id="presetTxt"></span></div>
     <canvas id="c1" class="t"></canvas></div>
   <div class="row r3">
     <div class="card" data-c="tests"><div class="ch"><h3>Champion tests <small>↑ promoted · ↺ rolled back</small></h3></div>
@@ -215,6 +215,7 @@ const I={step:1}, F={
  line_refresh_s:['Line refresh (s)','Rebuild the reference line + ghost when the champion beats it by this much. 0 = never.','number',{min:0,max:60,step:'any'}],
  start_focus:['Mid-start focus','Share of mid-track starts placed where laps fail or lose time to the ghost; the rest are spread evenly. 0 = all even, 1 = all focused.','number',{min:0,max:1,step:0.05}],
  obs_norm:['Input normalisation','PPO + IQN: inputs scaled by their running average/spread (clipped at 5). Saved with the run; older runs start at "no scaling" and blend in slowly.','checkbox',{more:1}],
+ iqn_greedy_share:['Exploitation laps (IQN)','IQN: this share of training laps drives without any random actions (pure best guess), round-robin over the cars; they are learned from like any lap. NEW IQN runs only (existing runs keep 0).','number',{min:0,max:1,step:0.05,iqn:1}],
  iqn_per:['Prioritized replay (IQN)','IQN: replays surprising experiences more often (alpha 0.6, beta 0.4 -> 1). NEW IQN runs only; existing IQN runs keep uniform sampling.','checkbox',{iqn:1}],
  own_line_s:['Own line from (s to PB)','With a PB file: once the champion is within this many seconds of your PB, the whole target line, ghost and mid-track starts follow the champion\'s own route (rebuilt with every new champion); back to your PB line if it falls further behind. 0 = always your PB line.','number',{min:0,max:60,step:0.1}],
  mid_start_p:['Mid-track starts','Share of laps that start partway along the champion lap (after the first finish). 0 = off.','number',{min:0,max:1,step:0.05}],
@@ -269,7 +270,7 @@ const SECTIONS=[
  ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
  ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
  ['note','Notifications',['discord_webhook','discord_every_min']],
- ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_per','iqn_rollback','iqn_device','reward_v']],
+ ['adv','Advanced',['algo','extra_obs','steer_mode','minirace_s','iqn_reuse','iqn_buffer','iqn_eps_full_steps','iqn_eps_mid','iqn_eps_mid_steps','iqn_eps_end','iqn_eps_end_steps','iqn_warm_run','iqn_mid_start_p','iqn_gas_brake','iqn_steer_levels','iqn_greedy_share','iqn_per','iqn_rollback','iqn_device','reward_v']],
 ];
 let DEF={}, BASE={}, WMETA=[], LINES={}, cfgLoaded=false, DIRTY=false, BAD=new Set();
 const meta=k=>{const f=F[k]||[k,'','text'];return {k,label:f[0],hint:f[1],type:f[2],o:f[3]||{}}};
@@ -554,7 +555,7 @@ function render(s){ S_LAST=s;
   const laps=s.laps, tests=s.tests.filter(t=>t.ms);
   const ol=s.own_line||{}; $('presetTxt').textContent=[s.run_preset?`This run: ${s.run_preset} rewards`:'',
     ol.on?`Line: its own (since champion ${(ol.champ_ms/1000).toFixed(3)} s, PB ${(ol.pb_ms/1000).toFixed(3)} s)`:''].filter(Boolean).join(' · ');
-  draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},
+  draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},{t:'d',p:s.glaps||[],c:'#46c37b',r:3},
      {t:'d',p:tests.filter(t=>t.promoted).map(t=>[t.lap_n,t.ms/1000]),c:'#e8622a',r:4},
      ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[]),
      {t:'m',ch:'G',c:'#c9a227',x:(s.targets||[]).filter(t=>t.k=='target').map(t=>t.lap)},

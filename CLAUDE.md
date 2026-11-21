@@ -198,6 +198,12 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   blend in slowly. PPO: rollout obs stashed at rollout end, applied at the next rollout START (stats constant within
   collect + update); EMA copies the stats exactly. IQN: learner updates from the replay batch every `NORM_EVERY` (10)
   updates, tgt gets the same stats.
+- **IQN exploitation laps** (`iqn_greedy_share` 0.2 for NEW IQN runs, iqn.json `greedy`; runs from before keep 0):
+  that share of training laps (global lap counter, so round-robin over the cars; `next_greedy`) drives pure argmax:
+  no epsilon, no Boltzmann (`choose(greedy=...)`). They go into the replay and count for best_run / sections like any
+  lap. Lap events carry `greedy: 1` and `rnd` (random / Boltzmann actions this lap, 0 on greedy laps); the 5-min
+  profile adds "exploitation laps: N, X % finished, best Y s"; the dashboard lap chart draws them green
+  ("No-random laps", `glaps`). Champion tests unchanged.
 - **IQN prioritized replay** (`iqn_per`, default on, NEW IQN runs only: iqn.json `per`; runs from before keep
   uniform): replay field `p` (= (|TD| + 1e-3)^0.6, new samples get the max `pm`), stratified sampling over a cumsum
   refreshed every 10 updates (`per_sample`), IS weights (n P)^-beta / max with beta 0.4 -> 1 over 3M steps

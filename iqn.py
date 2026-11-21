@@ -122,10 +122,11 @@ def layout_cfg(cfg, run_dir, quiet=False):
         T.say(f"IQN: this run keeps its layout ({lv} steering levels, {nm} throttle modes); the IQN steering levels / "
               "gas+brake settings only apply to new IQN runs (IQN checkpoints can't be converted).")
     NM[0] = nm
-    per = bool(cfg.get("iqn_per", True))
+    per, greedy = bool(cfg.get("iqn_per", True)), float(cfg.get("iqn_greedy_share", 0.2))
     if have:                                          # an existing run keeps its replay sampling (older runs: uniform)
-        per = bool(meta.get("per", False))
-    return dict(cfg, _iqn_levels=lv, _iqn_modes=nm, _iqn_per=per)
+        per = bool(meta.get("per", False))           # ... and its lap mix (older runs: no greedy laps)
+        greedy = float(meta.get("greedy", 0.0))
+    return dict(cfg, _iqn_levels=lv, _iqn_modes=nm, _iqn_per=per, _iqn_greedy=greedy)
 
 
 def per_sample(p, cum, b, beta, rng):
@@ -162,17 +163,24 @@ def random_action(n_act, rng):
     return int(rng.integers(n_act // nm)) * nm + m
 
 
-def choose(net, obs, eps, beps, rng, seed_noise=None):
-    """obs [B, dim] -> action indices; full mini-race ahead when acting."""
+def choose(net, obs, eps, beps, rng, seed_noise=None, greedy=None, rnd=None):
+    """obs [B, dim] -> action indices; full mini-race ahead when acting. greedy[i] = pure argmax for row i (an
+    exploitation lap: no epsilon, no Boltzmann). rnd (list) gets True per row whose action was not the argmax pick."""
     with torch.no_grad():
         q = net.q(torch.from_numpy(with_tau(obs, 1.0))).numpy()
     out = q.argmax(1)
     for i in range(len(out)):
+        if greedy is not None and greedy[i]:
+            if rnd is not None:
+                rnd.append(False)
+            continue
         u = rng.random()
         if u < eps:
             out[i] = random_action(q.shape[1], rng)
         elif u < eps + beps:
             out[i] = int(np.argmax(q[i] + TAU_B * rng.gumbel(size=q.shape[1])))
+        if rnd is not None:
+            rnd.append(u < eps + beps)
     return out
 
 
@@ -439,7 +447,8 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
             tgt.load_state_dict(net.state_dict())
         T.write_json(run_dir / "iqn.json", {"n_in": n_in, "n_act": n_act, "levels": int(cfg.get("_iqn_levels") or 21),
                                             "modes": int(cfg.get("_iqn_modes") or 3),
-                                            "per": bool(cfg.get("_iqn_per", False))})
+                                            "per": bool(cfg.get("_iqn_per", False)),
+                                            "greedy": float(cfg.get("_iqn_greedy", 0.0))})
         ctr[0], ctr[1], ctr[2] = steps0, max(0, steps0 - WARMUP) * cfg["iqn_reuse"], 0
         buf = SharedReplay(cfg["iqn_buffer"], dim, names=rnames)
         wnp = np.frombuffer(wbuf, dtype=np.float32)
@@ -674,9 +683,18 @@ def train(cfg):
             C["laps"] += 1
             C["since"] += 1
             fin = bool(info.get("finished"))
+            g = bool(greedy_lap[i])
             log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                 end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"),
-                **({"ast": info["ast"]} if info.get("ast") else {}))
+                **({"ast": info["ast"]} if info.get("ast") else {}), **({"greedy": 1} if g else {}),
+                rnd=int(lap_rnd[i]))
+            if g:
+                GS["n"] += 1
+                if fin and not info.get("mid"):
+                    GS["fin"] += 1
+                    GS["best"] = min(GS["best"] or 10 ** 9, int(info["race_ms"]))
+            lap_rnd[i] = 0
+            greedy_lap[i] = next_greedy()                    # the car's next lap
             for kk, vv in (info.get("rb") or {}).items():
                 rb[kk] = rb.get(kk, 0.0) + vv
             rb_steps += int(info.get("rsteps", 0))
@@ -705,7 +723,24 @@ def train(cfg):
             ppo = None
             T.say(f"Warm start skipped ({str(e)[:100]})")
 
-    def policy(obs_b, steps):
+    # exploitation laps: a share (iqn_greedy_share) of the laps, spread round-robin over the cars, drive pure argmax
+    # (no epsilon, no Boltzmann); they go into the replay and count for best_run / sections like any lap
+    g_share = float(cfg.get("_iqn_greedy", 0.0))
+    g_acc = [0.0]
+
+    def next_greedy():
+        g_acc[0] += g_share
+        if g_acc[0] >= 1.0 - 1e-9:
+            g_acc[0] -= 1.0
+            return True
+        return False
+
+    greedy_lap, lap_rnd = [next_greedy() for _ in range(n_env)], [0] * n_env
+    GS = {"n": 0, "fin": 0, "best": None}
+    if g_share > 0:
+        T.say(f"IQN: {g_share:.0%} of the training laps are exploitation laps (no random actions).")
+
+    def policy(obs_b, steps, ids=None):
         nonlocal ppo
         if ppo is not None:
             if steps >= 50000:
@@ -721,7 +756,13 @@ def train(cfg):
                 rnd = rng.random(len(pa)) < 0.1
                 pa[rnd] = np.stack([rng.integers(nvec[0], size=rnd.sum()), rng.integers(nvec[1], size=rnd.sum())], 1)
                 return pa[:, 0] * nvec[1] + pa[:, 1]
-        return choose(act, obs_b, sched(EPS_PTS, steps), sched(BOLTZ, steps), rng)
+        ids = list(range(len(obs_b))) if ids is None else ids
+        rnd = []
+        out = choose(act, obs_b, sched(EPS_PTS, steps), sched(BOLTZ, steps), rng,
+                     greedy=[greedy_lap[i] for i in ids], rnd=rnd)
+        for i, r_ in zip(ids, rnd):
+            lap_rnd[i] += int(r_)
+        return out
 
     cur_obs, cur_act = list(pool.first_obs), [0] * n_env
     reason = "stopped"
@@ -761,7 +802,7 @@ def train(cfg):
             if items:
                 refresh_act()
                 ids = [it[0] for it in items]
-                a = policy(np.stack([cur_obs[i] for i in ids]), int(ctr[0]))
+                a = policy(np.stack([cur_obs[i] for i in ids]), int(ctr[0]), ids)
                 for i, ai in zip(ids, a):
                     cur_act[i] = int(ai)
                     pool.send(i, act_index(cur_act[i]))
@@ -798,6 +839,11 @@ def train(cfg):
                 rec["cars"] = n_env
                 log(**rec)
                 T.say(T.prof_line(rec))
+                if g_share > 0:
+                    T.say(f"  exploitation laps (no random actions): {GS['n']} in the last {wall / 60:.0f} min, "
+                          f"{GS['fin'] / max(GS['n'], 1):.0%} finished"
+                          + (f", best {GS['best'] / 1000:.3f} s" if GS["best"] else ""))
+                    GS.update(n=0, fin=0, best=None)
                 tgt_r = float(cfg["iqn_reuse"])
                 if int(c[0]) > WARMUP and lrn["reuse"] < 0.8 * tgt_r:      # learner can't keep up with the cars
                     sug = max(1, int(n_env * lrn["reuse"] / tgt_r))

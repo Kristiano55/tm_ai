@@ -61,6 +61,7 @@ class Store:
     def clear(self):
         self.off = 0
         self.laps, self.tests, self.upds = [], [], []     # laps: (lap number, ms) of full laps only
+        self.glaps = []                                      # IQN exploitation laps (no random actions): [n, s]
         self.n_all, self.n_mid = 0, 0
         self.rbs, self.ends = [], []
         self.targets = []                                    # reward target changes: ghost rebuilds, section switches
@@ -113,6 +114,9 @@ class Store:
                     self.n_mid += 1
                 else:
                     self.laps.append((self.n_all, e.get("ms")))
+                    if e.get("greedy") and e.get("ms"):
+                        self.glaps.append([self.n_all, e["ms"] / 1000.0])
+                        del self.glaps[:-2000]
             elif k == "test":
                 self.tests.append(e)
                 if e.get("map"):
@@ -331,7 +335,7 @@ def build_state():
         "tests_total": len(S.tests), "promotions": sum(1 for t in S.tests if t["promoted"]),
         "learn": {k: upd.get(k) for k in ("aux", "sil", "sil_act", "sil_n")},
         "updates": upd.get("u", 0), "steps": upd.get("steps", 0), "speed": upd.get("speed"),
-        "laps": downsample([[n, s] for n, s in fin]),
+        "laps": downsample([[n, s] for n, s in fin]), "glaps": S.glaps[-1000:],
         "tests": [{"lap_n": t["lap_n"], "ms": t["ms"], "champ_ms": t["champ_ms"],
                    "promoted": t["promoted"], "rolled_back": t["rolled_back"]} for t in S.tests[-400:]],
         "v": downsample([[i + 1, u["v"]] for i, u in enumerate(S.upds)]),
