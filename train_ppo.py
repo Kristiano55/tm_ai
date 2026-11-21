@@ -263,7 +263,9 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
             f.write(json.dumps(kw) + "\n")
 
     env, model, bad, tests = None, None, 0, 0
+    to_warned = False                                 # 'test hit the lap limit' is said once
     while True:
+        watchdog_off()                                   # waiting for the next test is not a hang
         msg = inbox.get()
         if msg is None:
             break
@@ -324,6 +326,11 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
                 best["champion_seed"] = tr["seed"]
                 save_npy(R / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
                 InputText.write(str(R / "champion.txt"), rec.actions)
+            elif not fin and info.get("end") == "timeout":    # the lap limit is too short, not a bad driver
+                if not to_warned:
+                    to_warned = True
+                    say(f"Champion test hit the lap time limit (max_lap_seconds {mcfg['max_lap_seconds']} s): not counted "
+                        "for rollback. Raise 'Max lap (s)' to at least 1.3 x the champion / PB time.")
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
                 bad += 1
                 if bad >= cfg["rollback_after"] and not maps:
@@ -397,7 +404,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
             self.trackers, self.stuckws = {}, {}
             self.ep = [[] for _ in range(cfg["envs"])]       # self-imitation: the lap each car is driving
             self.ramps = {}                                  # wall-hit ramp per run folder (per map in base runs)
-            self.finished_once = (run_dir / "best_run.json").exists() or bool(read_json(best_file).get("champion_ms"))
+            self.finished_once = full_lap_done(run_dir)
             freeze_guard(run_dir, seconds=max(180.0, 2.0 * time_budget(cfg) + 60.0))
             self.ptm, self.last_prof, self.prof_steps = np.zeros(5), time.time(), self.model.num_timesteps
             log(k="start", cfg=cfg, **({"notice": notice} if notice else {}))
@@ -575,7 +582,7 @@ def _make_callback(cfg, run_dir, tracker=None, maps=None, notice=None):
         def tests_ready(self):
             """No champion tests (and so no rollbacks) before the first full lap has been finished in this run."""
             if maps:
-                return any((Path(m[1]) / "best_run.json").exists() for m in maps)
+                return self.finished_once and any((Path(m[1]) / "best_run.json").exists() for m in maps)
             return self.finished_once
 
         def tester_start(self):
@@ -784,6 +791,8 @@ def train(cfg):
     raise_priority(tick_too=True)
     base = cfg["run_type"] == "base"
     reward_notice(run_dir)
+    if lap_limit_warning(cfg, run_dir):
+        say("Warning: " + lap_limit_warning(cfg, run_dir))
     from_base = None if base else start_from_base(cfg, run_dir)
     pnorm = float(cfg["progress_norm_m"]) if (base or (run_dir / "base.json").exists()) else 0.0
     specs, maps = setup_cars(cfg, run_dir, pnorm)

@@ -74,6 +74,8 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
 .savebar .msg{flex:1;color:var(--mut);font-size:13px}.savebar.dirty .msg{color:var(--yel)}
 .leave{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:10;background:#1d1a14;border:1px solid var(--yel);border-radius:var(--r);padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:calc(100% - 24px)}
 @media(max-width:800px){.q .tip{position:fixed;left:12px;right:12px;bottom:64px;transform:none;width:auto;max-width:none}#set{grid-template-columns:1fr}.snav{display:none}#secSel{display:block;width:100%}.stop{flex-wrap:wrap}header{padding:10px 12px}main{padding:12px}.pill{max-width:100%}}
+.mapc{margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.mapc label{display:flex;gap:4px;align-items:center}
+tr.tot td{border-top:1px solid #3a414c;font-weight:600}
 </style></head><body>
 <header>
   <div class="logo" aria-hidden="true">&raquo;</div>
@@ -127,9 +129,13 @@ mark{background:#e8a33a55;color:inherit;border-radius:2px}
   <div class="row r11">
     <div class="card" data-c="rb"><div class="ch"><h3>Reward breakdown <small>per step, recent updates · red costs, green pays</small></h3></div>
       <div id="rbBars" class="mut">no data yet</div><div class="mut" id="rbSum" style="margin-top:8px"></div></div>
-    <div class="card" data-c="ends"><div class="ch"><h3>Where laps end <small>full laps bright, mid-track faint</small></h3></div>
-      <div class="lg" style="margin-bottom:6px"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span></div>
-      <canvas id="cMap" style="height:280px"></canvas></div>
+    <div class="card" data-c="ends"><div class="ch"><h3>Where laps end <small>full laps bright, mid-track faint · wheel / buttons to zoom, drag to pan, double-click to reset</small></h3></div>
+      <div class="lg" style="margin-bottom:6px"><span><b style="background:#e5484d"></b>stuck / off-zone</span><span><b style="background:#e8a33a"></b>cut / timeout</span>
+        <span class="mapc"><button type="button" class="sm" id="mzIn" title="Zoom in">+</button><button type="button" class="sm" id="mzOut" title="Zoom out">−</button><button type="button" class="sm" id="mzReset">Reset view</button>
+        <label class="mut"><input type="checkbox" id="mFull"> full laps only</label>
+        <button type="button" class="sm" id="mClear" title="Hide the dots of laps that ended so far (view only: nothing is deleted, training is not touched)">Clear dots</button><button type="button" class="sm" id="mAll">Show all</button>
+        <span class="mut" id="mInfo"></span></span></div>
+      <canvas id="cMap" style="height:340px;cursor:grab;touch-action:none"></canvas></div>
   </div></section>
 
   <section class="grp" aria-label="Sections and base maps"><div class="gh">Sections &amp; base maps</div>
@@ -452,10 +458,12 @@ function drawBase(s){
 function drawSections(rows){
   if(!rows||!rows.length){$('secT').innerHTML='<tr><td class="mut">no data yet (filled in as laps end)</td></tr>';return}
   const f=v=>v==null?'–':v.toFixed(2)+' s';
-  $('secT').innerHTML='<tr><th>Section</th><th>PB / WR</th><th>AI best</th><th>Difference</th><th>Laps failing here</th><th>Target in use</th></tr>'+
+  const sp=rows.reduce((a,r)=>a+(r.pb||0),0), sa=rows.every(r=>r.ai!=null)?rows.reduce((a,r)=>a+r.ai,0):null;
+  $('secT').innerHTML='<tr><th>Section</th><th>PB / WR</th><th>AI best</th><th>Difference</th><th title="Of the laps that reached this section, how many failed in it (stuck, off-zone, far off line, behind ghost, timeout); last 200">Fail rate (of laps reaching it)</th><th>Target in use</th></tr>'+
     rows.map(r=>{const d=(r.ai!=null&&r.pb!=null)?r.ai-r.pb:null, rt=r.rate;
       return `<tr><td>CP ${r.k-1} → ${r.k}</td><td>${f(r.pb)}</td><td>${f(r.ai)}</td><td class="${d==null?'':d>0?'bad':'ok'}">${d==null?'–':(d>0?'+':'')+d.toFixed(2)+' s'}</td>`+
-      `<td class="${rt==null?'':rt>0.7?'bad':rt<0.2?'ok':''}">${rt==null?'–':Math.round(rt*100)+'%'} <span class="mut">(${r.laps} laps)</span></td><td class="${r.target.startsWith('AI')?'fb':''}">${r.target}</td></tr>`}).join('')
+      `<td class="${rt==null?'':rt>0.7?'bad':rt<0.2?'ok':''}">${rt==null?'–':Math.round(rt*100)+'%'} <span class="mut">(of the last ${r.laps} laps reaching it${r.practice_only?'; reached by practice starts only':''})</span></td><td class="${r.target.startsWith('AI')?'fb':''}">${r.target}</td></tr>`}).join('')+
+    `<tr class="tot"><td>Best case (sum of AI bests)</td><td>${sp?f(sp):'–'}</td><td>${f(sa)}</td><td class="${sa==null||!sp?'':sa>sp?'bad':'ok'}">${sa==null||!sp?'–':(sa>sp?'+':'')+(sa-sp).toFixed(2)+' s'}</td><td></td><td class="mut">AI bests can come from different laps</td></tr>`
 }
 function drawTime(s){
   const p=s.prof, running=s.state=='running'||s.state=='benchmarking'; $('bBench').disabled=running;
@@ -501,18 +509,42 @@ function drawRb(rb){
     <span style="text-align:right;color:#c9ced6">${v.toFixed(4)}</span></div>`}).join('');
   const run=ks.filter(k=>!['finish','end','checkpoint'].includes(k)).reduce((a,k)=>a+rb[k],0);
   $('rbSum').innerHTML=hitTxt(S_LAST)+`While driving: <b style="color:${run<0?'#e5484d':'#39c46a'}">${run>=0?'+':''}${run.toFixed(4)}</b> per step`+(run<0?' – negative: stopping can look attractive to the AI':'')}
+/* map view: zoom / pan / hidden dots live only in this browser (localStorage), never in config or training */
+const MV={k:1,cx:null,cz:null,sc:1,w:0,h:0};
+function mvGet(k,d){try{return localStorage.getItem('tmai.map.'+k)??d}catch(e){return d}}
+function mvSet(k,v){try{localStorage.setItem('tmai.map.'+k,v)}catch(e){}}
+function mapRedraw(){ if(S_LAST) drawMap($('cMap'),S_LAST.track||[],S_LAST.ends||[]) }
+function mapZoom(f,px,py){ const cv=$('cMap'); if(MV.cx==null) return; px=px??MV.w/2; py=py??MV.h/2;
+  const wx=MV.cx+(px-MV.w/2)/(MV.sc*MV.k), wz=MV.cz+(py-MV.h/2)/(MV.sc*MV.k);
+  MV.k=Math.min(Math.max(MV.k*f,1),60); MV.cx=wx-(px-MV.w/2)/(MV.sc*MV.k); MV.cz=wz-(py-MV.h/2)/(MV.sc*MV.k); mapRedraw() }
+function mapInit(){ const cv=$('cMap'); if(cv.dataset.mi) return; cv.dataset.mi=1;
+  cv.addEventListener('wheel',e=>{e.preventDefault(); const r=cv.getBoundingClientRect(); mapZoom(e.deltaY<0?1.25:0.8,e.clientX-r.left,e.clientY-r.top)},{passive:false});
+  let drag=null; cv.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing'});
+  cv.addEventListener('pointermove',e=>{ if(!drag||MV.cx==null) return; MV.cx-=(e.clientX-drag[0])/(MV.sc*MV.k); MV.cz-=(e.clientY-drag[1])/(MV.sc*MV.k); drag=[e.clientX,e.clientY]; mapRedraw() });
+  const up=()=>{drag=null;cv.style.cursor='grab'}; cv.addEventListener('pointerup',up); cv.addEventListener('pointercancel',up);
+  cv.addEventListener('dblclick',()=>{MV.k=1;MV.cx=null;mapRedraw()});
+  $('mzIn').onclick=()=>mapZoom(1.5); $('mzOut').onclick=()=>mapZoom(1/1.5); $('mzReset').onclick=()=>{MV.k=1;MV.cx=null;mapRedraw()};
+  $('mFull').checked=mvGet('full','0')=='1'; $('mFull').onchange=()=>{mvSet('full',$('mFull').checked?'1':'0');mapRedraw()};
+  $('mClear').onclick=()=>{mvSet('clear',String(Date.now()/1000));mapRedraw()}; $('mAll').onclick=()=>{mvSet('clear','0');mapRedraw()} }
 function drawMap(cv,track,ends){
+  mapInit();
   const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight; cv.width=w*d; cv.height=h*d;
   const g=cv.getContext('2d'); g.scale(d,d);
+  const clr=Number(mvGet('clear','0'))||0, onlyFull=mvGet('full','0')=='1', all=ends.length;
+  ends=ends.filter(e=>(!clr||(e[4]||0)>clr)&&(!onlyFull||!e[3]));
+  $('mInfo').textContent=all?`${ends.length} of ${all} lap ends shown`+(clr?' (cleared earlier ones)':''):'';
   const pts=track.concat(ends.map(e=>[e[0],e[1]]));
   if(!pts.length){g.fillStyle='#8b93a0';g.font='11px Segoe UI';g.fillText('no data yet',w/2-28,h/2);return}
   let x0=Math.min(...pts.map(p=>p[0])),x1=Math.max(...pts.map(p=>p[0])),z0=Math.min(...pts.map(p=>p[1])),z1=Math.max(...pts.map(p=>p[1]));
-  const sc=Math.min((w-20)/Math.max(x1-x0,1),(h-20)/Math.max(z1-z0,1)),ox=(w-(x1-x0)*sc)/2,oz=(h-(z1-z0)*sc)/2;
-  const X=x=>ox+(x-x0)*sc, Z=z=>oz+(z-z0)*sc;
+  const sc=Math.min((w-20)/Math.max(x1-x0,1),(h-20)/Math.max(z1-z0,1));
+  if(MV.cx==null){MV.cx=(x0+x1)/2;MV.cz=(z0+z1)/2;MV.k=1} MV.sc=sc; MV.w=w; MV.h=h;
+  const X=x=>w/2+(x-MV.cx)*sc*MV.k, Z=z=>h/2+(z-MV.cz)*sc*MV.k;
   if(track.length){g.strokeStyle='#4a5260';g.lineWidth=3;g.beginPath();track.forEach((p,i)=>i?g.lineTo(X(p[0]),Z(p[1])):g.moveTo(X(p[0]),Z(p[1])));g.stroke();
     g.fillStyle='#39c46a';g.beginPath();g.arc(X(track[0][0]),Z(track[0][1]),4,0,7);g.fill()}
+  const rr=Math.min(2.2*Math.sqrt(MV.k),6);
   for(const e of ends){g.globalAlpha=e[3]?0.15:0.45;g.fillStyle=(e[2]=='stuck'||e[2]=='off-zone')?'#e5484d':'#e8a33a';
-    g.beginPath();g.arc(X(e[0]),Z(e[1]),2.2,0,7);g.fill()} g.globalAlpha=1}
+    g.beginPath();g.arc(X(e[0]),Z(e[1]),rr,0,7);g.fill()} g.globalAlpha=1;
+  if(MV.k>1){g.fillStyle='#8b93a0';g.font='11px Segoe UI';g.fillText(`zoom x${MV.k.toFixed(1)}`,8,h-8)}}
 function movAvg(p,k){ const o=[];let s=0;for(let i=0;i<p.length;i++){s+=p[i][1];if(i>=k)s-=p[i-k][1];o.push([p[i][0],s/Math.min(i+1,k)])}return o }
 
 let S_LAST=null;
@@ -534,13 +566,13 @@ function render(s){ S_LAST=s;
   const br=s.best_run; $('bestRun').textContent=br?`Fastest run saved: ${ms(br.ms)} (${br.source}) → best_run.txt`:'No finished run saved yet';
   const ch=s.champion_ms,pb=s.pb_ms,f=s.first_test_ms;
   $('champ').textContent=ms(ch);
-  $('vsPb').textContent=ch&&pb?(ch<=pb?`${((pb-ch)/1000).toFixed(3)} s under your PB!`:`${((ch-pb)/1000).toFixed(3)} s over your PB`):(ch?'':'no champion yet – first test comes after '+c.test_every_laps+' laps');
+  $('vsPb').textContent=ch&&pb?(ch<=pb?`${((pb-ch)/1000).toFixed(3)} s under your PB!`:`${((ch-pb)/1000).toFixed(3)} s over your PB`):(ch?'':(s.tests_wait?'no champion yet – the first test comes after the first finished full lap':'no champion yet – the first test comes within '+c.test_every_laps+' laps'));
   let pct=null; if(ch&&pb&&f&&f>pb) pct=(f-ch)/(f-pb)*100; else if(ch&&pb&&f) pct=ch<=pb?100:0;
   $('pbBar').style.width=(pct==null?0:Math.max(0,Math.min(100,pct)))+'%';
   $('first').textContent=f?`first test ${ms(f)}  ·  ${pct==null?'':Math.round(pct)+'% of the way'}`:''; $('pbTxt').textContent=pb?`your PB ${ms(pb)}`:'set your PB in Settings';
   $('sMin').textContent=Math.round(s.session_min)+' min'; $('sLaps').textContent=`${n0(s.session_laps)} training laps (this session)`;
   $('mode').textContent=c.stop_at_pb&&pb?'Stops at your PB':(c.time_limit_min?`Stops after ${c.time_limit_min} min`:'Trains until you stop it');
-  $('nextTest').textContent=s.tests_wait?'Champion tests start after the first finished lap':`Next champion test in ${s.next_test_in} training laps`;
+  $('nextTest').textContent=s.tests_wait?'Champion tests start after the first finished full lap (practice starts don\'t count)':`Next champion test in ${s.next_test_in} training laps`;
   RUNS=s.runs||[]; $('runList').innerHTML=RUNS.map(r=>`<option value="${String(r.name).replace(/"/g,'&quot;')}">${runLabel(r).replace(/</g,'&lt;')}</option>`).join(''); runInfo();
   const bn=[...(s.notice?[s.notice]:[]),...(s.run_warnings||[])]; $('banner').classList.toggle('hide',!bn.length);
   $('banner').innerHTML=bn.map(t=>`<div style="color:${t.startsWith('STARTING')?'var(--red)':'var(--org)'}">${t.replace(/</g,'&lt;')}</div>`).join(''); $('stopBar').style.width=(100-100*s.next_test_in/Math.max(1,c.test_every_laps))+'%';

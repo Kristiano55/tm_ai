@@ -31,7 +31,7 @@ class SectionTracker:
     when the AI gets through on that route (or on a periodic retry). Writes sections.json (read by the cars:
     difficulty input + target mode) and rebuilds the guide on every switch."""
 
-    WINDOW, MIN_N, FAIL, RETRY_S, TRY_N = 200, 50, 0.7, 600.0, 50
+    WINDOW, MIN_N, FAIL, RETRY_S, TRY_N = 200, 100, 0.7, 600.0, 50   # MIN_N: laps reaching a section before fallback
     # hysteresis (a section used to flip PB <-> AI every ~30 s): after a switch the target is kept >= HOLD_S, and
     # the rate must cross with a margin: to AI above FAIL + MARGIN, back to PB at <= 0.5 - MARGIN / WR_N laps on PB
     HOLD_S, MARGIN, WR_N, LOG_S = 600.0, 0.1, 5, 600.0
@@ -51,6 +51,8 @@ class SectionTracker:
         self.since = list(d.get("since", [0.0] * n))
         self.retry = list(d.get("retry", [self.RETRY_S] * n))
         self.wr = [0] * n
+        self.full = (list(d.get("full", [])) + [0] * n)[:n]    # FULL laps (from the start) that reached each section
+        self._fin, self._fin_t = False, 0.0                     # a full lap has been finished (no fallback before)
         self.last_write, self.last_log = 0.0, [0.0] * n
         if not self.on and "ai" in d.get("mode", []):          # fallback switched off: back to the PB/WR line
             self.write()
@@ -63,6 +65,11 @@ class SectionTracker:
         if info.get("end") in ("car restarted", "gym lost"):
             return
         cp0, j = int(info.get("cp0", 0)), int(info.get("cp", 0))
+        if not info.get("mid") and cp0 <= 0:
+            for k in range(min(j + 1, self.n)):
+                self.full[k] += 1
+            if info.get("finished"):
+                self._fin = True
         for k in range(max(cp0, 0), min(j, self.n)):
             self.out[k].append(0)
         if j < self.n and info.get("end") in FAIL_ENDS:
@@ -93,14 +100,22 @@ class SectionTracker:
         if log:
             log(k="section", sec=k, mode=mode, old=old, why=why)
 
+    def full_done(self):
+        if not self._fin and time.time() - self._fin_t > 60:
+            self._fin_t = time.time()
+            self._fin = full_lap_done(self.run_dir)
+        return self._fin
+
     def update(self, log=None):
-        """Decide switches; call every few seconds. Off while the run drives its own line."""
+        """Decide switches; call every few seconds. Off while the run drives its own line, and no fallback before the
+        first finished FULL lap."""
         changed, now = False, time.time()
         for k in range(self.n if (self.on and not own_on(self.run_dir)) else 0):
             r, m, n_out = self.rate(k), self.mode[k], len(self.out[k])
             if now - float(self.since[k] or 0.0) < self.HOLD_S:     # just switched: keep the target for now
                 continue
-            if m == "pb" and r is not None and n_out >= self.MIN_N and r > self.FAIL + self.MARGIN and self._ai_route(k):
+            if (m == "pb" and r is not None and n_out >= self.MIN_N and r > self.FAIL + self.MARGIN
+                    and self.full_done() and self._ai_route(k)):
                 self._set(k, "ai", f"{r:.0%} of the laps reaching it fail there", log)
                 changed = True
             elif m == "ai" and self.wr[k] >= self.WR_N:
@@ -134,7 +149,7 @@ class SectionTracker:
         rates = [self.rate(k) for k in range(self.n)]
         write_json(self.f, {"n": self.n, "mode": self.mode, "rate": [round(x, 3) if x is not None else None for x in rates],
                             "laps": [len(o) for o in self.out], "out": self.out, "since": self.since,
-                            "retry": self.retry, "t": time.time()})
+                            "retry": self.retry, "full": self.full, "t": time.time()})
 
 
 def n_sections(run_dir, env_route_len=None):

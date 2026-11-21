@@ -97,6 +97,31 @@ def watchdog(seconds=90):
         pass
 
 
+def watchdog_off():
+    """Before a wait that may legitimately last long (an idle tester waiting for its next test): no hang dump."""
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
+def full_lap_done(run_dir):
+    """True once this run has a champion or its events show a finished FULL lap (not a mid-track start, not a pool
+    car). best_run.json alone is not enough: champion tests ran on caelid_v2 with 0 full finishes."""
+    run_dir = Path(run_dir)
+    if read_json(run_dir / "best.json").get("champion_ms"):
+        return True
+    try:
+        with open(run_dir / "events.jsonl", "rb") as f:
+            for line in f:
+                if b'"k": "lap"' in line[:20] and b'"ms": null' not in line and b'"mid": 0' in line \
+                        and b'"pool": 1' not in line:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def freeze_guard(run_dir, seconds=180):
     """Trainer only: a thread that notices when the main loop stops calling watchdog() for `seconds`. It writes all
     stacks to hang.txt, marks status.json "froze" (the dashboard restarts the run), stops the child processes and
@@ -507,7 +532,7 @@ def own_line_update(cfg, run_dir, log=None, rolled=False, test_ms=None):
     return False
 
 
-AI_SECTION_MAX_X = 2.0   # an AI section drive slower than 2x your PB's section time is no target (Shemesh: 84 s pace)
+AI_SECTION_MAX_X = 1.3   # an AI section drive slower than 1.3x your PB's section time is no target (Shemesh: 84 s)
 
 
 def section_route(run_dir, k, pb=None):

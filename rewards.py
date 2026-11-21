@@ -26,6 +26,7 @@ from common import _f, _cp_cuts, _wp_kind, _vocab_load, _VOCAB, _hang_file, _HAN
 def reward_notice(run_dir):
     """Log once at the start which reward weights this run uses: frozen ones (rewards.json) + any legacy terms on."""
     w = run_rewards(run_dir)
+    _reward_warnings(w or _settings_weights())
     if not w:
         say("Rewards: " + ", ".join(f"{k} {float(v):g}" for k, v in sorted(_settings_weights().items()) if float(v))
             + " (Settings).")
@@ -34,6 +35,35 @@ def reward_notice(run_dir):
     legacy = [f"{k} {float(w[k]):g}" for k in cfgmod.LEGACY_TERMS if float(w.get(k, 0) or 0)]
     say(f"Rewards: this run keeps its saved weights ({d.get('preset') or 'rewards.json'}; Settings changes don't "
         "apply to it). Legacy terms active: " + (", ".join(legacy) if legacy else "none") + ".")
+
+
+def _reward_warnings(w):
+    """Rewards that can't teach a fast finish: no finish bonus, or progress only beating the time cost when fast."""
+    def g(k, d=0.0):
+        try:
+            return float(w.get(k, d))
+        except (TypeError, ValueError):
+            return d
+    if g("w_finish") <= 0:
+        say("Warning: this run's finish bonus (w_finish) is 0: finishing a lap earns nothing extra.")
+    wp, wt = g("w_progress"), g("w_time")
+    be = 20.0 * wt / wp if wp > 0 else float("inf")
+    if be > 20.0:
+        say(f"Warning: driving only pays from {be:.0f} m/s (20 x time {wt:g} / progress {wp:g}); below that the AI "
+            "earns more by stopping. Lower the time penalty or raise Progress.")
+
+
+def lap_limit_warning(cfg, run_dir):
+    """max_lap_seconds must leave room for the champion / PB lap, or champion tests end 'timeout' (caelid_v2: 52 s
+    limit, ~50-52 s laps). Returns the warning text or ''."""
+    ms = [x for x in (read_json(Path(run_dir) / "best.json").get("champion_ms"), pb_ms_of(cfg, run_dir)) if x]
+    if not ms:
+        return ""
+    need = 1.3 * max(ms) / 1000.0
+    if float(cfg["max_lap_seconds"]) < need:
+        return (f"Max lap {cfg['max_lap_seconds']:g} s is less than 1.3 x the champion / PB time ({need:.0f} s): "
+                "champion tests and good laps get cut off as 'timeout'. Raise 'Max lap (s)'.")
+    return ""
 
 
 def _settings_weights():

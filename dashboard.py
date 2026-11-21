@@ -108,7 +108,7 @@ class Store:
                     self.map_n[e["map"]] = self.map_n.get(e["map"], 0) + 1
                 self.n_all += 1
                 if e.get("x") is not None and e.get("end") != "finished":
-                    self.ends.append([e["x"], e["z"], e.get("end", ""), 1 if e.get("mid") else 0])
+                    self.ends.append([e["x"], e["z"], e.get("end", ""), 1 if e.get("mid") else 0, e.get("t") or 0])
                     del self.ends[:-3000]
                 if e.get("mid"):
                     self.n_mid += 1
@@ -157,10 +157,26 @@ def _cuts(tr):
     return c
 
 
+def _lap_limit_warn(cfg, rd):
+    """max_lap_seconds shorter than 1.3 x champion / PB: tests and good laps end 'timeout' (caelid_v2)."""
+    try:                                             # same rule as rewards.lap_limit_warning (no torch here)
+        pb = float(cfg.get("pb_seconds") or 0) * 1000 or (read_json(rd / "pb_trace.json").get("ms")
+                                                         if cfg.get("pb_file") else None)
+        ms = [x for x in (read_json(rd / "best.json").get("champion_ms"), pb) if x]
+        need = 1.3 * max(ms) / 1000.0 if ms else 0.0
+        if need and float(cfg["max_lap_seconds"]) < need:
+            return [f"Max lap {cfg['max_lap_seconds']:g} s is less than 1.3 x the champion / PB time ({need:.0f} s): "
+                    "champion tests and good laps get cut off as 'timeout'. Raise 'Max lap (s)'."]
+    except Exception:
+        pass
+    return []
+
+
 def section_rows(rd):
     """Per checkpoint section: your PB/WR split, the AI's best split, failure rate, target in use."""
     sj = read_json(rd / "sections.json")
-    files = [rd / "pb_trace.npy", rd / "best_trace.npy"] + sorted(rd.glob("sec_best_*.npy"))
+    files = ([rd / "pb_trace.npy", rd / "best_trace.npy", rd / "centerline.json", rd / "own_line.json"]
+             + sorted(rd.glob("sec_best_*.npy")))
     key = (sj.get("t"), tuple((f.name, f.stat().st_mtime) for f in files if f.exists()))
     if key == _SEC["key"]:
         return _SEC["rows"]
@@ -184,6 +200,9 @@ def section_rows(rd):
     pbs, ais = splits(pb), splits(ai)
     n = max(n, len(pbs))
     guide = pb is not None
+    own = bool(read_json(rd / "own_line.json").get("on"))
+    chosen = read_json(rd / "centerline.json").get("guide") or []      # per section: PB / AI / AI* (build_guide)
+    full = sj.get("full") or []
     rows = []
     for k in range(n):
         best = ais[k] if k < len(ais) and len(ais) == n else None
@@ -195,11 +214,23 @@ def section_rows(rd):
             pass
         modes, rates, laps = sj.get("mode") or [], sj.get("rate") or [], sj.get("laps") or []
         m = modes[k] if k < len(modes) else "pb"
+        rate = rates[k] if k < len(rates) else None
+        if own or not guide:
+            tgt = "its own line (champion)"
+        elif m == "ai":
+            tgt = f"AI route (fallback: {round((rate or 0) * 100)}% fail)"
+        elif m == "try":
+            tgt = "PB/WR (retrying)"
+        elif k < len(chosen) and str(chosen[k]).startswith("AI"):
+            tgt = "AI route (faster)"
+        else:
+            tgt = "PB/WR"
+        nl = laps[k] if k < len(laps) else 0
         rows.append({"k": k + 1, "pb": round(pbs[k], 2) if k < len(pbs) else None,
                      "ai": round(best, 2) if best is not None else None,
-                     "rate": rates[k] if k < len(rates) else None, "laps": laps[k] if k < len(laps) else 0,
-                     "target": ("AI route (fallback)" if m == "ai" else "PB/WR (retrying)" if m == "try"
-                                else "PB/WR" if guide else "own champion line")})
+                     "rate": rate, "laps": nl, "target": tgt,
+                     # only mid-track (practice) starts got here so far, no lap from the start line
+                     "practice_only": bool(nl) and k < len(full) and not full[k]})
     _SEC.update(key=key, rows=rows)
     return rows
 
@@ -254,7 +285,8 @@ def tests_can_run(cfg, rd, best):
     """Champion tests start after the first finished full lap (base: on any pool map)."""
     if cfg["run_type"] == "base":
         return any((rd / "maps" / cfgmod.map_slug(e["map"]) / "best_run.json").exists() for e in cfg["map_pool"])
-    return (rd / "best_run.json").exists() or bool(best.get("champion_ms"))
+    # same rule as the trainers (common.full_lap_done): a champion, or a finished FULL lap in this run's events
+    return bool(best.get("champion_ms")) or any(ms for _, ms in STORE.laps)
 
 
 def safe(fn, *a):
@@ -330,7 +362,7 @@ def build_state():
         "next_test_in": max(0, cfg["test_every_laps"] - (S.n_all - last_test_lap)),
         "tests_wait": not tests_can_run(cfg, rd, best),
         "hit_ramp": read_json(rd / "hit_ramp.json") or None,
-        "notice": S.notice, "run_warnings": list(cfgmod.RUN_WARNINGS),
+        "notice": S.notice, "run_warnings": list(cfgmod.RUN_WARNINGS) + _lap_limit_warn(cfg, rd),
         "runs": runs_cached(), "run_folder": rd.name,
         "tests_total": len(S.tests), "promotions": sum(1 for t in S.tests if t["promoted"]),
         "learn": {k: upd.get(k) for k in ("aux", "sil", "sil_act", "sil_n")},

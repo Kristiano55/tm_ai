@@ -201,7 +201,9 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
     env = None
     net = IQNNet(n_in, n_act)
     best, bad, tests = T.read_json(best_file), 0, 0
+    to_warned = False                                 # 'test hit the lap limit' is said once
     while True:
+        T.watchdog_off()                                 # waiting for the next test is not a hang (hang.txt)
         msg = inbox.get()
         if msg is None:
             break
@@ -241,6 +243,11 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
                 T.atomic_save(run_dir / "champion.pt", lambda p: torch.save(msg["sd"], p))
                 T.InputText.write(str(run_dir / "champion.txt"), rec.actions)
                 T.save_npy(run_dir / "champ_trace.npy", np.asarray(tr["hist"], dtype=np.float64))
+            elif not fin and info.get("end") == "timeout":    # the lap limit is too short, not a bad driver
+                if not to_warned:
+                    to_warned = True
+                    T.say(f"Champion test hit the lap time limit (max_lap_seconds {cfg['max_lap_seconds']} s): not counted "
+                          "for rollback. Raise 'Max lap (s)' to at least 1.3 x the champion / PB time.")
             elif champ is not None and (not fin or ms > champ + cfg["rollback_margin_s"] * 1000):
                 bad += 1
                 if cfg["iqn_rollback"] and bad >= cfg["rollback_after"] and (run_dir / "champion.pt").exists():
@@ -598,6 +605,8 @@ def train(cfg):
     T.say(f"IQN: {cfg['_iqn_levels']} steering levels x {cfg['_iqn_modes']} throttle modes"
           + (" (gas+brake on)" if cfg["_iqn_modes"] == 4 else ""))
     T.reward_notice(run_dir)
+    if T.lap_limit_warning(cfg, run_dir):
+        T.say("Warning: " + T.lap_limit_warning(cfg, run_dir))
     pool = T.CarPool(cfg, run_dir, n_env)                     # cars in their own processes, not in lock-step
     dim, nvec = pool.dim, pool.nvec
     n_act = int(nvec[0] * nvec[1])
@@ -657,7 +666,7 @@ def train(cfg):
 
     rng = np.random.default_rng()
     pend = [[] for _ in range(n_env)]          # n-step windows per car: (obs, action, reward)
-    C = {"laps": 0, "since": 0}
+    C = {"laps": 0, "since": 0, "full": T.full_lap_done(run_dir)}
     rb, rb_steps = {}, 0
     stuckw = T.StuckWatch()
     tracker = T.SectionTracker(run_dir, cfg, T.n_sections(run_dir, pool.n_seg))
@@ -683,6 +692,8 @@ def train(cfg):
             C["laps"] += 1
             C["since"] += 1
             fin = bool(info.get("finished"))
+            if fin and not info.get("mid"):
+                C["full"] = True                              # champion tests start after the first FULL finish
             g = bool(greedy_lap[i])
             log(k="lap", ms=int(info["race_ms"]) if fin else None, cp=int(info.get("cp", 0)),
                 end=info.get("end", ""), mid=1 if info.get("mid") else 0, x=info.get("x"), z=info.get("z"),
@@ -812,7 +823,7 @@ def train(cfg):
             mt["act"] += w3 - w2
 
             # --- tests, logging, profiling, stop ---
-            if C["since"] >= cfg["test_every_laps"] and not busy.value and (run_dir / "best_run.json").exists():
+            if C["since"] >= cfg["test_every_laps"] and not busy.value and C["full"]:
                 busy.value = 1
                 C["since"] = 0
                 inbox.put({"sd": {k: v.clone() for k, v in act.state_dict().items()}, "lap_n": C["laps"]})

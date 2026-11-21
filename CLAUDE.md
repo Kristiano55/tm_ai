@@ -279,6 +279,13 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   `cov_passes`). `novel` = progress x (w_novel x (1 - known) - w_known x wks x known); `focus` = ghost x w_focus x known.
 - **Reward presets:** dashboard buttons "Linesight preset" and "Reset to minimal" fill the weights. Zero-weight terms
   are left out of the reward breakdown.
+- **Dashboard sections table:** target "AI route (faster)" (build_guide chose the AI's faster section, centerline.json
+  `guide`) vs "AI route (fallback: N% fail)" vs "PB/WR" vs "its own line"; column "Fail rate (of laps reaching it)"
+  ("of the last N laps reaching it", window 200); "reached by practice starts only" when no lap from the start line
+  got there (sections.json `full` counts); bottom row "Best case (sum of AI bests)" vs the PB total.
+- **Dashboard map "Where laps end":** zoom (wheel / + / −, up to x60), drag to pan, double-click / Reset view, "full
+  laps only", "Clear dots" (hides lap ends up to now by their event time `ends[i][4]`; "Show all" undoes) - view only,
+  kept in localStorage `tmai.map.*`, never in config or training.
 - **Lap-time chart markers:** G = ghost rebuilt (event k=target), S = section target switched (k=section); dashboard
   `targets` (lap number when it happened).
 - **Own line once close to the PB** (`own_line_s` 2.0, 0 = never; PPO + IQN, runs with a `pb_file`): the target line,
@@ -302,8 +309,9 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   0 / 15 / 20 / 25 m to the side (no change needed).
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
   every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
-  failing (>=50 laps) and a REAL AI route exists (`common.section_route`: sec_best_<k> that starts at CP k and ends on
-  CP k+1, or a finished lap with the PB's checkpoint count, and <= `AI_SECTION_MAX_X` (2) x the PB's section time;
+  failing (>= `MIN_N` 100 laps reaching it), only after the run's first finished FULL lap (`full_done`), and a REAL AI
+  route exists (`common.section_route`: sec_best_<k> that starts at CP k and ends on
+  CP k+1, or a finished lap with the PB's checkpoint count, and <= `AI_SECTION_MAX_X` (1.3) x the PB's section time;
   an 84 s "AI route" once gave a 84 s target pace) -> mode "ai"; `build_guide` applies the same rule, else the PB: `build_guide` uses the AI's
   fastest route there (line + ghost + VCPs). Back to "pb" when 3 laps drive the whole section within 15 m of the PB
   route (`secs_wr` in lap info), or a periodic "try" (after 10 min, doubling to 1 h; 50 laps, <=50% fail = keep).
@@ -322,8 +330,15 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   practice), the champion lap joins once it exists (PPO). IQN uses
   `iqn_mid_start_p` (0.2) and, with a `pb_file`, starts only along the PB/WR states (to learn the WR route's cut); built BEFORE
   `g.reset()` in `reset()` (an earlier bug made laps start at the finish).
-- **Champion tests only after the first finished full lap** of the run (`tests_ready()`: best_run.json / champion;
-  base: per map, the tester skips pool maps never finished; IQN too). Dashboard: "Champion tests start after ...".
+- **Champion tests only after the first finished FULL lap** of the run: `common.full_lap_done` = a champion exists or
+  events.jsonl has a finished lap with mid 0 (not pool); best_run.json alone no longer counts (caelid_v2: tests from
+  17:53 with 0 full finishes). PPO `finished_once`, IQN `C["full"]`, dashboard `tests_can_run` use the same rule;
+  base: per map, the tester skips pool maps never finished. Dashboard: "... after the first finished full lap".
+- **Lap limit vs lap time:** a champion test ending "timeout" never counts as a bad test (no rollback), logged once per
+  tester process. `rewards.lap_limit_warning` (training start, PPO + IQN) and the dashboard banner (`_lap_limit_warn`,
+  computed without torch) warn when max_lap_seconds < 1.3 x max(champion, PB). `_reward_warnings` at start:
+  w_finish 0, or break-even speed (20 x w_time / w_progress) > 20 m/s.
+- **hang.txt:** idle testers (PPO + IQN, waiting on their queue) call `watchdog_off()` first: no false hang dumps.
 - **Wall-hit penalty** (`_hit_penalty`): w_hit x min(1, speed lost / 10 m/s) x ramp factor. `HitRamp` (setting
   `w_hit_ramp`, default on): finish rate of the last 100 full laps < 30 % -> 25 %, linear to 100 % at 60 %; once 60 %
   is reached (>= 20 laps) it stays 100 % (`reached`). Per run folder (per map in base runs); event k=hit_ramp on
