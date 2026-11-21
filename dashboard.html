@@ -216,6 +216,7 @@ const I={step:1}, F={
  start_focus:['Mid-start focus','Share of mid-track starts placed where laps fail or lose time to the ghost; the rest are spread evenly. 0 = all even, 1 = all focused.','number',{min:0,max:1,step:0.05}],
  obs_norm:['Input normalisation','PPO + IQN: inputs scaled by their running average/spread (clipped at 5). Saved with the run; older runs start at "no scaling" and blend in slowly.','checkbox',{more:1}],
  iqn_per:['Prioritized replay (IQN)','IQN: replays surprising experiences more often (alpha 0.6, beta 0.4 -> 1). NEW IQN runs only; existing IQN runs keep uniform sampling.','checkbox',{iqn:1}],
+ own_line_s:['Own line from (s to PB)','With a PB file: once the champion is within this many seconds of your PB, the whole target line, ghost and mid-track starts follow the champion\'s own route (rebuilt with every new champion); back to your PB line if it falls further behind. 0 = always your PB line.','number',{min:0,max:60,step:0.1}],
  mid_start_p:['Mid-track starts','Share of laps that start partway along the champion lap (after the first finish). 0 = off.','number',{min:0,max:1,step:0.05}],
  mid_start_every_s:['Start spacing (s)','Mid-track start points every N s of the champion lap.','number',{min:0.5,max:60,step:'any'}],
  sec_fallback:['Section fallback','With a PB/WR line: where most laps fail, chase the AI\'s own route in that section.','checkbox'],
@@ -238,7 +239,7 @@ const I={step:1}, F={
  algo:['Algorithm','PPO is recommended. IQN is experimental (its settings appear below).','select',{opts:[['ppo','PPO (recommended)'],['iqn','IQN (experimental)']]}],
  extra_obs:['Extra inputs','Turbo, grip, wall hits, ghost speed, line offset, surfaces, ice.','checkbox'],
  steer_mode:['Steering levels','Progressive = fine near the centre, coarse at the edges.','select',{opts:[['progressive','Progressive'],['uniform','Uniform (10 % steps)']]}],
- minirace_s:['Mini-race (s)','IQN maximises progress over the next N seconds.','number',{min:1,max:60,step:'any',iqn:1}],
+ minirace_s:['Mini-race (s)','IQN maximises progress over the next N seconds, then values what comes after (1..15).','number',{min:1,max:15,step:'any',iqn:1}],
  iqn_reuse:['Reuse','IQN learns from each experience about this often.','number',{min:1,max:256,...I,iqn:1}],
  iqn_buffer:['Replay size','IQN replay memory (experiences).','number',{min:1000,max:10000000,...I,iqn:1}],
  iqn_eps_full_steps:['Random steps','Fully random driving for the first N steps.','number',{min:0,max:1e10,...I,iqn:1}],
@@ -263,7 +264,7 @@ const SECTIONS=[
  ['cars','Cars & speed',['envs','ticks_per_step','time_limit_min','max_lap_seconds','lidar_every']],
  ['rew','Rewards',['w_progress','w_time','w_checkpoint','w_finish','w_stuck','w_offzone','ghost_weight','ghost_window_s','w_hit','w_hit_ramp']],
  ['tests','Champion tests',['test_every_laps','test_tries','test_tries_close','stop_at_pb','test_close_s','rollback_after','rollback_margin_s']],
- ['line','Track & line',['line_refresh_s','mid_start_p','start_focus','mid_start_every_s','sec_fallback','cut_behind_s']],
+ ['line','Track & line',['line_refresh_s','own_line_s','mid_start_p','start_focus','mid_start_every_s','sec_fallback','cut_behind_s']],
  ['learn','Learning (PPO)',['horizon_s','decay_steps','obs_norm','analog_steer','gas_brake','sil_weight','aux_weight']],
  ['base','Base driver',['base_name','map_pool','pool_rotate_laps','pool_cars','progress_norm_m']],
  ['hub','Sharing (hub)',['github_user','github_token','maps_folder','hub_repo','hub_index_url','hub_benchmark_url']],
@@ -551,7 +552,8 @@ function render(s){ S_LAST=s;
   $('kUpd').textContent=n0(s.updates); $('kSteps').textContent=`${n0(s.steps)} env steps`;
   $('log').textContent=s.log.join('\n');
   const laps=s.laps, tests=s.tests.filter(t=>t.ms);
-  $('presetTxt').textContent=s.run_preset?`This run: ${s.run_preset} rewards`:'';
+  const ol=s.own_line||{}; $('presetTxt').textContent=[s.run_preset?`This run: ${s.run_preset} rewards`:'',
+    ol.on?`Line: its own (since champion ${(ol.champ_ms/1000).toFixed(3)} s, PB ${(ol.pb_ms/1000).toFixed(3)} s)`:''].filter(Boolean).join(' · ');
   draw($('c1'),[{t:'d',p:laps,c:'#3b8bea'},{t:'l',p:movAvg(laps,20),c:'#6fb1ff'},
      {t:'d',p:tests.filter(t=>t.promoted).map(t=>[t.lap_n,t.ms/1000]),c:'#e8622a',r:4},
      ...(ch?[{t:'h',y:ch/1000,c:'#e8622a',s:'champion '+sec(ch/1000)}]:[]),

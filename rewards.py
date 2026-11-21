@@ -52,7 +52,12 @@ def champion_ghost(env, run_dir, ms, log=None):
     exists). PB-guide runs rebuild the guide (faster of PB vs AI best per section). Logs event k=target."""
     run_dir = Path(run_dir)
     try:
-        if env.guide:
+        if own_on(run_dir):                       # own line: line + ghost = the new champion's lap
+            gms = build_own_line(run_dir)
+            if gms is None:
+                return False
+            say(f"Champion {ms / 1000:.3f} s -> own line + ghost rebuilt from it")
+        elif env.guide:
             r = build_guide(run_dir)
             if not r:
                 return False

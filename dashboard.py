@@ -340,7 +340,7 @@ def build_state():
         "rb": {k: sum(r.get(k, 0.0) for r in S.rbs[-5:]) / max(1, len(S.rbs[-5:]))
                for k in sorted({k for r in S.rbs[-5:] for k in r})},
         "ends": S.ends[-1500:], "track": track_outline(rd), "linesight": cfgmod.LINESIGHT,
-        "run_preset": read_json(rd / "rewards.json").get("preset"), "targets": S.targets[-300:],
+        "run_preset": read_json(rd / "rewards.json").get("preset"), "own_line": read_json(rd / "own_line.json"), "targets": S.targets[-300:],
         "weights": [{"k": k, "default": d, "label": l, "hint": h} for k, (d, l, h) in cfgmod.WEIGHTS.items()],
         "defaults": {**cfgmod.DEFAULTS, "github_token": ""},
         "best_run": read_json(rd / "best_run.json") or None,

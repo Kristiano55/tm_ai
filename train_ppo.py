@@ -340,8 +340,8 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
                 save_npy(R / "champ_trace.npy", np.asarray(env.hist, dtype=np.float64))
             line_ms = read_json(line_meta).get("ms") or best.get("first_test_ms")   # old runs: line from the first test
             refresh = cfg["line_refresh_s"] and promoted and line_ms and ms <= line_ms - cfg["line_refresh_s"] * 1000
-            if env.guide:
-                refresh = False                                  # guide mode: the line is PB/best sections
+            if env.guide or own_on(R):
+                refresh = False                                  # PB guide / own line: champion_ghost builds it
             if fin and (not line_file.exists() or refresh):     # reference line follows the champion
                 what = "rebuilt from the new champion" if line_file.exists() else "created"
                 save_npy(line_file, make_line(np.asarray(env.hist)[:, :3]))
@@ -352,6 +352,7 @@ def ppo_test_worker(cfg, run_dir, inbox, busy, maps=None):
                 say(f"Reference line + ghost {what} ({ms / 1000:.3f} s lap). Expect a short dip while cars adapt.")
             if fin and (promoted or not (R / "profile.npy").exists()):   # ghost follows the champion only
                 champion_ghost(env, R, ms, (lambda **kw: log(**kw, map=slug)) if slug else log)
+            own_line_update(mcfg, R, (lambda **kw: log(**kw, map=slug)) if slug else log, rolled=rolled, test_ms=ms)
             write_json(best_file, best)
             log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled,
                 tries=n_try, seed=tr["seed"], map=slug)
@@ -789,6 +790,7 @@ def train(cfg):
     if not base:
         cfg = dict(cfg, _pnorm=pnorm)
         prepare_guide(cfg, run_dir)
+        own_line_update(cfg, run_dir)                          # existing runs close to their PB: own line now
     venv = make_pool_vecenv(cfg, str(run_dir), specs)       # a hung car is replaced, not the whole training frozen
     tracker = None if base else SectionTracker(run_dir, cfg, n_sections(run_dir, venv.n_seg))
     set_gamma(cfg)

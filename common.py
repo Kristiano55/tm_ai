@@ -438,6 +438,75 @@ def map_targets(m, start):
     return keep, dropped
 
 
+def own_on(run_dir):
+    """The run drives its OWN line (champion close to the PB): own_line.json {on: true}."""
+    return bool(run_dir) and bool(read_json(Path(run_dir) / "own_line.json").get("on"))
+
+
+def pb_ms_of(cfg, run_dir):
+    """Your PB in ms: the pb_seconds setting, else the traced PB file's time (None without either)."""
+    if cfg.get("pb_seconds"):
+        return float(cfg["pb_seconds"]) * 1000.0
+    ms = read_json(Path(run_dir) / "pb_trace.json").get("ms") if cfg.get("pb_file") else None
+    return float(ms) if ms else None
+
+
+def build_own_line(run_dir):
+    """Target line + ghost = the champion's own lap (champ_trace.npy). Returns the champion ms or None."""
+    run_dir = Path(run_dir)
+    try:
+        tr = np.load(run_dir / "champ_trace.npy")
+    except (OSError, ValueError):
+        return None
+    ms = read_json(run_dir / "best.json").get("champion_ms")
+    if tr.ndim != 2 or len(tr) < 10 or not ms:
+        return None
+    line = make_line(tr[:, :3])
+    prof = trace_to_profile(dense_line(line), tr)
+    save_npy(run_dir / "centerline.npy", line)
+    save_npy(run_dir / "profile.npy", prof)
+    write_json(run_dir / "centerline.json", {"ms": int(ms), "own": True, "t": time.time()})
+    write_json(run_dir / "profile.json", {"ms": int(ms)})
+    return int(ms)
+
+
+def own_line_update(cfg, run_dir, log=None, rolled=False, test_ms=None):
+    """Yosh-style: with a PB file, the target follows your PB until the champion is within own_line_s of it; then the
+    WHOLE target line (line, ghost, VCPs, mid-track starts) is the champion's own route, rebuilt with every new
+    champion (champion_ghost). Back to the PB line if the champion is more than own_line_s behind the PB again, or
+    on a rollback while the tests drive slower than that; after going back it switches again only with a new champion.
+    Called by both testers after each test and once at training start (existing runs qualify on their next start)."""
+    run_dir = Path(run_dir)
+    lim = float(cfg.get("own_line_s", 2.0) or 0.0) * 1000.0
+    f = run_dir / "own_line.json"
+    st = read_json(f)
+    if not cfg.get("pb_file") or not (run_dir / "pb_trace.npy").exists():
+        return False
+    champ, pb = read_json(run_dir / "best.json").get("champion_ms"), pb_ms_of(cfg, run_dir)
+    want = bool(lim > 0 and champ and pb and champ <= pb + lim and (run_dir / "champ_trace.npy").exists())
+    if st.get("on") and (not want or (rolled and (test_ms is None or test_ms > pb + lim))):
+        write_json(f, {"on": False, "blocked_champ": champ, "t": time.time()})
+        r = build_guide(run_dir)
+        why = "rollback" if want else f"the champion is more than {lim / 1000:g} s behind the PB"
+        say(f"Back to the PB line ({why}; champion {champ / 1000:.3f} s, PB {pb / 1000:.3f} s)" if champ and pb
+            else f"Back to the PB line ({why})")
+        if log:
+            log(k="target", what="pb_line", ms=champ, pb_ms=pb, why=why, ghost_ms=r[0] if r else None)
+        return True
+    if want and not st.get("on"):
+        if st.get("blocked_champ") and champ >= st["blocked_champ"]:
+            return False                                  # went back after a rollback: wait for a new champion
+        ms = build_own_line(run_dir)
+        if ms is None:
+            return False
+        write_json(f, {"on": True, "champ_ms": champ, "pb_ms": pb, "t": time.time()})
+        say(f"Now using its own line (champion {champ / 1000:.3f} s, PB {pb / 1000:.3f} s)")
+        if log:
+            log(k="target", what="own_line", ms=champ, pb_ms=pb, ghost_ms=ms)
+        return True
+    return False
+
+
 AI_SECTION_MAX_X = 2.0   # an AI section drive slower than 2x your PB's section time is no target (Shemesh: 84 s pace)
 
 

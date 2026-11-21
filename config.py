@@ -65,6 +65,7 @@ DEFAULTS = {
     "maps_folder": "",         # where your .Map.Gbx files are (verify / benchmark find maps there by file name)
     "iqn_gas_brake": False,    # IQN: 4th throttle mode gas + brake (new IQN runs only: IQN checkpoints don't convert)
     "iqn_steer_levels": 21,    # IQN: 21 / 31 / 41 steering levels (new IQN runs only)
+    "own_line_s": 2.0,         # with a PB file: once the champion is within N s of the PB, follow its own line (0 = never)
     "obs_norm": True,          # PPO + IQN: inputs normalised by running mean/std (clipped +-5), saved with the run
     "iqn_per": True,           # IQN: prioritized replay (alpha 0.6, beta 0.4 -> 1); new IQN runs only
     "start_focus": 0.5,        # mid-track starts: share picked by where laps fail / lose time (rest uniform)
@@ -205,6 +206,8 @@ def coerce(cfg):
         out[k] = v
     out["envs"] = max(1, out["envs"])
     out["iqn_steer_levels"] = min((21, 31, 41), key=lambda n: abs(n - out["iqn_steer_levels"]))
+    out["own_line_s"] = max(0.0, out["own_line_s"])
+    out["minirace_s"] = min(max(out["minirace_s"], 1.0), 15.0)
     out["start_focus"] = min(max(out["start_focus"], 0.0), 1.0)
     pool = []
     for e in out["map_pool"] if isinstance(out["map_pool"], list) else []:

@@ -94,9 +94,9 @@ class SectionTracker:
             log(k="section", sec=k, mode=mode, old=old, why=why)
 
     def update(self, log=None):
-        """Decide switches; call every few seconds."""
+        """Decide switches; call every few seconds. Off while the run drives its own line."""
         changed, now = False, time.time()
-        for k in range(self.n if self.on else 0):
+        for k in range(self.n if (self.on and not own_on(self.run_dir)) else 0):
             r, m, n_out = self.rate(k), self.mode[k], len(self.out[k])
             if now - float(self.since[k] or 0.0) < self.HOLD_S:     # just switched: keep the target for now
                 continue
@@ -202,7 +202,9 @@ class TMEnv(gym.Env):
         self.start_focus = float(cfg.get("start_focus", 0.5))
         self.tloss, self._seg_k, self._seg_phi = np.zeros(0), None, 0.0
         self._starts_line = "unset"
-        self.guide = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
+        self.has_pb = bool(cfg.get("pb_file")) and self.run_dir is not None and (self.run_dir / "pb_trace.npy").exists()
+        self.own = own_on(self.run_dir) if self.has_pb else False
+        self.guide = self.has_pb and not self.own   # the PB is the target (until the run drives its own line)
         self.cprof, self._cprof_key = None, None
         self.cp_arc, self.off_line, self.far, self.pbuf, self.nbuf = None, 0.0, 0, [], []
         self.hit_factor, self._ramp_m = 1.0, None
@@ -279,9 +281,9 @@ class TMEnv(gym.Env):
             return
         # with your PB: start points along the PB's states from the beginning, so the sections after a hard spot get
         # practice while the hard spot itself is being learned (Shemesh: 12887 laps, none past CP1)
-        if m == self._ca_m:
+        if (m, self.own) == self._ca_m:          # rebuild on a new champion lap or an own-line switch
             return
-        self._ca_m = m
+        self._ca_m = (m, self.own)
         acts = read_json(f).get("acts") or [] if m else []
         old = [st["snap"] for st in self.starts]
         self.starts, self.fails = [], np.zeros(0)
@@ -323,7 +325,9 @@ class TMEnv(gym.Env):
                 if self.role == "training":
                     write_json(mk, {"m": m})
                 say(f"[{self.role}] {len(self.starts)} mid-track start points built "
-                    + ("(along your PB/WR)" if pb_only else "(champion lap + your PB)"))
+                    + ("(along your PB/WR)" if pb_only else ("(champion lap + your PB)" if self.guide
+                                                              else "(champion lap, its own line)" if self.own
+                                                              else "(champion lap)")))
         except Exception:                       # snapshots unsupported / limit reached: train without
             self.starts, self.fails = self.starts[:len(self.fails)] if len(self.fails) else [], self.fails
 
@@ -839,6 +843,9 @@ class TMEnv(gym.Env):
     # --- gym API ---------------------------------------------------------------------------
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        if self.has_pb:                          # own line switched on / off by the tester (own_line.json)
+            self.own = own_on(self.run_dir)
+            self.guide = not self.own
         self._read_weights()
         self._read_best()
         self._load_line()

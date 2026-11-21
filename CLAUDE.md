@@ -275,6 +275,25 @@ Nothing is shown in the game window: laps are simulated; results are saved as TI
   are left out of the reward breakdown.
 - **Lap-time chart markers:** G = ghost rebuilt (event k=target), S = section target switched (k=section); dashboard
   `targets` (lap number when it happened).
+- **Own line once close to the PB** (`own_line_s` 2.0, 0 = never; PPO + IQN, runs with a `pb_file`): the target line,
+  ghost, VCPs and mid-track starts follow the PB until the champion is within own_line_s of it; then `own_line.json`
+  {on} and the WHOLE target is the champion's own lap (`build_own_line` from champ_trace), rebuilt with every new
+  champion (`champion_ghost`). `own_line_update` (both testers after each test, and once at training start, so
+  existing runs qualify on their next start, e.g. caelid 45.19 vs 44.05): back to the PB line (`build_guide`) when the
+  champion is > own_line_s behind the PB (e.g. pb_seconds changed) or on a rollback while the test is slower than
+  that, and then only again with a new champion (`blocked_champ`). TMEnv: `has_pb` + `own` (re-read every reset),
+  `guide` = has_pb and not own (PB pull, PB mid-starts, guide ghost), mid-starts rebuild on a switch. Section fallback
+  is off while on own line. Logged "Now using its own line (champion X s, PB Y s)" / "Back to the PB line (...)",
+  events k=target what=own_line / pb_line (G marker), dashboard lap card "Line: its own (...)".
+- **IQN horizon beyond the mini-race:** before, a sample whose mini-race ended inside its 3 steps (tau <= k) stopped
+  there (no bootstrap): anything after the mini-race was worth 0, so IQN only optimised the next minirace_s (caelid:
+  every section at PB pace, never trading "CP a bit later" for more exit speed). Now such a sample uses its full k
+  steps and bootstraps from the target net at its final state with a FULL mini-race left (`trunc`, `left2`), so value
+  continues past the mini-race, discounted by gamma (0.999/step = ~50 s at 50 ms, -> 1 = whole lap after 2.5M steps;
+  logged at start). Failed races unchanged (time cost for the rest of the mini-race). `minirace_s` 1..15. Fake fork
+  test (`TICKGYM_FAKE_FORK=1`: tight branch 0.2 s sooner to z=500 but 30 % slower after): last third of 3 min, 61 %
+  fast-exit laps vs 48 % with the old target. Lateral offset: progress paid and lap rules are identical with the line
+  0 / 15 / 20 / 25 m to the side (no change needed).
 - **Section fallback** (`SectionTracker`, PPO + IQN, only with a `pb_file`): per checkpoint section, outcome of
   every lap that reaches it (fail = stuck / off-zone / far off line / behind ghost / timeout), window 200. >70%
   failing (>=50 laps) and a REAL AI route exists (`common.section_route`: sec_best_<k> that starts at CP k and ends on

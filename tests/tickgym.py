@@ -12,6 +12,9 @@ _FAIL=os.environ.get("TICKGYM_FAKE_FAIL","")
 # TICKGYM_FAKE_WALL=<z>: a wall across the road at z (e.g. 150): crossing it faster than 20 m/s wrecks the car (speed 0
 # for the rest of the lap = "stuck"); only braking to <= 20 m/s before it gets through (a hard spot after the start)
 WALL=float(os.environ.get("TICKGYM_FAKE_WALL","0") or 0)
+# TICKGYM_FAKE_FORK=1: a fork at z=310. Steering left (< -20) there takes the TIGHT branch: a 16 m shortcut (~0.2 s
+# sooner to z=500) but it exits 30 % slower (top speed x0.7 from z=500 to the finish). Otherwise the wide branch.
+FORK=bool(os.environ.get("TICKGYM_FAKE_FORK"))
 # Surfaces: asphalt (material 16) everywhere except dirt (material 6) for z 600..800; gameplay id 3 ("turbo")
 # for z 300..320, else 0. Ice fields are 0 (a summer map). The 4 downward rays (32..35) hit the road ~2 m below
 # and see the material ~20 m ahead.
@@ -94,7 +97,7 @@ class G:
                 else: os.remove(_FAIL)
             except (OSError,ValueError): pass
             else: raise TransportError("the connection failed: timed out")
-        s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];s.crashed=False;return s.tel()
+        s.z=0.;s.v=0.;s.tick=0;s.acc=True;s.brk=False;s.rec=[];s.crashed=False;s.branch=None;return s.tel()
     def step(s,ticks,actions=(),steer=None,accelerate=None,brake=None):
         for a in actions:
             if a.kind=='accel': s.acc=bool(a.value)
@@ -113,7 +116,12 @@ class G:
         if getattr(s,'brk',False) and not accelerate: s.v=max(s.v-2,0)
         if CORNER and 400<=s.z<460: s.v=min(s.v,60.0 if (accelerate and s.brk) else 35.0)
         if getattr(s,'crashed',False): s.v=0.0             # TICKGYM_FAKE_WALL: wrecked against the wall for good
+        if FORK and getattr(s,'branch',None)=="tight" and s.z>=500: s.v=min(s.v,0.7*s.vmax)
         nz=s.z+s.v*ticks/100
+        if FORK and s.z<310<=nz:
+            s.branch="tight" if (steer is not None and steer < -20) else "wide"
+            G.branches=getattr(G,'branches',{"tight":0,"wide":0}); G.branches[s.branch]+=1
+            if s.branch=="tight": nz+=16.0
         if WALL and s.z<WALL<=nz and s.v>20.0:              # hit the wall faster than 20 m/s: stopped dead
             s.crashed,s.v,nz=True,0.0,WALL-1.0
         s.z=nz; return s.tel()
@@ -126,7 +134,7 @@ class G:
     def snapshot(s):
         G.snaps=getattr(G,'snaps',{}); i=len(G.snaps)+1; G.snaps[i]=(s.z,s.v,s.tick); return NS(id=i,tick=s.tick)
     def restore(s,snap):
-        s.z,s.v,s.tick=G.snaps[snap.id]; s.crashed=False; return s.tel()
+        s.z,s.v,s.tick=G.snaps[snap.id]; s.crashed=False; s.branch=None; return s.tel()
     def discard(s,*a): pass
     def export(s): return NS(finish_ms=s.tick*10,actions=list(getattr(s,"rec",[])))
     def close(s): pass

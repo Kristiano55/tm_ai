@@ -246,7 +246,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
             if fin and not (run_dir / "champ_trace.npy").exists():
                 T.save_npy(run_dir / "champ_trace.npy", np.asarray(tr["hist"], dtype=np.float64))
             line_ms = T.read_json(line_meta).get("ms") or best.get("first_test_ms")
-            refresh = (not env.guide and cfg["line_refresh_s"] and promoted and line_ms
+            refresh = (not env.guide and not T.own_on(run_dir) and cfg["line_refresh_s"] and promoted and line_ms
                        and ms <= line_ms - cfg["line_refresh_s"] * 1000)
             if fin and (not line_file.exists() or refresh):
                 T.save_npy(line_file, T.make_line(np.asarray(tr["hist"])[:, :3]))
@@ -258,6 +258,7 @@ def test_worker(cfg, run_dir, n_in, n_act, inbox, busy, tstat=None):
             env.hist = tr["hist"]
             if fin and (promoted or not (run_dir / "profile.npy").exists()):   # ghost follows the champion only
                 T.champion_ghost(env, run_dir, ms, log)
+            T.own_line_update(cfg, run_dir, log, rolled=rolled, test_ms=ms)
             T.write_json(best_file, best)
             log(k="test", lap_n=msg["lap_n"], ms=ms, champ_ms=champ, promoted=promoted, rolled_back=rolled)
             T.say(f"Champion test {tests}: " + (f"{ms / 1000:.3f} s" if fin else f"no finish ({info.get('end')})")
@@ -493,15 +494,21 @@ def learner_proc(cfg, run_dir, dim, n_act, H, time_cost, rnames, rlock, ctr, sta
             with rlock:
                 o, ac, r, k, o2, end, c = buf.sample(BATCH, idx)
             tau = np.random.randint(1, H + 1, BATCH)                  # time left in this sample's mini-race
-            m = np.minimum(k, tau)
+            # a mini-race that ends inside these k steps used to stop there (no bootstrap): whatever came after it
+            # (exit speed, the next section) was worth 0, so IQN only ever optimised the next minirace_s seconds.
+            # Now such a sample takes its full k steps and bootstraps from the target net's value of the final state
+            # with a FULL mini-race left: the value continues past the mini-race, discounted by gamma.
+            trunc = (end == 0) & (tau <= k)
+            m = np.where(trunc, k, np.minimum(k, tau))
             disc = gamma ** np.arange(N_STEP)
             mask = np.arange(N_STEP)[None, :] < m[:, None]
             R = (r * disc * mask).sum(1)
             # a failed race keeps paying the time cost for the rest of its mini-race (giving up never pays)
             R -= np.where(end == 2, c * np.maximum(tau - m, 0), 0.0)
-            boot = (end == 0) & (tau > k)
+            boot = end == 0
+            left2 = np.where(trunc, H, np.maximum(tau - k, 0))
             x = torch.from_numpy(np.concatenate([o, (tau / H)[:, None]], 1).astype(np.float32)).to(dev)
-            x2 = torch.from_numpy(np.concatenate([o2, (np.maximum(tau - k, 0) / H)[:, None]], 1).astype(np.float32)).to(dev)
+            x2 = torch.from_numpy(np.concatenate([o2, (left2 / H)[:, None]], 1).astype(np.float32)).to(dev)
             for g in opt.param_groups:
                 g["lr"] = sched(LR, steps)
             with torch.no_grad():
@@ -558,6 +565,7 @@ def train(cfg):
     torch.set_num_threads(1)                                  # driving: tiny batches, one thread is fastest
     T.raise_priority(tick_too=True)
     T.prepare_guide(cfg, run_dir)
+    T.own_line_update(cfg, run_dir)                          # existing runs close to their PB: own line now
     events, status_file = run_dir / "events.jsonl", run_dir / "status.json"
 
     def log(**kw):
@@ -721,6 +729,11 @@ def train(cfg):
     status("running")
     T.say(f"Training started: IQN, {n_env} cars (each drives on its own, no waiting), mini-race "
           f"{cfg['minirace_s']:.0f} s, reuse x{cfg['iqn_reuse']}, learner on {device.upper()} in its own process.")
+    g0, dt = sched(GAMMA, int(ctr[0])), cfg["ticks_per_step"] / 100.0
+    hz = dt / max(1.0 - g0, 1e-9)
+    T.say(f"IQN horizon: mini-race {cfg['minirace_s']:g} s (time-left input), then the value of the next mini-race "
+          f"(bootstrapped at its end); discount {g0:.4f} per step = ~{hz:.0f} s now"
+          + (", -> whole lap (gamma 1)" if g0 < 1.0 else " (whole lap)") + f" by {GAMMA[-1][0] / 1e6:g}M steps.")
     a0 = policy(np.stack(cur_obs), int(ctr[0]))
     for i in range(n_env):
         cur_act[i] = int(a0[i])
